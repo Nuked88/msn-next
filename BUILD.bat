@@ -1,0 +1,1 @@
+powershell .\scripts\release-windows.ps1

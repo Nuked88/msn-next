@@ -18,6 +18,12 @@ pub struct Entry {
     pub timestamp_ms: u64,
 }
 
+pub struct ContactEntry {
+    pub peer: String,
+    pub name: String,
+    pub link: String,
+}
+
 impl History {
     pub fn open(path: &Path, key: [u8; 32]) -> Result<Self, Box<dyn Error>> {
         if let Some(parent) = path.parent() {
@@ -32,6 +38,15 @@ impl History {
             kind TEXT NOT NULL,
             body BLOB NOT NULL,
             timestamp_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS contacts (
+            peer TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            link TEXT NOT NULL,
+            added_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ignored_contacts (
+            peer TEXT PRIMARY KEY
         );",
         )?;
         Ok(Self {
@@ -96,6 +111,131 @@ impl History {
         }
         Ok(entries)
     }
+
+    pub fn conversation(&self, peer: &str, limit: usize) -> Result<Vec<Entry>, Box<dyn Error>> {
+        let mut statement = self.connection.prepare(
+            "SELECT peer, direction, kind, body, timestamp_ms
+             FROM events WHERE peer = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![peer, limit as u64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, u64>(4)?,
+            ))
+        })?;
+        let mut entries = Vec::new();
+        for row in rows {
+            let (peer, direction, kind, encrypted, timestamp_ms) = row?;
+            if encrypted.len() < 24 {
+                return Err("riga cronologia danneggiata".into());
+            }
+            let body = self
+                .cipher
+                .decrypt(XNonce::from_slice(&encrypted[..24]), &encrypted[24..])
+                .map_err(|_| "cronologia non decifrabile")?;
+            entries.push(Entry {
+                peer,
+                direction,
+                kind,
+                body: String::from_utf8(body)?,
+                timestamp_ms,
+            });
+        }
+        Ok(entries)
+    }
+
+    pub fn save_contact(
+        &self,
+        peer: &str,
+        name: &str,
+        link: &str,
+        added_at_ms: u64,
+    ) -> Result<(), Box<dyn Error>> {
+        self.connection.execute(
+            "INSERT INTO contacts (peer, name, link, added_at_ms) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(peer) DO UPDATE SET
+                name = excluded.name,
+                link = CASE WHEN excluded.link = '' THEN contacts.link ELSE excluded.link END",
+            params![peer, name, link, added_at_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn ensure_contact(
+        &self,
+        peer: &str,
+        name: &str,
+        added_at_ms: u64,
+    ) -> Result<(), Box<dyn Error>> {
+        self.connection.execute(
+            "INSERT OR IGNORE INTO contacts (peer, name, link, added_at_ms) VALUES (?1, ?2, '', ?3)",
+            params![peer, name, added_at_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn rename_contact(&self, peer: &str, name: &str) -> Result<(), Box<dyn Error>> {
+        let name = name.trim();
+        if name.is_empty() || name.len() > 64 {
+            return Err("nome contatto non valido".into());
+        }
+        if self.connection.execute(
+            "UPDATE contacts SET name = ?2 WHERE peer = ?1",
+            params![peer, name],
+        )? == 0
+        {
+            return Err("contatto non trovato".into());
+        }
+        Ok(())
+    }
+
+    pub fn clear_conversation(&self, peer: &str) -> Result<(), Box<dyn Error>> {
+        self.connection
+            .execute("DELETE FROM events WHERE peer = ?1", [peer])?;
+        Ok(())
+    }
+
+    pub fn delete_contact(&self, peer: &str) -> Result<(), Box<dyn Error>> {
+        self.clear_conversation(peer)?;
+        self.connection
+            .execute("DELETE FROM contacts WHERE peer = ?1", [peer])?;
+        self.connection.execute(
+            "INSERT OR IGNORE INTO ignored_contacts (peer) VALUES (?1)",
+            [peer],
+        )?;
+        Ok(())
+    }
+
+    pub fn allow_contact(&self, peer: &str) -> Result<(), Box<dyn Error>> {
+        self.connection
+            .execute("DELETE FROM ignored_contacts WHERE peer = ?1", [peer])?;
+        Ok(())
+    }
+
+    pub fn ignored_contacts(&self) -> Result<Vec<String>, Box<dyn Error>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT peer FROM ignored_contacts")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn contacts(&self) -> Result<Vec<ContactEntry>, Box<dyn Error>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT peer, name, link FROM contacts ORDER BY name COLLATE NOCASE")?;
+        let rows = statement.query_map([], |row| {
+            Ok(ContactEntry {
+                peer: row.get(0)?,
+                name: row.get(1)?,
+                link: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
 }
 
 #[cfg(test)]
@@ -118,6 +258,66 @@ mod tests {
             .unwrap()
             .windows(22)
             .any(|bytes| bytes == b"segreto-inconfondibile"));
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn conversation_history_is_filtered_by_peer() {
+        let path =
+            std::env::temp_dir().join(format!("msnnext-conversation-{}.db", std::process::id()));
+        fs::remove_file(&path).ok();
+        let history = History::open(&path, [8; 32]).unwrap();
+        history.record("alice", "in", "text", "uno", 1).unwrap();
+        history.record("bob", "in", "text", "due", 2).unwrap();
+
+        let entries = history.conversation("alice", 20).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].peer, "alice");
+        assert_eq!(entries[0].body, "uno");
+        drop(history);
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn contacts_survive_reopening_the_store() {
+        let path = std::env::temp_dir().join(format!("msnnext-contacts-{}.db", std::process::id()));
+        fs::remove_file(&path).ok();
+        {
+            let history = History::open(&path, [9; 32]).unwrap();
+            history
+                .save_contact("peer-a", "Alice", "msnnext://add/alice", 7)
+                .unwrap();
+        }
+
+        let history = History::open(&path, [9; 32]).unwrap();
+        let contacts = history.contacts().unwrap();
+
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].peer, "peer-a");
+        assert_eq!(contacts[0].name, "Alice");
+        assert_eq!(contacts[0].link, "msnnext://add/alice");
+        drop(history);
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn contact_can_be_renamed_and_removed_with_its_chat() {
+        let path =
+            std::env::temp_dir().join(format!("msnnext-contact-crud-{}.db", std::process::id()));
+        fs::remove_file(&path).ok();
+        let history = History::open(&path, [10; 32]).unwrap();
+        history.save_contact("peer-a", "Alice", "link", 1).unwrap();
+        history.record("peer-a", "in", "text", "ciao", 2).unwrap();
+        history.rename_contact("peer-a", "Alicia").unwrap();
+        assert_eq!(history.contacts().unwrap()[0].name, "Alicia");
+        history.delete_contact("peer-a").unwrap();
+        assert!(history.contacts().unwrap().is_empty());
+        assert!(history.conversation("peer-a", 10).unwrap().is_empty());
+        assert_eq!(history.ignored_contacts().unwrap(), vec!["peer-a"]);
+        history.allow_contact("peer-a").unwrap();
+        assert!(history.ignored_contacts().unwrap().is_empty());
+        drop(history);
         fs::remove_file(path).ok();
     }
 }
