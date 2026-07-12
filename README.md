@@ -47,8 +47,24 @@ QUIC cifra già il trasporto. La cifratura applicativa ibrida e il ratchet non s
 
 Il prototipo HTML/CSS/JS in `prototypes/web` serve soltanto a validare l'esperienza di chat e non contiene la futura rete o crittografia di produzione.
 
-## Milestone 2 — prossima
+## Milestone 2 — completata
 
-Aggiungere file transfer a chunk con manifest, hash per blocco e resume. Gli algoritmi post-quantum arriveranno dietro un crate `crypto` isolato: niente primitive inventate e nessuna promessa “quantum-resistant” prima di test e revisione.
+Il comando `file <percorso>` trasferisce immagini, video o file generici fino a 25 MB in chunk da 256 KB. Manifest e chunk hanno hash BLAKE3; rilanciando lo stesso comando dopo un'interruzione, il destinatario richiede soltanto i chunk mancanti. Usa `--downloads <cartella>` per cambiare destinazione.
 
-Poi: cronologia locale, drag-and-drop e notifiche desktop.
+La cronologia locale usa SQLite, ma i contenuti delle righe sono cifrati con XChaCha20-Poly1305. Il comando `history` mostra gli ultimi 20 eventi. La chiave è derivata dall'identità locale: la protezione tramite key store del sistema operativo arriverà con il crate storage definitivo.
+
+Le notifiche desktop si attivano con `--notify true`. Il prototipo web supporta anche il drag-and-drop di immagini e video sulla conversazione; la futura UI Tauri richiamerà lo stesso backend Rust usato da `file`.
+
+## Milestone 3 — in corso
+
+Il client trova e collega automaticamente gli altri peer msnnext nella LAN tramite mDNS. All'apertura della connessione scambia nome e presenza; la chiusura dell'ultima connessione porta il contatto offline.
+
+```text
+contact export alice.contact
+contact import alice.contact
+contact import-link msnnext://add/...
+```
+
+La scheda CBOR contiene nome locale, Peer ID, chiave pubblica classica e fino a quattro indirizzi iniziali. Import e link verificano crittograficamente che chiave e Peer ID corrispondano. Il link è il payload pronto per il QR; il renderer terminale non è incluso perché la dipendenza non era disponibile offline.
+
+Restano DHT, AutoNAT, hole punching e relay sostituibili.

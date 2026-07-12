@@ -21,6 +21,39 @@ pub enum ChatEvent {
     Text(TextMessage),
     Nudge(Nudge),
     EmoticonOffer(EmoticonOffer),
+    AttachmentOffer(AttachmentManifest),
+    AttachmentChunk(AttachmentChunk),
+    Presence(PresenceUpdate),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresenceUpdate {
+    pub display_name: String,
+    pub online: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentManifest {
+    pub attachment_id: [u8; 32],
+    pub filename: String,
+    pub mime: String,
+    pub size: u64,
+    pub chunk_size: u32,
+    pub chunks: Vec<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentChunk {
+    pub attachment_id: [u8; 32],
+    pub index: u32,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProtocolResponse {
+    Ack,
+    MissingChunks(Vec<u32>),
+    Rejected(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -31,6 +31,18 @@ els.nudgeButton.onclick = () => { send({ type:'nudge' }); nudge('Hai inviato un 
 els.statusButton.onclick = () => toast('Sei disponibile');
 els.fileButton.onclick = () => channel?.readyState === 'open' ? els.fileInput.click() : toast('Prima collega un amico');
 els.fileInput.onchange = () => sendFile(els.fileInput.files[0]);
+let dragDepth = 0;
+els.messages.ondragenter = event => {
+  if (!event.dataTransfer?.types.includes('Files')) return;
+  event.preventDefault(); dragDepth++; els.messages.classList.add('drop-ready');
+};
+els.messages.ondragover = event => { if (event.dataTransfer?.types.includes('Files')) event.preventDefault(); };
+els.messages.ondragleave = () => { if (--dragDepth <= 0) { dragDepth=0; els.messages.classList.remove('drop-ready'); } };
+els.messages.ondrop = event => {
+  event.preventDefault(); dragDepth=0; els.messages.classList.remove('drop-ready');
+  if (channel?.readyState !== 'open') return toast('Prima collega un amico');
+  sendFile(event.dataTransfer.files[0]);
+};
 els.addEmoteButton.onclick = () => els.emoteDialog.showModal();
 els.emoteButton.onclick = () => {
   if (matchMedia('(max-width:900px)').matches) els.emoteDialog.showModal();

@@ -1,4 +1,10 @@
+mod attachments;
+mod contacts;
+mod history;
+
+use attachments::{build_manifest, read_chunk, Receiver};
 use futures::StreamExt;
+use history::History;
 use libp2p::{
     identity::Keypair,
     request_response::{self, ProtocolSupport},
@@ -6,11 +12,12 @@ use libp2p::{
     Multiaddr, PeerId, StreamProtocol,
 };
 use msnnext_protocol::{
-    resolve_emoticons, validate_text_message, validate_triggers, ChatEvent, Emoticon,
-    EmoticonOffer, Envelope, Mime, Nudge, NudgeRateLimit, TextMessage, Trigger, PROTOCOL_VERSION,
+    resolve_emoticons, validate_text_message, validate_triggers, AttachmentManifest, ChatEvent,
+    Emoticon, EmoticonOffer, Envelope, Mime, Nudge, NudgeRateLimit, PresenceUpdate,
+    ProtocolResponse, TextMessage, Trigger, PROTOCOL_VERSION,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     error::Error,
     fs,
     path::{Path, PathBuf},
@@ -18,24 +25,48 @@ use std::{
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-// ponytail: one bounded request; replace with manifests/chunks when Milestone 2 adds resume.
+// Emoticons stay tiny and atomic; regular attachments use the resumable chunk protocol.
 const MAX_EMOTICON_BYTES: usize = 350_000;
 const MAX_EMOTICON_SIDE: usize = 512;
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
-    chat: request_response::cbor::Behaviour<Envelope, ()>,
+    chat: request_response::cbor::Behaviour<Envelope, ProtocolResponse>,
+    mdns: libp2p::mdns::tokio::Behaviour,
+}
+
+struct PendingOffer {
+    peer: PeerId,
+    path: PathBuf,
+    manifest: AttachmentManifest,
+}
+
+struct Incoming<'a> {
+    emotes: &'a Path,
+    triggers: &'a mut Vec<Trigger>,
+    nudge_limits: &'a mut HashMap<PeerId, NudgeRateLimit>,
+    attachments: &'a mut Receiver,
+    history: &'a History,
+    notifications: bool,
+    peer_names: &'a mut HashMap<PeerId, String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse()?;
     let identity = load_or_create_identity(&args.identity)?;
+    let public_key = identity.public();
+    let history_key = blake3::derive_key(
+        "msnnext local history v1",
+        &identity.to_protobuf_encoding()?,
+    );
+    let history = History::open(&args.history, history_key)?;
     let local_peer_id = PeerId::from(identity.public());
+    let mdns = libp2p::mdns::tokio::Behaviour::new(libp2p::mdns::Config::default(), local_peer_id)?;
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
         .with_quic()
-        .with_behaviour(|_| Behaviour {
+        .with_behaviour(move |_| Behaviour {
             chat: request_response::cbor::Behaviour::new(
                 [(
                     StreamProtocol::new("/msnnext/chat/1"),
@@ -43,6 +74,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 )],
                 request_response::Config::default(),
             ),
+            mdns,
         })?
         .build();
 
@@ -52,20 +84,58 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     println!("peer: {local_peer_id}");
-    println!("comandi: text <messaggio> | emote <trigger> <file> | nudge | quit");
+    println!("comandi: text <messaggio> | emote <trigger> <file> | file <percorso> | contact export/import <file> | nudge | history | quit");
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut peers = HashSet::new();
+    let mut dialing = HashSet::new();
+    let mut bootstrap_fallbacks = HashMap::<PeerId, VecDeque<Multiaddr>>::new();
     let mut triggers = load_triggers(&args.emotes)?;
     let mut nudge_limits = HashMap::<PeerId, NudgeRateLimit>::new();
     let mut incoming_nudge_limits = HashMap::<PeerId, NudgeRateLimit>::new();
     let mut sent_numbers = HashMap::<PeerId, u64>::new();
+    let mut pending_offers = HashMap::<request_response::OutboundRequestId, PendingOffer>::new();
+    let mut attachment_receiver = Receiver::new(args.downloads.clone());
+    let mut peer_names = HashMap::<PeerId, String>::new();
     let mut nudge_counter = 0_u64;
 
     loop {
         tokio::select! {
             line = lines.next_line() => match line? {
                 Some(line) if line == "quit" => break,
+                Some(line) if line == "history" => match history.latest(20) {
+                    Ok(entries) => for entry in entries.iter().rev() {
+                        println!("{} {} {} {}: {}", entry.timestamp_ms, entry.direction, entry.peer, entry.kind, entry.body);
+                    },
+                    Err(error) => eprintln!("cronologia non disponibile: {error}"),
+                },
+                Some(line) if line.starts_with("contact export ") => {
+                    let path = Path::new(line[15..].trim());
+                    match contacts::export(path, &args.name, local_peer_id, &public_key, swarm.listeners().cloned()) {
+                        Ok(()) => println!("scheda contatto salvata in {}", path.display()),
+                        Err(error) => eprintln!("esportazione contatto fallita: {error}"),
+                    }
+                },
+                Some(line) if line.starts_with("contact import-link ") => match contacts::import_link(line[20..].trim()) {
+                    Ok((name, peer_id, _)) => {
+                        peer_names.insert(peer_id, name.clone());
+                        println!("identità contatto verificata: {name} ({peer_id})");
+                    }
+                    Err(error) => eprintln!("link contatto rifiutato: {error}"),
+                },
+                Some(line) if line.starts_with("contact import ") => match contacts::import(Path::new(line[15..].trim())) {
+                    Ok((name, peer_id, addresses)) => {
+                        peer_names.insert(peer_id, name.clone());
+                        println!("contatto importato: {name} ({peer_id})");
+                        let mut addresses = VecDeque::from(addresses);
+                        if let Some(address) = addresses.pop_front() {
+                            dialing.insert(peer_id);
+                            bootstrap_fallbacks.insert(peer_id, addresses);
+                            if let Err(error) = swarm.dial(address) { eprintln!("indirizzo non raggiungibile: {error}"); }
+                        }
+                    }
+                    Err(error) => eprintln!("importazione contatto fallita: {error}"),
+                },
                 Some(line) if line == "nudge" => {
                     nudge_counter += 1;
                     let now = now_ms();
@@ -75,7 +145,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     if peers.is_empty() { eprintln!("nessun peer collegato"); }
                     for peer in &peers {
                         match nudge_limits.entry(*peer).or_default().try_acquire(now) {
-                            Ok(()) => send_event(&mut swarm, *peer, local_peer_id, &mut sent_numbers, ChatEvent::Nudge(Nudge { id, intensity: 1, timestamp_ms: now })),
+                            Ok(()) => {
+                                send_event(&mut swarm, *peer, local_peer_id, &mut sent_numbers, ChatEvent::Nudge(Nudge { id, intensity: 1, timestamp_ms: now }));
+                                record(&history, peer, "out", "nudge", "trillo");
+                            }
                             Err(wait_ms) => eprintln!("trillo limitato per {peer}: riprova tra {}s", wait_ms.div_ceil(1_000)),
                         }
                     }
@@ -84,15 +157,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let text = line[5..].to_owned();
                     let emoticons = resolve_emoticons(&text, &triggers)
                         .map_err(|error| format!("trigger emoticon non valido: {error:?}"))?;
+                    for peer in &peers { record(&history, peer, "out", "text", &text); }
                     let event = ChatEvent::Text(TextMessage { text, emoticons });
                     broadcast(&mut swarm, &peers, local_peer_id, &mut sent_numbers, event);
                 }
                 Some(line) if line.starts_with("emote ") => match parse_emote_command(&line, &args.emotes, &mut triggers) {
                     Ok(offer) => {
                         println!("emoticon salvata: {}", offer.metadata.name);
+                        for peer in &peers { record(&history, peer, "out", "emote", &offer.metadata.name); }
                         broadcast(&mut swarm, &peers, local_peer_id, &mut sent_numbers, ChatEvent::EmoticonOffer(offer));
                     }
                     Err(error) => eprintln!("emoticon rifiutata: {error}"),
+                },
+                Some(line) if line.starts_with("file ") => match build_manifest(Path::new(line[5..].trim())) {
+                    Ok(_manifest) if peers.is_empty() => eprintln!("nessun peer collegato"),
+                    Ok(manifest) => {
+                        let path = PathBuf::from(line[5..].trim());
+                        println!("offerta file: {} ({} chunk)", manifest.filename, manifest.chunks.len());
+                        for peer in &peers {
+                            record(&history, peer, "out", "file", &manifest.filename);
+                            let request_id = send_event(&mut swarm, *peer, local_peer_id, &mut sent_numbers, ChatEvent::AttachmentOffer(manifest.clone()));
+                            pending_offers.insert(request_id, PendingOffer { peer: *peer, path: path.clone(), manifest: manifest.clone() });
+                        }
+                    }
+                    Err(error) => eprintln!("file rifiutato: {error}"),
                 },
                 Some(_) => eprintln!("comando non valido"),
                 None => break,
@@ -100,26 +188,78 @@ async fn main() -> Result<(), Box<dyn Error>> {
             event = swarm.select_next_some() => match event {
                 SwarmEvent::NewListenAddr { address, .. } => println!("ascolto: {address}/p2p/{local_peer_id}"),
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                    peers.insert(peer_id);
-                    println!("connesso: {peer_id}");
+                    dialing.remove(&peer_id);
+                    bootstrap_fallbacks.remove(&peer_id);
+                    let first_connection = peers.insert(peer_id);
+                    if first_connection {
+                        println!("connesso: {peer_id}");
+                        send_event(&mut swarm, peer_id, local_peer_id, &mut sent_numbers, ChatEvent::Presence(PresenceUpdate { display_name: args.name.clone(), online: true }));
+                    }
                 }
-                SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                    peers.remove(&peer_id);
-                    nudge_limits.remove(&peer_id);
-                    incoming_nudge_limits.remove(&peer_id);
-                    println!("disconnesso: {peer_id}");
+                SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+                    if num_established == 0 {
+                        peers.remove(&peer_id);
+                        nudge_limits.remove(&peer_id);
+                        incoming_nudge_limits.remove(&peer_id);
+                        println!("offline: {}", peer_names.get(&peer_id).map_or_else(|| peer_id.to_string(), Clone::clone));
+                    }
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Chat(request_response::Event::Message { peer, message, .. })) => match message {
                     request_response::Message::Request { request, channel, .. } => {
-                        match validate_envelope(peer, local_peer_id, &request) {
-                            Ok(()) => receive_event(peer, &request.event, &args.emotes, &mut triggers, &mut incoming_nudge_limits),
-                            Err(error) => eprintln!("{peer}: evento rifiutato: {error}"),
-                        }
-                        swarm.behaviour_mut().chat.send_response(channel, ()).ok();
+                        let response = match validate_envelope(peer, local_peer_id, &request) {
+                            Ok(()) => receive_event(peer, &request.event, &mut Incoming {
+                                emotes: &args.emotes,
+                                triggers: &mut triggers,
+                                nudge_limits: &mut incoming_nudge_limits,
+                                attachments: &mut attachment_receiver,
+                                history: &history,
+                                notifications: args.notifications,
+                                peer_names: &mut peer_names,
+                            }),
+                            Err(error) => ProtocolResponse::Rejected(error.into()),
+                        };
+                        swarm.behaviour_mut().chat.send_response(channel, response).ok();
                     }
-                    request_response::Message::Response { .. } => {}
+                    request_response::Message::Response { request_id, response } => {
+                        if let Some(pending) = pending_offers.remove(&request_id) {
+                            match response {
+                                ProtocolResponse::MissingChunks(indices) => {
+                                    println!("invio {}: {} chunk richiesti", pending.manifest.filename, indices.len());
+                                    for index in indices {
+                                        match read_chunk(&pending.path, &pending.manifest, index) {
+                                            Ok(chunk) => { send_event(&mut swarm, pending.peer, local_peer_id, &mut sent_numbers, ChatEvent::AttachmentChunk(chunk)); }
+                                            Err(error) => { eprintln!("invio interrotto: {error}"); break; }
+                                        }
+                                    }
+                                }
+                                ProtocolResponse::Rejected(error) => eprintln!("file rifiutato da {peer}: {error}"),
+                                ProtocolResponse::Ack => {}
+                            }
+                        }
+                    }
                 },
-                SwarmEvent::OutgoingConnectionError { error, .. } => eprintln!("connessione fallita: {error}"),
+                SwarmEvent::Behaviour(BehaviourEvent::Mdns(libp2p::mdns::Event::Discovered(discovered))) => {
+                    for (peer_id, address) in discovered {
+                        if peer_id != local_peer_id && !peers.contains(&peer_id) && dialing.insert(peer_id) {
+                            println!("peer LAN trovato: {peer_id}");
+                            if let Err(error) = swarm.dial(address.with(libp2p::multiaddr::Protocol::P2p(peer_id))) {
+                                eprintln!("dial mDNS fallito: {error}");
+                            }
+                        }
+                    }
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Mdns(libp2p::mdns::Event::Expired(_))) => {}
+                SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                    if let Some(peer_id) = peer_id {
+                        if let Some(address) = bootstrap_fallbacks.get_mut(&peer_id).and_then(VecDeque::pop_front) {
+                            eprintln!("bootstrap fallito, provo il prossimo indirizzo: {error}");
+                            if let Err(next_error) = swarm.dial(address) { eprintln!("indirizzo non raggiungibile: {next_error}"); }
+                        } else {
+                            dialing.remove(&peer_id);
+                            eprintln!("connessione fallita: {error}");
+                        }
+                    } else { eprintln!("connessione fallita: {error}"); }
+                }
                 _ => {}
             }
         }
@@ -148,7 +288,7 @@ fn send_event(
     local_peer_id: PeerId,
     sent_numbers: &mut HashMap<PeerId, u64>,
     event: ChatEvent,
-) {
+) -> request_response::OutboundRequestId {
     let number = sent_numbers.entry(peer).or_default();
     *number += 1;
     let envelope = Envelope {
@@ -159,7 +299,7 @@ fn send_event(
         previous_message_number: number.saturating_sub(1),
         event,
     };
-    swarm.behaviour_mut().chat.send_request(&peer, envelope);
+    swarm.behaviour_mut().chat.send_request(&peer, envelope)
 }
 
 fn validate_envelope(
@@ -186,6 +326,11 @@ fn validate_envelope(
             validate_text_message(message).map_err(|_| "messaggio di testo non valido")
         }
         ChatEvent::Nudge(nudge) if nudge.intensity != 1 => Err("intensità trillo non valida"),
+        ChatEvent::Presence(presence)
+            if presence.display_name.trim().is_empty() || presence.display_name.len() > 64 =>
+        {
+            Err("presenza non valida")
+        }
         _ => Ok(()),
     }
 }
@@ -206,27 +351,101 @@ fn conversation_id(first: PeerId, second: PeerId) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-fn receive_event(
-    peer: PeerId,
-    event: &ChatEvent,
-    store: &Path,
-    triggers: &mut Vec<Trigger>,
-    nudge_limits: &mut HashMap<PeerId, NudgeRateLimit>,
-) {
+fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) -> ProtocolResponse {
     match event {
-        ChatEvent::Text(message) => println!(
-            "{peer}: {} [{} emoticon]",
-            message.text,
-            message.emoticons.len()
-        ),
-        ChatEvent::Nudge(_) => match nudge_limits.entry(peer).or_default().try_acquire(now_ms()) {
-            Ok(()) => println!("{peer}: *** TRILLO ***"),
-            Err(_) => eprintln!("{peer}: trillo ricevuto ignorato per rate limit"),
+        ChatEvent::Text(message) => {
+            println!(
+                "{peer}: {} [{} emoticon]",
+                message.text,
+                message.emoticons.len()
+            );
+            record(context.history, &peer, "in", "text", &message.text);
+            notify(context.notifications, "Nuovo messaggio", &message.text);
+            ProtocolResponse::Ack
+        }
+        ChatEvent::Nudge(_) => match context
+            .nudge_limits
+            .entry(peer)
+            .or_default()
+            .try_acquire(now_ms())
+        {
+            Ok(()) => {
+                println!("{peer}: *** TRILLO ***");
+                record(context.history, &peer, "in", "nudge", "trillo");
+                notify(context.notifications, "Trillo", "Hai ricevuto un trillo");
+                ProtocolResponse::Ack
+            }
+            Err(_) => {
+                eprintln!("{peer}: trillo ricevuto ignorato per rate limit");
+                ProtocolResponse::Ack
+            }
         },
-        ChatEvent::EmoticonOffer(offer) => match save_offer(store, offer, triggers) {
-            Ok(path) => println!("{peer}: emoticon salvata in {}", path.display()),
-            Err(error) => eprintln!("{peer}: emoticon rifiutata: {error}"),
+        ChatEvent::EmoticonOffer(offer) => {
+            match save_offer(context.emotes, offer, context.triggers) {
+                Ok(path) => {
+                    println!("{peer}: emoticon salvata in {}", path.display());
+                    record(context.history, &peer, "in", "emote", &offer.metadata.name);
+                    ProtocolResponse::Ack
+                }
+                Err(error) => ProtocolResponse::Rejected(error.to_string()),
+            }
+        }
+        ChatEvent::AttachmentOffer(manifest) => {
+            match context.attachments.accept_offer(manifest.clone()) {
+                Ok((missing, completed)) => {
+                    record(context.history, &peer, "in", "file", &manifest.filename);
+                    if let Some(path) = completed {
+                        println!("{peer}: file già completo in {}", path.display());
+                        notify(context.notifications, "File ricevuto", &manifest.filename);
+                    }
+                    ProtocolResponse::MissingChunks(missing)
+                }
+                Err(error) => ProtocolResponse::Rejected(error.to_string()),
+            }
+        }
+        ChatEvent::AttachmentChunk(chunk) => match context.attachments.accept_chunk(chunk) {
+            Ok(Some(path)) => {
+                println!("{peer}: file ricevuto in {}", path.display());
+                notify(
+                    context.notifications,
+                    "File ricevuto",
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("file"),
+                );
+                ProtocolResponse::Ack
+            }
+            Ok(None) => ProtocolResponse::Ack,
+            Err(error) => ProtocolResponse::Rejected(error.to_string()),
         },
+        ChatEvent::Presence(presence) => {
+            context
+                .peer_names
+                .insert(peer, presence.display_name.clone());
+            println!(
+                "{} è {}",
+                presence.display_name,
+                if presence.online { "online" } else { "offline" }
+            );
+            ProtocolResponse::Ack
+        }
+    }
+}
+
+fn record(history: &History, peer: &PeerId, direction: &str, kind: &str, body: &str) {
+    if let Err(error) = history.record(&peer.to_string(), direction, kind, body, now_ms()) {
+        eprintln!("cronologia non aggiornata: {error}");
+    }
+}
+
+fn notify(enabled: bool, summary: &str, body: &str) {
+    if enabled {
+        notify_rust::Notification::new()
+            .summary(summary)
+            .body(body)
+            .appname("msnnext")
+            .show()
+            .ok();
     }
 }
 
@@ -429,6 +648,10 @@ struct Args {
     connect: Option<Multiaddr>,
     identity: PathBuf,
     emotes: PathBuf,
+    downloads: PathBuf,
+    history: PathBuf,
+    notifications: bool,
+    name: String,
 }
 
 impl Args {
@@ -437,6 +660,10 @@ impl Args {
         let mut connect = None;
         let mut identity = PathBuf::from(".msnnext/identity.key");
         let mut emotes = PathBuf::from(".msnnext/emoticons");
+        let mut downloads = PathBuf::from(".msnnext/downloads");
+        let mut history = PathBuf::from(".msnnext/history.db");
+        let mut notifications = false;
+        let mut name = std::env::var("USERNAME").unwrap_or_else(|_| "Amico".into());
         let mut args = std::env::args().skip(1);
         while let Some(flag) = args.next() {
             let value = args
@@ -447,14 +674,25 @@ impl Args {
                 "--connect" => connect = Some(value.parse()?),
                 "--identity" => identity = value.into(),
                 "--emotes" => emotes = value.into(),
+                "--downloads" => downloads = value.into(),
+                "--history" => history = value.into(),
+                "--notify" => notifications = value.parse()?,
+                "--name" => name = value,
                 _ => return Err(format!("opzione sconosciuta: {flag}").into()),
             }
+        }
+        if name.trim().is_empty() || name.len() > 64 {
+            return Err("nome non valido".into());
         }
         Ok(Self {
             listen,
             connect,
             identity,
             emotes,
+            downloads,
+            history,
+            notifications,
+            name,
         })
     }
 }
