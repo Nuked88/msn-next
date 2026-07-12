@@ -34,7 +34,9 @@ button { color:inherit; }
 .nudge-button { padding:9px 14px; border:1px solid #d9e0ea; border-radius:12px; background:white; font-weight:700; cursor:pointer; }
 .nudge-button span { color:var(--blue); font-size:19px; vertical-align:-1px; }
 .nudge-button:disabled { opacity:.4; cursor:not-allowed; }
-.messages { overflow-y:auto; padding:28px; scroll-behavior:smooth; }
+.messages { position:relative; overflow-y:auto; padding:28px; scroll-behavior:smooth; transition:background .18s ease,box-shadow .18s ease; }
+.messages.drop-ready { background:#f4f8ff; box-shadow:inset 0 0 0 2px var(--blue); }
+.messages.drop-ready::after { content:'Rilascia per inviare'; position:sticky; z-index:5; top:calc(50% - 24px); left:50%; display:block; width:max-content; margin:auto; padding:13px 18px; border-radius:14px; background:var(--blue); color:white; font-weight:700; box-shadow:0 12px 30px rgba(8,102,255,.25); pointer-events:none; animation:messageIn .18s both; }
 .welcome { min-height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; animation:arrive .6s both; }
 .orbit { width:100px; height:100px; display:grid; place-items:center; margin-bottom:26px; border:1px solid #c9dcff; border-radius:50%; box-shadow:0 0 0 14px #f5f8ff,0 0 0 15px #eaf1ff; }
 .orbit span { display:grid; place-items:center; width:56px; height:56px; border-radius:19px; background:var(--blue); color:white; font-size:34px; transform:rotate(-8deg); }

@@ -6,8 +6,14 @@ license = "AGPL-3.0-or-later"
 
 [dependencies]
 blake3 = "1"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+cbor4ii = { version = "0.3", features = ["serde1", "use_std"] }
 futures = "0.3"
 imagesize = "0.14"
-libp2p = { version = "0.56", features = ["cbor", "macros", "quic", "request-response", "tokio"] }
+libp2p = { version = "0.56", features = ["cbor", "macros", "mdns", "quic", "request-response", "tokio"] }
 msnnext-protocol = { path = "../../crates/protocol" }
+notify-rust = "4"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread"] }
