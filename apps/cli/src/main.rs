@@ -1,10 +1,15 @@
 mod attachments;
 mod connectivity;
 mod contacts;
+mod crypto;
 mod history;
 
 use attachments::{build_manifest, read_chunk, Receiver};
 use connectivity::{split_peer_address, FallbackPlanner, Recovery};
+use crypto::{
+    accepts_inbound, needs_outbound_handshake, respond as respond_hybrid, HybridInitiator,
+    HybridResponse, RatchetMessage, RatchetSession, SessionKey,
+};
 use futures::StreamExt;
 use history::History;
 use libp2p::{
@@ -34,10 +39,13 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 // Emoticons stay tiny and atomic; regular attachments use the resumable chunk protocol.
 const MAX_EMOTICON_BYTES: usize = 350_000;
 const MAX_EMOTICON_SIDE: usize = 512;
+const MAX_REQUEST_RETRIES: u8 = 2;
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
     chat: request_response::cbor::Behaviour<Envelope, ProtocolResponse>,
+    secure_chat: request_response::cbor::Behaviour<RatchetMessage, ProtocolResponse>,
+    handshake: request_response::cbor::Behaviour<crypto::HybridClientHello, HybridResponse>,
     mdns: mdns::tokio::Behaviour,
     identify: identify::Behaviour,
     kad: kad::Behaviour<kad::store::MemoryStore>,
@@ -52,6 +60,16 @@ struct PendingOffer {
     peer: PeerId,
     path: PathBuf,
     manifest: AttachmentManifest,
+    retries: u8,
+}
+
+struct PendingTransfer {
+    peer: PeerId,
+    path: PathBuf,
+    manifest: AttachmentManifest,
+    remaining: VecDeque<u32>,
+    current: u32,
+    retries: u8,
 }
 
 struct Incoming<'a> {
@@ -90,6 +108,20 @@ fn build_swarm(
                 chat: request_response::cbor::Behaviour::new(
                     [(
                         StreamProtocol::new("/msnnext/chat/1"),
+                        ProtocolSupport::Full,
+                    )],
+                    request_response::Config::default(),
+                ),
+                secure_chat: request_response::cbor::Behaviour::new(
+                    [(
+                        StreamProtocol::new("/msnnext/chat/2"),
+                        ProtocolSupport::Full,
+                    )],
+                    request_response::Config::default(),
+                ),
+                handshake: request_response::cbor::Behaviour::new(
+                    [(
+                        StreamProtocol::new("/msnnext/handshake/1"),
                         ProtocolSupport::Full,
                     )],
                     request_response::Config::default(),
@@ -162,7 +194,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     println!("peer: {local_peer_id}");
-    println!("comandi: text <messaggio> | emote <trigger> <file> | file <percorso> | contact export/import <file> | nudge | history | quit");
+    println!("comandi: text <messaggio> | emote <trigger> <file> | file <percorso> | contact qr | contact export/import <file> | nudge | history | quit");
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut peers = HashSet::new();
@@ -191,6 +223,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut incoming_nudge_limits = HashMap::<PeerId, NudgeRateLimit>::new();
     let mut sent_numbers = HashMap::<PeerId, u64>::new();
     let mut pending_offers = HashMap::<request_response::OutboundRequestId, PendingOffer>::new();
+    let mut pending_transfers =
+        HashMap::<request_response::OutboundRequestId, PendingTransfer>::new();
+    let mut pending_handshakes =
+        HashMap::<request_response::OutboundRequestId, (PeerId, HybridInitiator)>::new();
+    let mut pending_inbound_handshakes =
+        HashMap::<request_response::InboundRequestId, (PeerId, SessionKey)>::new();
+    let mut sessions = HashMap::<PeerId, RatchetSession>::new();
     let mut attachment_receiver = Receiver::new(args.downloads.clone());
     let mut peer_names = HashMap::<PeerId, String>::new();
     let mut nudge_counter = 0_u64;
@@ -208,14 +247,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 },
                 Some(line) if line.starts_with("contact export ") => {
                     let path = Path::new(line[15..].trim());
-                    let addresses = swarm.listeners().cloned().map(|address| {
-                        split_peer_address(&address)
-                            .map(|(_, base)| base)
-                            .unwrap_or(address)
-                    });
-                    match contacts::export(path, &args.name, local_peer_id, &public_key, addresses) {
+                    match contacts::export(
+                        path,
+                        &args.name,
+                        local_peer_id,
+                        &public_key,
+                        contact_addresses(&swarm).into_iter(),
+                    ) {
                         Ok(()) => println!("scheda contatto salvata in {}", path.display()),
                         Err(error) => eprintln!("esportazione contatto fallita: {error}"),
+                    }
+                },
+                Some(line) if line == "contact qr" => {
+                    let result = contacts::link(
+                        &args.name,
+                        local_peer_id,
+                        &public_key,
+                        contact_addresses(&swarm).into_iter(),
+                    )
+                    .and_then(|link| {
+                        let qr = contacts::render_qr(&link)?;
+                        Ok((link, qr))
+                    });
+                    match result {
+                        Ok((link, qr)) => println!("{qr}\n{link}"),
+                        Err(error) => eprintln!("generazione QR fallita: {error}"),
                     }
                 },
                 Some(line) if line.starts_with("contact import-link ") => match contacts::import_link(line[20..].trim()) {
@@ -262,7 +318,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     for peer in &peers {
                         match nudge_limits.entry(*peer).or_default().try_acquire(now) {
                             Ok(()) => {
-                                send_event(&mut swarm, *peer, local_peer_id, &mut sent_numbers, ChatEvent::Nudge(Nudge { id, intensity: 1, timestamp_ms: now }));
+                                send_event(&mut swarm, &mut sessions, *peer, local_peer_id, &mut sent_numbers, ChatEvent::Nudge(Nudge { id, intensity: 1, timestamp_ms: now }));
                                 record(&history, peer, "out", "nudge", "trillo");
                             }
                             Err(wait_ms) => eprintln!("trillo limitato per {peer}: riprova tra {}s", wait_ms.div_ceil(1_000)),
@@ -275,13 +331,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .map_err(|error| format!("trigger emoticon non valido: {error:?}"))?;
                     for peer in &peers { record(&history, peer, "out", "text", &text); }
                     let event = ChatEvent::Text(TextMessage { text, emoticons });
-                    broadcast(&mut swarm, &peers, local_peer_id, &mut sent_numbers, event);
+                    broadcast(&mut swarm, &mut sessions, &peers, local_peer_id, &mut sent_numbers, event);
                 }
                 Some(line) if line.starts_with("emote ") => match parse_emote_command(&line, &args.emotes, &mut triggers) {
                     Ok(offer) => {
                         println!("emoticon salvata: {}", offer.metadata.name);
                         for peer in &peers { record(&history, peer, "out", "emote", &offer.metadata.name); }
-                        broadcast(&mut swarm, &peers, local_peer_id, &mut sent_numbers, ChatEvent::EmoticonOffer(offer));
+                        broadcast(&mut swarm, &mut sessions, &peers, local_peer_id, &mut sent_numbers, ChatEvent::EmoticonOffer(offer));
                     }
                     Err(error) => eprintln!("emoticon rifiutata: {error}"),
                 },
@@ -292,8 +348,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         println!("offerta file: {} ({} chunk)", manifest.filename, manifest.chunks.len());
                         for peer in &peers {
                             record(&history, peer, "out", "file", &manifest.filename);
-                            let request_id = send_event(&mut swarm, *peer, local_peer_id, &mut sent_numbers, ChatEvent::AttachmentOffer(manifest.clone()));
-                            pending_offers.insert(request_id, PendingOffer { peer: *peer, path: path.clone(), manifest: manifest.clone() });
+                            if let Some(request_id) = send_event(&mut swarm, &mut sessions, *peer, local_peer_id, &mut sent_numbers, ChatEvent::AttachmentOffer(manifest.clone())) {
+                                pending_offers.insert(request_id, PendingOffer { peer: *peer, path: path.clone(), manifest: manifest.clone(), retries: 0 });
+                            }
                         }
                     }
                     Err(error) => eprintln!("file rifiutato: {error}"),
@@ -330,11 +387,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                     if (known_contacts.contains(&peer_id) || is_manual) && peers.insert(peer_id) {
                         println!("connesso: {peer_id}");
-                        send_event(&mut swarm, peer_id, local_peer_id, &mut sent_numbers, ChatEvent::Presence(PresenceUpdate { display_name: args.name.clone(), online: true }));
+                        send_event(&mut swarm, &mut sessions, peer_id, local_peer_id, &mut sent_numbers, ChatEvent::Presence(PresenceUpdate { display_name: args.name.clone(), online: true }));
+                        maybe_start_hybrid_handshake(
+                            &mut swarm,
+                            &mut pending_handshakes,
+                            &sessions,
+                            local_peer_id,
+                            peer_id,
+                        );
                     }
                 }
                 SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
                     if num_established == 0 && peers.remove(&peer_id) {
+                        sessions.remove(&peer_id);
+                        pending_inbound_handshakes
+                            .retain(|_, (pending_peer, _)| *pending_peer != peer_id);
                         nudge_limits.remove(&peer_id);
                         incoming_nudge_limits.remove(&peer_id);
                         println!("offline: {}", peer_names.get(&peer_id).map_or_else(|| peer_id.to_string(), Clone::clone));
@@ -342,38 +409,242 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Chat(request_response::Event::Message { peer, message, .. })) => match message {
                     request_response::Message::Request { request, channel, .. } => {
-                        let response = match validate_envelope(peer, local_peer_id, &request) {
-                            Ok(()) => receive_event(peer, &request.event, &mut Incoming {
-                                emotes: &args.emotes,
-                                triggers: &mut triggers,
-                                nudge_limits: &mut incoming_nudge_limits,
-                                attachments: &mut attachment_receiver,
-                                history: &history,
-                                notifications: args.notifications,
-                                peer_names: &mut peer_names,
-                            }),
-                            Err(error) => ProtocolResponse::Rejected(error.into()),
+                        let validation = if matches!(&request.event, ChatEvent::Presence(_)) {
+                            validate_envelope(peer, local_peer_id, &request)
+                        } else {
+                            Err("usa il protocollo chat cifrato")
+                        };
+                        let (response, valid) = match validation {
+                            Ok(()) => (
+                                receive_event(peer, &request.event, &mut Incoming {
+                                    emotes: &args.emotes,
+                                    triggers: &mut triggers,
+                                    nudge_limits: &mut incoming_nudge_limits,
+                                    attachments: &mut attachment_receiver,
+                                    history: &history,
+                                    notifications: args.notifications,
+                                    peer_names: &mut peer_names,
+                                }),
+                                true,
+                            ),
+                            Err(error) => (ProtocolResponse::Rejected(error.into()), false),
                         };
                         swarm.behaviour_mut().chat.send_response(channel, response).ok();
+                        if valid {
+                            if should_classify_application_peer(
+                                true,
+                                infrastructure_peers.contains(&peer),
+                                peers.contains(&peer),
+                            ) {
+                                known_contacts.insert(peer);
+                                peers.insert(peer);
+                                println!("connesso: {peer}");
+                                send_event(
+                                    &mut swarm,
+                                    &mut sessions,
+                                    peer,
+                                    local_peer_id,
+                                    &mut sent_numbers,
+                                    ChatEvent::Presence(PresenceUpdate {
+                                        display_name: args.name.clone(),
+                                        online: true,
+                                    }),
+                                );
+                            }
+                            maybe_start_hybrid_handshake(
+                                &mut swarm,
+                                &mut pending_handshakes,
+                                &sessions,
+                                local_peer_id,
+                                peer,
+                            );
+                        }
+                    }
+                    request_response::Message::Response { .. } => {}
+                },
+                SwarmEvent::Behaviour(BehaviourEvent::SecureChat(request_response::Event::Message { peer, message, .. })) => match message {
+                    request_response::Message::Request { request, channel, .. } => {
+                        let envelope = sessions
+                            .get_mut(&peer)
+                            .ok_or("sessione sicura non disponibile")
+                            .and_then(|session| {
+                                decrypt_envelope(session, peer, local_peer_id, &request)
+                                    .map_err(|_| "messaggio cifrato non valido")
+                            });
+                        let response = match envelope {
+                            Ok(envelope) => match validate_envelope(peer, local_peer_id, &envelope) {
+                                Ok(()) => receive_event(peer, &envelope.event, &mut Incoming {
+                                    emotes: &args.emotes,
+                                    triggers: &mut triggers,
+                                    nudge_limits: &mut incoming_nudge_limits,
+                                    attachments: &mut attachment_receiver,
+                                    history: &history,
+                                    notifications: args.notifications,
+                                    peer_names: &mut peer_names,
+                                }),
+                                Err(error) => ProtocolResponse::Rejected(error.into()),
+                            },
+                            Err(error) => ProtocolResponse::Rejected(error.into()),
+                        };
+                        swarm.behaviour_mut().secure_chat.send_response(channel, response).ok();
                     }
                     request_response::Message::Response { request_id, response } => {
                         if let Some(pending) = pending_offers.remove(&request_id) {
                             match response {
                                 ProtocolResponse::MissingChunks(indices) => {
                                     println!("invio {}: {} chunk richiesti", pending.manifest.filename, indices.len());
-                                    for index in indices {
-                                        match read_chunk(&pending.path, &pending.manifest, index) {
-                                            Ok(chunk) => { send_event(&mut swarm, pending.peer, local_peer_id, &mut sent_numbers, ChatEvent::AttachmentChunk(chunk)); }
-                                            Err(error) => { eprintln!("invio interrotto: {error}"); break; }
-                                        }
-                                    }
+                                    send_next_transfer_chunk(
+                                        &mut swarm,
+                                        &mut sessions,
+                                        &mut sent_numbers,
+                                        &mut pending_transfers,
+                                        local_peer_id,
+                                        PendingTransfer {
+                                            peer: pending.peer,
+                                            path: pending.path,
+                                            manifest: pending.manifest,
+                                            remaining: indices.into(),
+                                            current: 0,
+                                            retries: 0,
+                                        },
+                                    );
                                 }
                                 ProtocolResponse::Rejected(error) => eprintln!("file rifiutato da {peer}: {error}"),
-                                ProtocolResponse::Ack => {}
+                                ProtocolResponse::Ack => println!("file già completo sul destinatario"),
+                            }
+                        } else if let Some(transfer) = pending_transfers.remove(&request_id) {
+                            match response {
+                                ProtocolResponse::Ack => send_next_transfer_chunk(
+                                    &mut swarm,
+                                    &mut sessions,
+                                    &mut sent_numbers,
+                                    &mut pending_transfers,
+                                    local_peer_id,
+                                    transfer,
+                                ),
+                                ProtocolResponse::Rejected(error) => {
+                                    eprintln!("chunk rifiutato da {peer}: {error}")
+                                }
+                                ProtocolResponse::MissingChunks(_) => {
+                                    eprintln!("risposta chunk non valida da {peer}")
+                                }
                             }
                         }
                     }
                 },
+                SwarmEvent::Behaviour(BehaviourEvent::SecureChat(request_response::Event::OutboundFailure { peer, request_id, error, .. })) => {
+                    if let Some(mut pending) = pending_offers.remove(&request_id) {
+                        if let Some(retries) = next_request_retry(pending.retries) {
+                            pending.retries = retries;
+                            if let Some(next_id) = send_event(
+                                &mut swarm,
+                                &mut sessions,
+                                pending.peer,
+                                local_peer_id,
+                                &mut sent_numbers,
+                                ChatEvent::AttachmentOffer(pending.manifest.clone()),
+                            ) {
+                                pending_offers.insert(next_id, pending);
+                            }
+                        } else {
+                            eprintln!("offerta file fallita definitivamente per {peer}: {error}");
+                        }
+                    } else if let Some(mut transfer) = pending_transfers.remove(&request_id) {
+                        if let Some(retries) = next_request_retry(transfer.retries) {
+                            transfer.retries = retries;
+                            send_current_transfer_chunk(
+                                &mut swarm,
+                                &mut sessions,
+                                &mut sent_numbers,
+                                &mut pending_transfers,
+                                local_peer_id,
+                                transfer,
+                            );
+                        } else {
+                            eprintln!("trasferimento file fallito definitivamente per {peer}: {error}");
+                        }
+                    } else {
+                        eprintln!("invio cifrato fallito per {peer}: {error}");
+                    }
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::SecureChat(request_response::Event::InboundFailure { peer, error, .. })) => {
+                    eprintln!("messaggio cifrato non ricevibile da {peer}: {error}");
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::SecureChat(request_response::Event::ResponseSent { .. })) => {}
+                SwarmEvent::Behaviour(BehaviourEvent::Handshake(request_response::Event::Message { peer, message, .. })) => match message {
+                    request_response::Message::Request { request_id, request, channel } => {
+                        let authorized = handshake_peer_authorized(
+                            known_contacts.contains(&peer),
+                            peers.contains(&peer),
+                        );
+                        let (response, pending_key) = if !accepts_inbound(local_peer_id, peer)
+                            || !authorized
+                        {
+                            (
+                                HybridResponse::Rejected("handshake non autorizzato".into()),
+                                None,
+                            )
+                        } else {
+                            match respond_hybrid(&request, peer, local_peer_id) {
+                                Ok((hello, session_key)) => (
+                                    HybridResponse::Accepted(hello),
+                                    Some(session_key),
+                                ),
+                                Err(error) => (HybridResponse::Rejected(error.to_string()), None),
+                            }
+                        };
+                        if swarm.behaviour_mut().handshake.send_response(channel, response).is_ok() {
+                            if let Some(session_key) = pending_key {
+                                pending_inbound_handshakes.insert(request_id, (peer, session_key));
+                            }
+                        } else {
+                            eprintln!("risposta handshake non consegnata a {peer}");
+                        }
+                    }
+                    request_response::Message::Response { request_id, response } => {
+                        let Some((expected_peer, initiator)) = pending_handshakes.remove(&request_id) else {
+                            continue;
+                        };
+                        if expected_peer != peer {
+                            eprintln!("risposta handshake ricevuta dal peer errato");
+                            continue;
+                        }
+                        match response {
+                            HybridResponse::Accepted(hello) => match initiator.finish(&hello) {
+                                Ok(session_key) => {
+                                    sessions.insert(
+                                        peer,
+                                        RatchetSession::new(session_key, local_peer_id, peer),
+                                    );
+                                    println!("handshake ibrido completato: {peer}");
+                                }
+                                Err(error) => eprintln!("handshake ibrido fallito con {peer}: {error}"),
+                            },
+                            HybridResponse::Rejected(error) => {
+                                eprintln!("handshake ibrido rifiutato da {peer}: {error:?}");
+                            }
+                        }
+                    }
+                },
+                SwarmEvent::Behaviour(BehaviourEvent::Handshake(request_response::Event::OutboundFailure { peer, request_id, error, .. })) => {
+                    pending_handshakes.remove(&request_id);
+                    eprintln!("handshake ibrido fallito con {peer}: {error}");
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Handshake(request_response::Event::InboundFailure { peer, request_id, error, .. })) => {
+                    pending_inbound_handshakes.remove(&request_id);
+                    eprintln!("richiesta handshake non valida da {peer}: {error}");
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Handshake(request_response::Event::ResponseSent { peer, request_id, .. })) => {
+                    if let Some((expected_peer, session_key)) = pending_inbound_handshakes.remove(&request_id) {
+                        if expected_peer == peer {
+                            sessions.insert(
+                                peer,
+                                RatchetSession::new(session_key, local_peer_id, peer),
+                            );
+                            println!("handshake ibrido completato: {peer}");
+                        }
+                    }
+                }
                 SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                     for address in info.listen_addrs {
                         let address = match split_peer_address(&address) {
@@ -446,6 +717,65 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn should_classify_application_peer(
+    valid_message: bool,
+    infrastructure: bool,
+    already_connected: bool,
+) -> bool {
+    valid_message && !infrastructure && !already_connected
+}
+
+fn handshake_peer_authorized(known_contact: bool, active_peer: bool) -> bool {
+    known_contact || active_peer
+}
+
+fn next_request_retry(attempts: u8) -> Option<u8> {
+    (attempts < MAX_REQUEST_RETRIES).then_some(attempts + 1)
+}
+
+fn maybe_start_hybrid_handshake(
+    swarm: &mut Swarm<Behaviour>,
+    pending: &mut HashMap<request_response::OutboundRequestId, (PeerId, HybridInitiator)>,
+    established: &HashMap<PeerId, RatchetSession>,
+    local_peer: PeerId,
+    remote_peer: PeerId,
+) {
+    let already_pending = pending
+        .values()
+        .any(|(pending_peer, _)| *pending_peer == remote_peer);
+    if !needs_outbound_handshake(
+        local_peer,
+        remote_peer,
+        established.contains_key(&remote_peer),
+        already_pending,
+    ) {
+        return;
+    }
+
+    match HybridInitiator::start(local_peer, remote_peer) {
+        Ok((initiator, hello)) => {
+            let request_id = swarm
+                .behaviour_mut()
+                .handshake
+                .send_request(&remote_peer, hello);
+            pending.insert(request_id, (remote_peer, initiator));
+        }
+        Err(error) => eprintln!("avvio handshake ibrido fallito: {error}"),
+    }
+}
+
+fn contact_addresses(swarm: &Swarm<Behaviour>) -> Vec<Multiaddr> {
+    swarm
+        .listeners()
+        .cloned()
+        .map(|address| {
+            split_peer_address(&address)
+                .map(|(_, base)| base)
+                .unwrap_or(address)
+        })
+        .collect()
+}
+
 fn connect_contact(
     swarm: &mut Swarm<Behaviour>,
     peer: PeerId,
@@ -508,8 +838,36 @@ fn execute_recovery(
     }
 }
 
+fn encrypt_envelope(
+    session: &mut RatchetSession,
+    sender: PeerId,
+    recipient: PeerId,
+    envelope: &Envelope,
+) -> Result<RatchetMessage, Box<dyn Error>> {
+    let encoded = cbor4ii::serde::to_vec(Vec::new(), envelope)?;
+    Ok(session.encrypt(&encoded, &chat_associated_data(sender, recipient))?)
+}
+
+fn decrypt_envelope(
+    session: &mut RatchetSession,
+    sender: PeerId,
+    recipient: PeerId,
+    message: &RatchetMessage,
+) -> Result<Envelope, Box<dyn Error>> {
+    let encoded = session.decrypt(message, &chat_associated_data(sender, recipient))?;
+    Ok(cbor4ii::serde::from_slice(&encoded)?)
+}
+
+fn chat_associated_data(sender: PeerId, recipient: PeerId) -> Vec<u8> {
+    let mut associated_data = b"/msnnext/chat/2".to_vec();
+    associated_data.extend_from_slice(&sender.to_bytes());
+    associated_data.extend_from_slice(&recipient.to_bytes());
+    associated_data
+}
+
 fn broadcast(
     swarm: &mut libp2p::Swarm<Behaviour>,
+    sessions: &mut HashMap<PeerId, RatchetSession>,
     peers: &HashSet<PeerId>,
     local_peer_id: PeerId,
     sent_numbers: &mut HashMap<PeerId, u64>,
@@ -519,28 +877,114 @@ fn broadcast(
         eprintln!("nessun peer collegato");
     }
     for peer in peers {
-        send_event(swarm, *peer, local_peer_id, sent_numbers, event.clone());
+        send_event(
+            swarm,
+            sessions,
+            *peer,
+            local_peer_id,
+            sent_numbers,
+            event.clone(),
+        );
     }
 }
 
 fn send_event(
     swarm: &mut libp2p::Swarm<Behaviour>,
+    sessions: &mut HashMap<PeerId, RatchetSession>,
     peer: PeerId,
     local_peer_id: PeerId,
     sent_numbers: &mut HashMap<PeerId, u64>,
     event: ChatEvent,
-) -> request_response::OutboundRequestId {
-    let number = sent_numbers.entry(peer).or_default();
-    *number += 1;
+) -> Option<request_response::OutboundRequestId> {
+    let secure = sessions.contains_key(&peer);
+    if !secure && !matches!(event, ChatEvent::Presence(_)) {
+        eprintln!("sessione sicura non pronta per {peer}");
+        return None;
+    }
+    let previous = sent_numbers.get(&peer).copied().unwrap_or_default();
+    let number = match previous.checked_add(1) {
+        Some(number) => number,
+        None => {
+            eprintln!("contatore messaggi esaurito per {peer}");
+            return None;
+        }
+    };
     let envelope = Envelope {
         protocol_version: PROTOCOL_VERSION,
         conversation_id: conversation_id(local_peer_id, peer),
         sender_device_id: device_id(local_peer_id),
-        message_number: *number,
-        previous_message_number: number.saturating_sub(1),
+        message_number: number,
+        previous_message_number: previous,
         event,
     };
-    swarm.behaviour_mut().chat.send_request(&peer, envelope)
+    let request_id = if let Some(session) = sessions.get_mut(&peer) {
+        let encrypted = match encrypt_envelope(session, local_peer_id, peer, &envelope) {
+            Ok(encrypted) => encrypted,
+            Err(error) => {
+                eprintln!("cifratura messaggio fallita per {peer}: {error}");
+                return None;
+            }
+        };
+        swarm
+            .behaviour_mut()
+            .secure_chat
+            .send_request(&peer, encrypted)
+    } else {
+        swarm.behaviour_mut().chat.send_request(&peer, envelope)
+    };
+    sent_numbers.insert(peer, number);
+    Some(request_id)
+}
+
+fn send_next_transfer_chunk(
+    swarm: &mut Swarm<Behaviour>,
+    sessions: &mut HashMap<PeerId, RatchetSession>,
+    sent_numbers: &mut HashMap<PeerId, u64>,
+    pending_transfers: &mut HashMap<request_response::OutboundRequestId, PendingTransfer>,
+    local_peer_id: PeerId,
+    mut transfer: PendingTransfer,
+) {
+    let Some(index) = transfer.remaining.pop_front() else {
+        println!("invio completato: {}", transfer.manifest.filename);
+        return;
+    };
+    transfer.current = index;
+    transfer.retries = 0;
+    send_current_transfer_chunk(
+        swarm,
+        sessions,
+        sent_numbers,
+        pending_transfers,
+        local_peer_id,
+        transfer,
+    );
+}
+
+fn send_current_transfer_chunk(
+    swarm: &mut Swarm<Behaviour>,
+    sessions: &mut HashMap<PeerId, RatchetSession>,
+    sent_numbers: &mut HashMap<PeerId, u64>,
+    pending_transfers: &mut HashMap<request_response::OutboundRequestId, PendingTransfer>,
+    local_peer_id: PeerId,
+    transfer: PendingTransfer,
+) {
+    let chunk = match read_chunk(&transfer.path, &transfer.manifest, transfer.current) {
+        Ok(chunk) => chunk,
+        Err(error) => {
+            eprintln!("invio interrotto: {error}");
+            return;
+        }
+    };
+    if let Some(request_id) = send_event(
+        swarm,
+        sessions,
+        transfer.peer,
+        local_peer_id,
+        sent_numbers,
+        ChatEvent::AttachmentChunk(chunk),
+    ) {
+        pending_transfers.insert(request_id, transfer);
+    }
 }
 
 fn validate_envelope(
@@ -1010,6 +1454,55 @@ mod tests {
             validate_envelope(bob, alice, &envelope),
             Err("conversazione non valida")
         );
+    }
+
+    #[test]
+    fn envelope_round_trips_through_the_session_ratchet() {
+        let alice = PeerId::from(Keypair::generate_ed25519().public());
+        let bob = PeerId::from(Keypair::generate_ed25519().public());
+        let (initiator, hello) = HybridInitiator::start(alice, bob).unwrap();
+        let (response, bob_key) = respond_hybrid(&hello, alice, bob).unwrap();
+        let alice_key = initiator.finish(&response).unwrap();
+        let mut alice_session = RatchetSession::new(alice_key, alice, bob);
+        let mut bob_session = RatchetSession::new(bob_key, bob, alice);
+        let envelope = Envelope {
+            protocol_version: PROTOCOL_VERSION,
+            conversation_id: conversation_id(alice, bob),
+            sender_device_id: device_id(alice),
+            message_number: 1,
+            previous_message_number: 0,
+            event: ChatEvent::Text(TextMessage {
+                text: "segreto".into(),
+                emoticons: vec![],
+            }),
+        };
+
+        let encrypted = encrypt_envelope(&mut alice_session, alice, bob, &envelope).unwrap();
+        let decrypted = decrypt_envelope(&mut bob_session, alice, bob, &encrypted).unwrap();
+
+        assert_eq!(decrypted, envelope);
+    }
+
+    #[test]
+    fn valid_presence_classifies_an_unknown_application_peer() {
+        assert!(should_classify_application_peer(true, false, false));
+        assert!(!should_classify_application_peer(true, true, false));
+        assert!(!should_classify_application_peer(false, false, false));
+        assert!(!should_classify_application_peer(true, false, true));
+    }
+
+    #[test]
+    fn handshake_requires_an_authorized_application_peer() {
+        assert!(!handshake_peer_authorized(false, false));
+        assert!(handshake_peer_authorized(true, false));
+        assert!(handshake_peer_authorized(false, true));
+    }
+
+    #[test]
+    fn failed_secure_requests_have_bounded_retries() {
+        assert_eq!(next_request_retry(0), Some(1));
+        assert_eq!(next_request_retry(1), Some(2));
+        assert_eq!(next_request_retry(2), None);
     }
 
     #[test]
