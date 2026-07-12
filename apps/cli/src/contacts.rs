@@ -1,5 +1,6 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use libp2p::{identity::PublicKey, multiaddr::Protocol, Multiaddr, PeerId};
+use qrcode::{render::unicode, QrCode};
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fs, path::Path};
 
@@ -19,6 +20,40 @@ pub fn export(
     public_key: &PublicKey,
     addresses: impl Iterator<Item = Multiaddr>,
 ) -> Result<(), Box<dyn Error>> {
+    let encoded = encode(display_name, peer_id, public_key, addresses)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, &encoded)?;
+    println!("{}", encoded_link(&encoded));
+    Ok(())
+}
+
+pub fn link(
+    display_name: &str,
+    peer_id: PeerId,
+    public_key: &PublicKey,
+    addresses: impl Iterator<Item = Multiaddr>,
+) -> Result<String, Box<dyn Error>> {
+    Ok(encoded_link(&encode(
+        display_name,
+        peer_id,
+        public_key,
+        addresses,
+    )?))
+}
+
+pub fn render_qr(payload: &str) -> Result<String, Box<dyn Error>> {
+    let code = QrCode::new(payload.as_bytes())?;
+    Ok(code.render::<unicode::Dense1x2>().quiet_zone(true).build())
+}
+
+fn encode(
+    display_name: &str,
+    peer_id: PeerId,
+    public_key: &PublicKey,
+    addresses: impl Iterator<Item = Multiaddr>,
+) -> Result<Vec<u8>, Box<dyn Error>> {
     let addresses = addresses
         .take(4)
         .map(|address| address.with(Protocol::P2p(peer_id)).to_string())
@@ -30,13 +65,11 @@ pub fn export(
         classic_public_key: URL_SAFE_NO_PAD.encode(public_key.encode_protobuf()),
         bootstrap_addresses: addresses,
     };
-    let encoded = cbor4ii::serde::to_vec(Vec::new(), &card)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, &encoded)?;
-    println!("msnnext://add/{}", URL_SAFE_NO_PAD.encode(encoded));
-    Ok(())
+    Ok(cbor4ii::serde::to_vec(Vec::new(), &card)?)
+}
+
+fn encoded_link(encoded: &[u8]) -> String {
+    format!("msnnext://add/{}", URL_SAFE_NO_PAD.encode(encoded))
 }
 
 pub fn import(path: &Path) -> Result<(String, PeerId, Vec<Multiaddr>), Box<dyn Error>> {
@@ -94,5 +127,36 @@ mod tests {
         fs::write(&path, cbor4ii::serde::to_vec(Vec::new(), &card).unwrap()).unwrap();
         assert!(import(&path).is_err());
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn contact_link_round_trips() {
+        let identity = Keypair::generate_ed25519();
+        let peer_id = PeerId::from(identity.public());
+        let address: Multiaddr = "/ip4/127.0.0.1/tcp/4040".parse().unwrap();
+
+        let link = link(
+            "Alice",
+            peer_id,
+            &identity.public(),
+            std::iter::once(address),
+        )
+        .unwrap();
+        let (name, imported_peer, addresses) = import_link(&link).unwrap();
+
+        assert_eq!(name, "Alice");
+        assert_eq!(imported_peer, peer_id);
+        assert_eq!(addresses.len(), 1);
+        assert!(addresses[0]
+            .to_string()
+            .ends_with(&format!("/p2p/{peer_id}")));
+    }
+
+    #[test]
+    fn contact_link_renders_as_terminal_qr() {
+        let qr = render_qr("msnnext://add/example").unwrap();
+
+        assert!(qr.lines().count() > 10);
+        assert!(qr.contains('█'));
     }
 }

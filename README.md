@@ -55,17 +55,18 @@ La cronologia locale usa SQLite, ma i contenuti delle righe sono cifrati con XCh
 
 Le notifiche desktop si attivano con `--notify true`. Il prototipo web supporta anche il drag-and-drop di immagini e video sulla conversazione; la futura UI Tauri richiamerà lo stesso backend Rust usato da `file`.
 
-## Milestone 3 — in corso
+## Milestone 3 — completata
 
 Il client trova e collega automaticamente gli altri peer msnnext nella LAN tramite mDNS. All'apertura della connessione scambia nome e presenza; la chiusura dell'ultima connessione porta il contatto offline.
 
 ```text
+contact qr
 contact export alice.contact
 contact import alice.contact
 contact import-link msnnext://add/...
 ```
 
-La scheda CBOR contiene nome locale, Peer ID, chiave pubblica classica e fino a quattro indirizzi iniziali. Import e link verificano crittograficamente che chiave e Peer ID corrispondano. Il link è il payload pronto per il QR; il renderer terminale non è ancora incluso.
+La scheda CBOR contiene nome locale, Peer ID, chiave pubblica classica e fino a quattro indirizzi iniziali. Import e link verificano crittograficamente che chiave e Peer ID corrispondano. `contact qr` mostra nel terminale il QR del link verificabile.
 
 La discovery Internet usa una DHT Kademlia isolata nel protocollo `/msnnext/kad/1`. Identify condivide gli indirizzi, AutoNAT rileva la raggiungibilità e DCUtR tenta il passaggio da relay a connessione diretta. Bootstrap e relay sono sempre configurati dall'utente: il binario non contiene infrastruttura pubblica predefinita.
 
@@ -84,4 +85,6 @@ cargo run -p msnnext -- --name Bob --identity .msnnext/bob.key --listen /ip4/0.0
 
 Importando la scheda contatto, il client prova in ordine indirizzi diretti, DHT e relay. Il collaudo reale del hole punching richiede due reti NAT distinte; una singola macchina verifica soltanto bootstrap, prenotazione relay e chat locale.
 
-Resta il rendering QR della scheda contatto per completare la Milestone 3.
+## Milestone 4 — in corso
+
+I peer collegati negoziano una chiave di sessione effimera con X25519 + ML-KEM-768 sul protocollo `/msnnext/handshake/1`. L'integrazione della chiave nel ratchet e le firme ibride sono i prossimi incrementi.
