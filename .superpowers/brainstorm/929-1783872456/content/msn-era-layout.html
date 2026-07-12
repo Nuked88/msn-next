@@ -1,0 +1,102 @@
+<style>
+  .msn-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:18px; margin-top:22px; }
+  .msn-card { border:2px solid transparent; border-radius:16px; overflow:hidden; background:#fff; box-shadow:0 12px 35px rgba(40,78,125,.12); cursor:pointer; transition:.2s ease; }
+  .msn-card:hover { transform:translateY(-3px); box-shadow:0 16px 42px rgba(40,78,125,.18); }
+  .msn-card.selected { border-color:#278ae5; box-shadow:0 0 0 4px rgba(39,138,229,.14),0 16px 42px rgba(40,78,125,.18); }
+  .preview { height:340px; padding:14px; background:linear-gradient(145deg,#e9f8ff,#c9eaf9 55%,#eef9ff); position:relative; overflow:hidden; }
+  .window { overflow:hidden; border:1px solid #7aa9ce; border-radius:10px 10px 7px 7px; background:#fff; box-shadow:0 8px 22px rgba(31,66,104,.22); }
+  .titlebar { height:27px; display:flex; align-items:center; justify-content:space-between; padding:0 9px; color:#fff; background:linear-gradient(#49aee9,#087ac6); font:700 10px Arial; }
+  .dots { display:flex; gap:4px; }.dots i{display:block;width:8px;height:8px;border-radius:50%;background:#dff5ff;border:1px solid rgba(255,255,255,.8)}
+  .identity { display:flex; align-items:center; gap:9px; padding:11px; color:#164a74; background:linear-gradient(#f9fdff,#dff4ff); border-bottom:1px solid #b9d8ec; }
+  .avatar { width:36px;height:36px;display:grid;place-items:center;border-radius:8px;background:#fff;border:3px solid #73c6f0;color:#1677b7;font:700 15px Arial;box-shadow:0 2px 6px #b4d8ed; }
+  .identity b,.identity small{display:block}.identity b{font:700 11px Arial}.identity small{font:9px Arial;color:#53809b;margin-top:2px}
+  .contacts { padding:6px 8px 10px; font-family:Arial; }
+  .group { color:#237cb5;font-size:9px;font-weight:700;padding:6px 2px 4px;border-bottom:1px solid #e2eef5; }
+  .person { display:flex;align-items:center;gap:6px;padding:5px 3px;color:#344b5b;font-size:9px; }
+  .person i { width:9px;height:9px;border-radius:50%;background:#56bb33;box-shadow:inset 0 -1px 0 #278319; }.person.off i{background:#b9c4ca}.person span{color:#8193a0}
+  .chat { position:absolute; width:74%; right:5px; bottom:6px; }
+  .chatbody { display:grid;grid-template-columns:1fr 84px;min-height:195px; }
+  .history { padding:12px 10px 6px;font:10px Arial;color:#3e515e; }.history b{color:#1281bf}.history p{margin:0 0 8px}
+  .side { border-left:1px solid #d9e8f0;padding:10px;background:#f7fbfd }.side .avatar{margin:auto;width:46px;height:46px}
+  .toolbar {display:flex;gap:8px;padding:6px 9px;border-top:1px solid #cfe1ec;background:#edf8fd;color:#137db8;font:9px Arial}
+  .compose {height:43px;margin:0 8px 8px;border:1px solid #adcbdc;background:#fff}
+  .live .titlebar { background:linear-gradient(100deg,#71cbea,#277fd2 55%,#9adfef);height:31px}
+  .live .identity {background:linear-gradient(110deg,#e8f8ff,#fff 65%);padding:13px}
+  .live .avatar{border-radius:50%;border-color:#a6deee}
+  .live .window{border-color:#9cc8df;border-radius:14px 14px 8px 8px}
+  .hybrid {background:linear-gradient(145deg,#edfaff,#d9effa)}
+  .hybrid .window{height:310px}
+  .hybrid .titlebar{height:33px;background:linear-gradient(#6ec8ef,#1687d1)}
+  .hybrid-layout{display:grid;grid-template-columns:38% 62%;height:277px}
+  .hybrid-list{border-right:1px solid #cde2ed;background:#f7fcff}
+  .hybrid-chat{display:flex;flex-direction:column}
+  .hybrid-chat .history{flex:1}.hybrid-chat .compose{height:48px}
+  .card-copy { padding:15px 16px 17px; }
+  .card-copy h3{margin:0 0 6px;font-size:17px}.card-copy p{margin:0;color:#667587;font-size:12px;line-height:1.45}
+  .tag{display:inline-block;margin-top:10px;padding:4px 7px;border-radius:999px;background:#eaf5ff;color:#147fc2;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.08em}
+  @media(max-width:1000px){.msn-grid{grid-template-columns:1fr}.preview{height:300px}.chat{width:69%}}
+</style>
+
+<h2>Quale MSN vuoi ritrovare?</h2>
+<p class="subtitle">La differenza principale è strutturale: MSN classico separava la lista contatti dalle finestre di chat. Seleziona la direzione che senti più vicina.</p>
+
+<div class="msn-grid">
+  <div class="msn-card" data-choice="classic-75" onclick="toggleSelect(this)">
+    <div class="preview">
+      <div class="window" style="width:45%;position:absolute;left:10px;top:13px">
+        <div class="titlebar"><span>MSN Next</span><span class="dots"><i></i><i></i><i></i></span></div>
+        <div class="identity"><div class="avatar">M</div><div><b>Manuel (Online)</b><small>Scrivi un messaggio personale</small></div></div>
+        <div class="contacts">
+          <div class="group">▼ Amici online (3)</div>
+          <div class="person"><i></i><b>Alessio</b><span>— ci sono!</span></div>
+          <div class="person"><i></i><b>PCTEST</b><span>— disponibile</span></div>
+          <div class="person"><i></i><b>Giulia</b></div>
+          <div class="group">▶ Non in linea (5)</div>
+          <div class="person off"><i></i><b>Marco</b></div>
+        </div>
+      </div>
+      <div class="window chat">
+        <div class="titlebar"><span>Conversazione con PCTEST</span><span class="dots"><i></i><i></i><i></i></span></div>
+        <div class="chatbody"><div class="history"><p><b>Manuel scrive:</b><br>Ciao :mega-risata:</p><p><b>PCTEST scrive:</b><br>Finalmente sembra MSN! 😄</p></div><div class="side"><div class="avatar">P</div></div></div>
+        <div class="toolbar">😊 Emoticon　⚡ Trillo　📎 File</div><div class="compose"></div>
+      </div>
+    </div>
+    <div class="card-copy"><h3>A · MSN Messenger 7.5</h3><p>Due finestre, interfaccia XP, lista compatta, chat indipendenti. È la ricostruzione più fedele.</p><span class="tag">Consigliata</span></div>
+  </div>
+
+  <div class="msn-card" data-choice="live-2009" onclick="toggleSelect(this)">
+    <div class="preview live">
+      <div class="window" style="width:48%;position:absolute;left:10px;top:13px">
+        <div class="titlebar"><span>Windows Live style</span><span class="dots"><i></i><i></i><i></i></span></div>
+        <div class="identity"><div class="avatar">M</div><div><b>Manuel</b><small>Disponibile ▾</small></div></div>
+        <div class="contacts">
+          <div class="group">PREFERITI</div>
+          <div class="person"><i></i><b>PCTEST</b><span>— Online</span></div>
+          <div class="person"><i></i><b>Alessio</b><span>— Al lavoro</span></div>
+          <div class="group">ALTRI CONTATTI</div>
+          <div class="person"><i></i><b>Giulia</b></div>
+          <div class="person off"><i></i><b>Marco</b></div>
+        </div>
+      </div>
+      <div class="window chat">
+        <div class="titlebar"><span>PCTEST</span><span class="dots"><i></i><i></i><i></i></span></div>
+        <div class="chatbody"><div class="history"><p><b>PCTEST:</b> guarda questa GIF!</p><p><b>Manuel:</b> :risata:</p></div><div class="side"><div class="avatar">P</div></div></div>
+        <div class="toolbar">Emoticon　Trillo　Invia file</div><div class="compose"></div>
+      </div>
+    </div>
+    <div class="card-copy"><h3>B · Windows Live 2009</h3><p>Ancora MSN, ma più pulito: avatar rotondi, vetro azzurro, gerarchia meno “Windows XP”.</p><span class="tag">Più rifinita</span></div>
+  </div>
+
+  <div class="msn-card" data-choice="unified-retro" onclick="toggleSelect(this)">
+    <div class="preview hybrid">
+      <div class="window" style="position:absolute;inset:14px">
+        <div class="titlebar"><span>MSN Next — PCTEST</span><span class="dots"><i></i><i></i><i></i></span></div>
+        <div class="hybrid-layout">
+          <div class="hybrid-list"><div class="identity"><div class="avatar">M</div><div><b>Manuel</b><small>Online</small></div></div><div class="contacts"><div class="person"><i></i><b>PCTEST</b></div><div class="person"><i></i><b>Alessio</b></div><div class="person off"><i></i><b>Marco</b></div></div></div>
+          <div class="hybrid-chat"><div class="history"><p><b>PCTEST scrive:</b><br>Una sola finestra, look MSN.</p><p><b>Manuel scrive:</b><br>Più pratica, meno fedele.</p></div><div class="toolbar">😊　⚡　📎</div><div class="compose"></div></div>
+        </div>
+      </div>
+    </div>
+    <div class="card-copy"><h3>C · MSN unificato</h3><p>Una sola finestra con estetica MSN. Più semplice da gestire, ma non ricrea davvero l’esperienza originale.</p><span class="tag">Compromesso</span></div>
+  </div>
+</div>

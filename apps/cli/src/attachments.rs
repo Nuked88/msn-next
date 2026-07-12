@@ -211,7 +211,7 @@ impl Receiver {
     fn parts_dir(&self, id: &[u8; 32]) -> PathBuf {
         self.root
             .join(".parts")
-            .join(blake3::Hash::from_bytes(*id).to_hex().to_string())
+            .join(blake3::Hash::from_bytes(*id).to_hex().as_str())
     }
     fn chunk_path(&self, id: &[u8; 32], index: u32) -> PathBuf {
         self.parts_dir(id).join(format!("{index}.part"))
