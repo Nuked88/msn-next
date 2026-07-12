@@ -65,6 +65,23 @@ contact import alice.contact
 contact import-link msnnext://add/...
 ```
 
-La scheda CBOR contiene nome locale, Peer ID, chiave pubblica classica e fino a quattro indirizzi iniziali. Import e link verificano crittograficamente che chiave e Peer ID corrispondano. Il link è il payload pronto per il QR; il renderer terminale non è incluso perché la dipendenza non era disponibile offline.
+La scheda CBOR contiene nome locale, Peer ID, chiave pubblica classica e fino a quattro indirizzi iniziali. Import e link verificano crittograficamente che chiave e Peer ID corrispondano. Il link è il payload pronto per il QR; il renderer terminale non è ancora incluso.
 
-Restano DHT, AutoNAT, hole punching e relay sostituibili.
+La discovery Internet usa una DHT Kademlia isolata nel protocollo `/msnnext/kad/1`. Identify condivide gli indirizzi, AutoNAT rileva la raggiungibilità e DCUtR tenta il passaggio da relay a connessione diretta. Bootstrap e relay sono sempre configurati dall'utente: il binario non contiene infrastruttura pubblica predefinita.
+
+Avvia un nodo bootstrap/relay e annota il Peer ID stampato:
+
+```powershell
+cargo run -p msnnext -- --name Relay --identity .msnnext/relay.key --listen /ip4/0.0.0.0/udp/4001/quic-v1 --listen-tcp /ip4/0.0.0.0/tcp/4001 --relay-server
+```
+
+Poi avvia due client sostituendo `<RELAY_PEER_ID>`:
+
+```powershell
+cargo run -p msnnext -- --name Alice --identity .msnnext/alice.key --listen /ip4/0.0.0.0/udp/0/quic-v1 --bootstrap /ip4/127.0.0.1/tcp/4001/p2p/<RELAY_PEER_ID> --relay /ip4/127.0.0.1/tcp/4001/p2p/<RELAY_PEER_ID>
+cargo run -p msnnext -- --name Bob --identity .msnnext/bob.key --listen /ip4/0.0.0.0/udp/0/quic-v1 --bootstrap /ip4/127.0.0.1/tcp/4001/p2p/<RELAY_PEER_ID> --relay /ip4/127.0.0.1/tcp/4001/p2p/<RELAY_PEER_ID>
+```
+
+Importando la scheda contatto, il client prova in ordine indirizzi diretti, DHT e relay. Il collaudo reale del hole punching richiede due reti NAT distinte; una singola macchina verifica soltanto bootstrap, prenotazione relay e chat locale.
+
+Resta il rendering QR della scheda contatto per completare la Milestone 3.

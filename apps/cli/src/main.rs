@@ -1,15 +1,21 @@
 mod attachments;
+mod connectivity;
 mod contacts;
 mod history;
 
 use attachments::{build_manifest, read_chunk, Receiver};
+use connectivity::{split_peer_address, FallbackPlanner, Recovery};
 use futures::StreamExt;
 use history::History;
 use libp2p::{
+    autonat, dcutr, identify,
     identity::Keypair,
+    kad, mdns,
+    multiaddr::Protocol,
+    noise, ping, relay,
     request_response::{self, ProtocolSupport},
-    swarm::{NetworkBehaviour, SwarmEvent},
-    Multiaddr, PeerId, StreamProtocol,
+    swarm::{behaviour::toggle::Toggle, dial_opts::DialOpts, NetworkBehaviour, SwarmEvent},
+    tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm,
 };
 use msnnext_protocol::{
     resolve_emoticons, validate_text_message, validate_triggers, AttachmentManifest, ChatEvent,
@@ -21,7 +27,7 @@ use std::{
     error::Error,
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -32,7 +38,14 @@ const MAX_EMOTICON_SIDE: usize = 512;
 #[derive(NetworkBehaviour)]
 struct Behaviour {
     chat: request_response::cbor::Behaviour<Envelope, ProtocolResponse>,
-    mdns: libp2p::mdns::tokio::Behaviour,
+    mdns: mdns::tokio::Behaviour,
+    identify: identify::Behaviour,
+    kad: kad::Behaviour<kad::store::MemoryStore>,
+    autonat: autonat::Behaviour,
+    relay_client: relay::client::Behaviour,
+    relay_server: Toggle<relay::Behaviour>,
+    dcutr: dcutr::Behaviour,
+    ping: ping::Behaviour,
 }
 
 struct PendingOffer {
@@ -51,6 +64,56 @@ struct Incoming<'a> {
     peer_names: &'a mut HashMap<PeerId, String>,
 }
 
+fn build_swarm(
+    identity: Keypair,
+    relay_server_enabled: bool,
+) -> Result<Swarm<Behaviour>, Box<dyn Error>> {
+    let local_peer_id = PeerId::from(identity.public());
+    let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
+
+    Ok(libp2p::SwarmBuilder::with_existing_identity(identity)
+        .with_tokio()
+        .with_tcp(
+            tcp::Config::default().nodelay(true),
+            noise::Config::new,
+            yamux::Config::default,
+        )?
+        .with_quic()
+        .with_relay_client(noise::Config::new, yamux::Config::default)?
+        .with_behaviour(move |key, relay_client| {
+            let kad = kad::Behaviour::with_config(
+                local_peer_id,
+                kad::store::MemoryStore::new(local_peer_id),
+                kad::Config::new(StreamProtocol::new("/msnnext/kad/1")),
+            );
+            Behaviour {
+                chat: request_response::cbor::Behaviour::new(
+                    [(
+                        StreamProtocol::new("/msnnext/chat/1"),
+                        ProtocolSupport::Full,
+                    )],
+                    request_response::Config::default(),
+                ),
+                mdns,
+                identify: identify::Behaviour::new(identify::Config::new(
+                    "/msnnext/id/1".into(),
+                    key.public(),
+                )),
+                kad,
+                autonat: autonat::Behaviour::new(local_peer_id, autonat::Config::default()),
+                relay_client,
+                relay_server: Toggle::from(
+                    relay_server_enabled
+                        .then(|| relay::Behaviour::new(local_peer_id, relay::Config::default())),
+                ),
+                dcutr: dcutr::Behaviour::new(local_peer_id),
+                ping: ping::Behaviour::new(ping::Config::new()),
+            }
+        })?
+        .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(60)))
+        .build())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse()?;
@@ -62,25 +125,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     let history = History::open(&args.history, history_key)?;
     let local_peer_id = PeerId::from(identity.public());
-    let mdns = libp2p::mdns::tokio::Behaviour::new(libp2p::mdns::Config::default(), local_peer_id)?;
-    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(identity)
-        .with_tokio()
-        .with_quic()
-        .with_behaviour(move |_| Behaviour {
-            chat: request_response::cbor::Behaviour::new(
-                [(
-                    StreamProtocol::new("/msnnext/chat/1"),
-                    ProtocolSupport::Full,
-                )],
-                request_response::Config::default(),
-            ),
-            mdns,
-        })?
-        .build();
+    let mut swarm = build_swarm(identity, args.relay_server)?;
 
-    swarm.listen_on(args.listen)?;
-    if let Some(address) = args.connect {
+    swarm.listen_on(args.listen.clone())?;
+    swarm.listen_on(args.listen_tcp.clone())?;
+    if let Some(address) = args.connect.clone() {
         swarm.dial(address)?;
+    }
+    let bootstrap_peers = args
+        .bootstrap
+        .iter()
+        .filter_map(|address| split_peer_address(address).ok().map(|(peer, _)| peer))
+        .collect::<HashSet<_>>();
+    for address in &args.bootstrap {
+        let (peer, base) = split_peer_address(address)?;
+        swarm.behaviour_mut().kad.add_address(&peer, base);
+        if let Err(error) = swarm.dial(address.clone()) {
+            eprintln!("bootstrap non raggiungibile {peer}: {error}");
+        }
+    }
+    if !args.bootstrap.is_empty() {
+        swarm.behaviour_mut().kad.bootstrap()?;
+    }
+    let relay_addresses = args
+        .relays
+        .iter()
+        .map(|address| split_peer_address(address).map(|(peer, _)| (peer, address.clone())))
+        .collect::<Result<HashMap<_, _>, _>>()?;
+    for address in &args.relays {
+        let (peer, _) = split_peer_address(address)?;
+        if !bootstrap_peers.contains(&peer) {
+            if let Err(error) = swarm.dial(address.clone()) {
+                eprintln!("relay non raggiungibile {address}: {error}");
+            }
+        }
     }
 
     println!("peer: {local_peer_id}");
@@ -90,6 +168,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut peers = HashSet::new();
     let mut dialing = HashSet::new();
     let mut bootstrap_fallbacks = HashMap::<PeerId, VecDeque<Multiaddr>>::new();
+    let mut known_contacts = HashSet::<PeerId>::new();
+    let infrastructure_peers = args
+        .bootstrap
+        .iter()
+        .chain(&args.relays)
+        .filter_map(|address| split_peer_address(address).ok().map(|(peer, _)| peer))
+        .collect::<HashSet<_>>();
+    let manual_peer = args
+        .connect
+        .as_ref()
+        .and_then(|address| split_peer_address(address).ok().map(|(peer, _)| peer));
+    if let Some(peer) = manual_peer {
+        known_contacts.insert(peer);
+    }
+    let mut accept_unclassified_manual = args.connect.is_some() && manual_peer.is_none();
+    let mut fallback_planner = FallbackPlanner::new(args.relays.clone());
+    let mut pending_dht = HashMap::<kad::QueryId, PeerId>::new();
+    let mut requested_relay_reservations = HashSet::<PeerId>::new();
     let mut triggers = load_triggers(&args.emotes)?;
     let mut nudge_limits = HashMap::<PeerId, NudgeRateLimit>::new();
     let mut incoming_nudge_limits = HashMap::<PeerId, NudgeRateLimit>::new();
@@ -98,10 +194,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut attachment_receiver = Receiver::new(args.downloads.clone());
     let mut peer_names = HashMap::<PeerId, String>::new();
     let mut nudge_counter = 0_u64;
+    let mut stdin_open = true;
 
     loop {
         tokio::select! {
-            line = lines.next_line() => match line? {
+            line = lines.next_line(), if stdin_open => match line? {
                 Some(line) if line == "quit" => break,
                 Some(line) if line == "history" => match history.latest(20) {
                     Ok(entries) => for entry in entries.iter().rev() {
@@ -111,28 +208,47 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 },
                 Some(line) if line.starts_with("contact export ") => {
                     let path = Path::new(line[15..].trim());
-                    match contacts::export(path, &args.name, local_peer_id, &public_key, swarm.listeners().cloned()) {
+                    let addresses = swarm.listeners().cloned().map(|address| {
+                        split_peer_address(&address)
+                            .map(|(_, base)| base)
+                            .unwrap_or(address)
+                    });
+                    match contacts::export(path, &args.name, local_peer_id, &public_key, addresses) {
                         Ok(()) => println!("scheda contatto salvata in {}", path.display()),
                         Err(error) => eprintln!("esportazione contatto fallita: {error}"),
                     }
                 },
                 Some(line) if line.starts_with("contact import-link ") => match contacts::import_link(line[20..].trim()) {
-                    Ok((name, peer_id, _)) => {
+                    Ok((name, peer_id, addresses)) => {
                         peer_names.insert(peer_id, name.clone());
+                        known_contacts.insert(peer_id);
                         println!("identità contatto verificata: {name} ({peer_id})");
+                        connect_contact(
+                            &mut swarm,
+                            peer_id,
+                            addresses,
+                            &mut dialing,
+                            &mut bootstrap_fallbacks,
+                            &mut fallback_planner,
+                            &mut pending_dht,
+                        );
                     }
                     Err(error) => eprintln!("link contatto rifiutato: {error}"),
                 },
                 Some(line) if line.starts_with("contact import ") => match contacts::import(Path::new(line[15..].trim())) {
                     Ok((name, peer_id, addresses)) => {
                         peer_names.insert(peer_id, name.clone());
+                        known_contacts.insert(peer_id);
                         println!("contatto importato: {name} ({peer_id})");
-                        let mut addresses = VecDeque::from(addresses);
-                        if let Some(address) = addresses.pop_front() {
-                            dialing.insert(peer_id);
-                            bootstrap_fallbacks.insert(peer_id, addresses);
-                            if let Err(error) = swarm.dial(address) { eprintln!("indirizzo non raggiungibile: {error}"); }
-                        }
+                        connect_contact(
+                            &mut swarm,
+                            peer_id,
+                            addresses,
+                            &mut dialing,
+                            &mut bootstrap_fallbacks,
+                            &mut fallback_planner,
+                            &mut pending_dht,
+                        );
                     }
                     Err(error) => eprintln!("importazione contatto fallita: {error}"),
                 },
@@ -183,22 +299,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     Err(error) => eprintln!("file rifiutato: {error}"),
                 },
                 Some(_) => eprintln!("comando non valido"),
-                None => break,
+                None => stdin_open = false,
             },
             event = swarm.select_next_some() => match event {
-                SwarmEvent::NewListenAddr { address, .. } => println!("ascolto: {address}/p2p/{local_peer_id}"),
+                SwarmEvent::NewListenAddr { address, .. } => {
+                    let address = if split_peer_address(&address).is_ok() {
+                        address
+                    } else {
+                        address.with(Protocol::P2p(local_peer_id))
+                    };
+                    println!("ascolto: {address}");
+                }
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                     dialing.remove(&peer_id);
                     bootstrap_fallbacks.remove(&peer_id);
-                    let first_connection = peers.insert(peer_id);
-                    if first_connection {
+                    fallback_planner.connected(peer_id);
+                    if let Some(address) = relay_addresses.get(&peer_id) {
+                        if requested_relay_reservations.insert(peer_id) {
+                            if let Err(error) =
+                                swarm.listen_on(address.clone().with(Protocol::P2pCircuit))
+                            {
+                                eprintln!("prenotazione relay fallita: {error}");
+                            }
+                        }
+                    }
+                    let is_manual = accept_unclassified_manual && !infrastructure_peers.contains(&peer_id);
+                    if is_manual {
+                        accept_unclassified_manual = false;
+                        known_contacts.insert(peer_id);
+                    }
+                    if (known_contacts.contains(&peer_id) || is_manual) && peers.insert(peer_id) {
                         println!("connesso: {peer_id}");
                         send_event(&mut swarm, peer_id, local_peer_id, &mut sent_numbers, ChatEvent::Presence(PresenceUpdate { display_name: args.name.clone(), online: true }));
                     }
                 }
                 SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
-                    if num_established == 0 {
-                        peers.remove(&peer_id);
+                    if num_established == 0 && peers.remove(&peer_id) {
                         nudge_limits.remove(&peer_id);
                         incoming_nudge_limits.remove(&peer_id);
                         println!("offline: {}", peer_names.get(&peer_id).map_or_else(|| peer_id.to_string(), Clone::clone));
@@ -238,25 +374,68 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                 },
-                SwarmEvent::Behaviour(BehaviourEvent::Mdns(libp2p::mdns::Event::Discovered(discovered))) => {
+                SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
+                    for address in info.listen_addrs {
+                        let address = match split_peer_address(&address) {
+                            Ok((address_peer, base)) if address_peer == peer_id => base,
+                            Ok(_) => continue,
+                            Err(_) => address,
+                        };
+                        swarm.behaviour_mut().kad.add_address(&peer_id, address);
+                    }
+                    swarm.add_external_address(info.observed_addr);
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { id, step, .. })) if step.last => {
+                    if let Some(peer) = pending_dht.remove(&id) {
+                        let recovery = fallback_planner.after_dht(peer);
+                        execute_recovery(&mut swarm, &mut pending_dht, recovery);
+                    }
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Autonat(autonat::Event::StatusChanged { new, .. })) => {
+                    println!("raggiungibilità: {new:?}");
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::RelayClient(event)) => {
+                    println!("relay client: {event:?}");
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::RelayServer(event)) => {
+                    println!("relay server: {event:?}");
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Dcutr(event)) => {
+                    println!("hole punching: {event:?}");
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Ping(_)) => {}
+                SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(discovered))) => {
                     for (peer_id, address) in discovered {
-                        if peer_id != local_peer_id && !peers.contains(&peer_id) && dialing.insert(peer_id) {
+                        swarm.behaviour_mut().kad.add_address(&peer_id, address.clone());
+                        if !args.relay_server
+                            && peer_id != local_peer_id
+                            && !infrastructure_peers.contains(&peer_id)
+                            && !peers.contains(&peer_id)
+                            && dialing.insert(peer_id)
+                        {
+                            known_contacts.insert(peer_id);
                             println!("peer LAN trovato: {peer_id}");
-                            if let Err(error) = swarm.dial(address.with(libp2p::multiaddr::Protocol::P2p(peer_id))) {
+                            if let Err(error) = swarm.dial(address.with(Protocol::P2p(peer_id))) {
                                 eprintln!("dial mDNS fallito: {error}");
                             }
                         }
                     }
                 }
-                SwarmEvent::Behaviour(BehaviourEvent::Mdns(libp2p::mdns::Event::Expired(_))) => {}
+                SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Expired(_))) => {}
                 SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                     if let Some(peer_id) = peer_id {
-                        if let Some(address) = bootstrap_fallbacks.get_mut(&peer_id).and_then(VecDeque::pop_front) {
+                        if peers.contains(&peer_id) {
+                            eprintln!("dial duplicato ignorato per peer già connesso: {peer_id}");
+                        } else if let Some(address) = bootstrap_fallbacks.get_mut(&peer_id).and_then(VecDeque::pop_front) {
                             eprintln!("bootstrap fallito, provo il prossimo indirizzo: {error}");
                             if let Err(next_error) = swarm.dial(address) { eprintln!("indirizzo non raggiungibile: {next_error}"); }
                         } else {
                             dialing.remove(&peer_id);
                             eprintln!("connessione fallita: {error}");
+                            if known_contacts.contains(&peer_id) {
+                                let recovery = fallback_planner.after_failure(peer_id);
+                                execute_recovery(&mut swarm, &mut pending_dht, recovery);
+                            }
                         }
                     } else { eprintln!("connessione fallita: {error}"); }
                 }
@@ -265,6 +444,68 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     Ok(())
+}
+
+fn connect_contact(
+    swarm: &mut Swarm<Behaviour>,
+    peer: PeerId,
+    addresses: Vec<Multiaddr>,
+    dialing: &mut HashSet<PeerId>,
+    direct_fallbacks: &mut HashMap<PeerId, VecDeque<Multiaddr>>,
+    planner: &mut FallbackPlanner,
+    pending_dht: &mut HashMap<kad::QueryId, PeerId>,
+) {
+    let mut valid = VecDeque::new();
+    for address in addresses {
+        match split_peer_address(&address) {
+            Ok((address_peer, base)) if address_peer == peer => {
+                swarm.behaviour_mut().kad.add_address(&peer, base);
+                valid.push_back(address);
+            }
+            Ok(_) => eprintln!("indirizzo ignorato: Peer ID diverso dal contatto"),
+            Err(error) => eprintln!("indirizzo contatto ignorato: {error}"),
+        }
+    }
+
+    if let Some(address) = valid.pop_front() {
+        dialing.insert(peer);
+        direct_fallbacks.insert(peer, valid);
+        if let Err(error) = swarm.dial(address) {
+            eprintln!("indirizzo non raggiungibile: {error}");
+            let recovery = planner.after_failure(peer);
+            execute_recovery(swarm, pending_dht, recovery);
+        }
+    } else {
+        let recovery = planner.after_failure(peer);
+        execute_recovery(swarm, pending_dht, recovery);
+    }
+}
+
+fn execute_recovery(
+    swarm: &mut Swarm<Behaviour>,
+    pending_dht: &mut HashMap<kad::QueryId, PeerId>,
+    recovery: Recovery,
+) {
+    match recovery {
+        Recovery::SearchDht(peer) => {
+            println!("cerco {peer} nella DHT");
+            let query = swarm.behaviour_mut().kad.get_closest_peers(peer);
+            pending_dht.insert(query, peer);
+        }
+        Recovery::DialPeer(peer) => {
+            println!("provo indirizzi DHT per {peer}");
+            if let Err(error) = swarm.dial(DialOpts::peer_id(peer).build()) {
+                eprintln!("dial DHT fallito: {error}");
+            }
+        }
+        Recovery::ViaRelay(address) => {
+            println!("provo il relay: {address}");
+            if let Err(error) = swarm.dial(address) {
+                eprintln!("dial relay fallito: {error}");
+            }
+        }
+        Recovery::Exhausted => eprintln!("nessun altro percorso disponibile"),
+    }
 }
 
 fn broadcast(
@@ -645,7 +886,11 @@ fn load_or_create_identity(path: &Path) -> Result<Keypair, Box<dyn Error>> {
 
 struct Args {
     listen: Multiaddr,
+    listen_tcp: Multiaddr,
     connect: Option<Multiaddr>,
+    bootstrap: Vec<Multiaddr>,
+    relays: Vec<Multiaddr>,
+    relay_server: bool,
     identity: PathBuf,
     emotes: PathBuf,
     downloads: PathBuf,
@@ -656,22 +901,41 @@ struct Args {
 
 impl Args {
     fn parse() -> Result<Self, Box<dyn Error>> {
+        Self::parse_from(std::env::args().skip(1))
+    }
+
+    fn parse_from<I, S>(args: I) -> Result<Self, Box<dyn Error>>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
         let mut listen = "/ip4/0.0.0.0/udp/4040/quic-v1".parse()?;
+        let mut listen_tcp = "/ip4/0.0.0.0/tcp/0".parse()?;
         let mut connect = None;
+        let mut bootstrap = Vec::new();
+        let mut relays = Vec::new();
+        let mut relay_server = false;
         let mut identity = PathBuf::from(".msnnext/identity.key");
         let mut emotes = PathBuf::from(".msnnext/emoticons");
         let mut downloads = PathBuf::from(".msnnext/downloads");
         let mut history = PathBuf::from(".msnnext/history.db");
         let mut notifications = false;
         let mut name = std::env::var("USERNAME").unwrap_or_else(|_| "Amico".into());
-        let mut args = std::env::args().skip(1);
+        let mut args = args.into_iter().map(Into::into);
         while let Some(flag) = args.next() {
+            if flag == "--relay-server" {
+                relay_server = true;
+                continue;
+            }
             let value = args
                 .next()
                 .ok_or_else(|| format!("manca il valore per {flag}"))?;
             match flag.as_str() {
                 "--listen" => listen = value.parse()?,
+                "--listen-tcp" => listen_tcp = value.parse()?,
                 "--connect" => connect = Some(value.parse()?),
+                "--bootstrap" => bootstrap.push(value.parse()?),
+                "--relay" => relays.push(value.parse()?),
                 "--identity" => identity = value.into(),
                 "--emotes" => emotes = value.into(),
                 "--downloads" => downloads = value.into(),
@@ -686,7 +950,11 @@ impl Args {
         }
         Ok(Self {
             listen,
+            listen_tcp,
             connect,
+            bootstrap,
+            relays,
+            relay_server,
             identity,
             emotes,
             downloads,
@@ -742,5 +1010,39 @@ mod tests {
             validate_envelope(bob, alice, &envelope),
             Err("conversazione non valida")
         );
+    }
+
+    #[test]
+    fn parses_connectivity_options() {
+        let bootstrap_peer = PeerId::from(Keypair::generate_ed25519().public());
+        let relay_peer = PeerId::from(Keypair::generate_ed25519().public());
+        let bootstrap = format!("/ip4/127.0.0.1/tcp/4001/p2p/{bootstrap_peer}");
+        let relay = format!("/ip4/127.0.0.1/tcp/4002/p2p/{relay_peer}");
+
+        let args = Args::parse_from(vec![
+            "--listen-tcp".to_owned(),
+            "/ip4/127.0.0.1/tcp/4000".to_owned(),
+            "--bootstrap".to_owned(),
+            bootstrap,
+            "--relay".to_owned(),
+            relay,
+            "--relay-server".to_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(args.bootstrap.len(), 1);
+        assert_eq!(args.relays.len(), 1);
+        assert!(args.relay_server);
+        assert_eq!(args.listen_tcp, "/ip4/127.0.0.1/tcp/4000".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn builds_connectivity_swarm() {
+        let identity = Keypair::generate_ed25519();
+        let expected_peer = PeerId::from(identity.public());
+
+        let swarm = build_swarm(identity, false).unwrap();
+
+        assert_eq!(*swarm.local_peer_id(), expected_peer);
     }
 }
