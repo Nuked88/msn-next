@@ -1,0 +1,13 @@
+[package]
+name = "msnnext"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+blake3 = "1"
+futures = "0.3"
+imagesize = "0.14"
+libp2p = { version = "0.56", features = ["cbor", "macros", "quic", "request-response", "tokio"] }
+msnnext-protocol = { path = "../../crates/protocol" }
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread"] }

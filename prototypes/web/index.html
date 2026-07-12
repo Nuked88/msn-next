@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#0866ff">
+  <title>nxt — messaggi, come una volta</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="app-shell" id="appShell">
+    <aside class="contacts" aria-label="Contatti">
+      <header class="brand-row">
+        <div class="brand">nxt<span>.</span></div>
+        <button class="icon-button" id="connectButton" title="Collega un amico" aria-label="Collega un amico">＋</button>
+      </header>
+
+      <section class="profile">
+        <div class="avatar avatar-me">N</div>
+        <div>
+          <strong>Tu</strong>
+          <button class="status" id="statusButton"><i></i><span>Disponibile</span></button>
+        </div>
+      </section>
+
+      <div class="contact-heading"><span>Persone</span><span id="peerCount">0 online</span></div>
+      <button class="contact active" id="peerContact">
+        <div class="avatar">?</div>
+        <span><strong id="peerName">Nessun collegamento</strong><small id="peerStatus">Crea o inserisci un codice</small></span>
+        <i class="presence" id="peerPresence"></i>
+      </button>
+
+      <p class="privacy-note">Connessione diretta.<br>Nessuna cronologia sul cloud.</p>
+    </aside>
+
+    <section class="conversation">
+      <header class="conversation-head">
+        <div>
+          <strong id="chatTitle">Nuova conversazione</strong>
+          <small id="connectionLabel">Non collegato</small>
+        </div>
+        <button class="nudge-button" id="nudgeButton" disabled><span>〰</span> Trillo</button>
+      </header>
+
+      <div class="messages" id="messages" aria-live="polite">
+        <div class="welcome" id="welcome">
+          <div class="orbit"><span>☺</span></div>
+          <h1>Le cose belle<br>tornano sempre.</h1>
+          <p>Collega un amico e ricomincia da un trillo.</p>
+          <button class="primary" id="welcomeConnect">Collega un amico</button>
+        </div>
+      </div>
+
+      <form class="composer" id="composer">
+        <div class="composer-tools">
+          <button type="button" class="tool active" id="emoteButton" aria-label="Emoticon">☺</button>
+          <button type="button" class="tool" id="fileButton" aria-label="Invia immagine o video">▧</button>
+          <input type="file" id="fileInput" accept="image/*,video/*" hidden>
+        </div>
+        <label class="message-box">
+          <span class="sr-only">Messaggio</span>
+          <textarea id="messageInput" rows="1" maxlength="4000" placeholder="Scrivi un messaggio…" disabled></textarea>
+          <button type="submit" id="sendButton" disabled aria-label="Invia">↑</button>
+        </label>
+      </form>
+    </section>
+
+    <aside class="emotes" id="emotePanel">
+      <header>
+        <div><strong>Le tue emoticon</strong><small>Scrivi la scorciatoia in chat</small></div>
+        <button class="icon-button" id="addEmoteButton" aria-label="Aggiungi emoticon">＋</button>
+      </header>
+      <div class="emote-grid" id="emoteGrid"></div>
+      <div class="emote-tip"><b>Tip</b><span>Le emoticon ricevute vengono salvate qui automaticamente.</span></div>
+    </aside>
+  </main>
+
+  <dialog id="connectDialog">
+    <form method="dialog" class="dialog-card">
+      <button class="dialog-close" value="cancel" aria-label="Chiudi">×</button>
+      <span class="eyebrow">Connessione peer-to-peer</span>
+      <h2>Collega due finestre.</h2>
+      <p>Su un dispositivo crea il codice. Sull'altro incollalo e premi “Usa codice”. Poi riporta indietro la risposta.</p>
+      <label>Il tuo nome<input id="nameInput" maxlength="30" value="Amico"></label>
+      <div class="dialog-actions">
+        <button type="button" class="primary" id="createCodeButton">Crea codice</button>
+        <button type="button" class="secondary" id="pasteCodeButton">Incolla</button>
+      </div>
+      <label>Codice di collegamento<textarea id="connectionCode" rows="5" spellcheck="false" placeholder="Il codice apparirà qui…"></textarea></label>
+      <button type="button" class="primary wide" id="useCodeButton">Usa codice</button>
+      <small id="connectHelp">Non contiene messaggi o file.</small>
+    </form>
+  </dialog>
+
+  <dialog id="emoteDialog">
+    <form method="dialog" class="dialog-card" id="emoteForm">
+      <button class="dialog-close" value="cancel" aria-label="Chiudi">×</button>
+      <span class="eyebrow">Nuova emoticon</span>
+      <h2>Falla tua in due secondi.</h2>
+      <label>Immagine o GIF<input type="file" id="emoteFile" accept="image/*" required></label>
+      <label>Scorciatoia<input id="emoteShortcut" maxlength="20" placeholder=":ciao:" pattern="[^\s]+" required></label>
+      <button class="primary wide" type="submit">Salva emoticon</button>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status"></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
