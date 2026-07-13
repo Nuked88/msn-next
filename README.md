@@ -12,7 +12,8 @@ Messenger desktop P2P ispirato a MSN Messenger. L'obiettivo è mantenere testo, 
 - interfaccia ispirata a MSN con lista contatti online/offline, chat, ricerca e non letti;
 - temi Chiaro, Scuro e Sistema persistenti;
 - onboarding, aggiunta contatto tramite link `msnnext://add/...`, QR grafico e scansione QR da immagine;
-- selettore file nativo;
+- selettore e drag-and-drop nativi per file e immagini;
+- chat di gruppo persistenti fino a 32 partecipanti, instradate sui canali cifrati individuali;
 - conversazioni separate per Peer ID;
 - contatti, cronologia e identità persistenti dopo il riavvio;
 - bridge tipizzato tra GUI e core tramite comandi ed eventi Tauri.
@@ -36,6 +37,9 @@ Messenger desktop P2P ispirato a MSN Messenger. L'obiettivo è mantenere testo, 
 - cronologia SQLite con contenuto cifrato localmente;
 - contatti persistenti;
 - trasferimento core a chunk con hash BLAKE3 e ripresa dei chunk mancanti;
+- allegati fino a 5 GB, senza ricostruzione integrale in RAM;
+- archivio allegati ricevuti cifrato localmente per singolo chunk, inclusi i chunk parziali;
+- anteprime immagini inviate e ricevute configurabili dal profilo;
 - limiti e validazione per emoticon PNG, JPEG, GIF e WebP;
 - trilli cifrati e sottoposti a rate limit.
 
@@ -66,13 +70,21 @@ Il risultato richiesto da `GROUND.md` resta: scegliere un'immagine o GIF, assegn
 
 ### Immagini, video e file
 
-Il protocollo Rust a chunk esiste e la GUI mostra completamento o errore reali; l'esperienza resta incompleta:
+Il protocollo Rust a chunk, il drag-and-drop e l'archivio cifrato sono integrati; l'esperienza resta incompleta:
 
 - manca una verifica end-to-end affidabile tra due applicazioni desktop;
-- non ci sono anteprima inline di immagini o video;
+- le immagini hanno anteprima inline e visualizzazione interna; i video non hanno ancora un player;
 - non ci sono richiesta di accettazione o rifiuto, avanzamento, velocità, annullamento e ritentativo visibili;
 - non è ancora disponibile una barra di avanzamento per i singoli chunk;
-- mancano drag-and-drop e apertura sicura del file ricevuto dalla conversazione.
+- i file non visualizzabili vengono esportati esplicitamente dall'utente; non sono aperti automaticamente in chiaro.
+
+Il file originale inviato non viene copiato nell'archivio di msnnext: viene letto a chunk dal percorso scelto, verificato con BLAKE3 e spedito sul canale cifrato. Sul destinatario i chunk restano cifrati nella directory dati dell'app e vengono decifrati solo in memoria per l'anteprima oppure in streaming verso un percorso scelto durante l'esportazione; non viene usata la cartella temporanea. La chiave dell'archivio deriva però dall'identità locale, che oggi è conservata sullo stesso dispositivo: protegge i file dalla lettura casuale, ma non ancora da un attaccante che copi l'intera directory dati. Per quest'ultimo caso serve il key store del sistema operativo.
+
+### Chat di gruppo
+
+- la creazione, la cronologia locale e i messaggi testuali funzionano tramite invio separato a ogni partecipante online;
+- non esiste ancora consegna offline: chi non è collegato al momento non riceve il messaggio;
+- file, trilli e modifica successiva dei partecipanti non sono ancora disponibili nelle chat di gruppo.
 
 ### Collegamento e presenza
 
@@ -80,7 +92,7 @@ Il protocollo Rust a chunk esiste e la GUI mostra completamento o errore reali; 
 - hole punching e fallback relay non sono stati collaudati su due NAT reali;
 - non esiste infrastruttura bootstrap/relay pubblica preconfigurata;
 - non esistono messaggi offline: almeno uno dei dispositivi deve essere raggiungibile;
-- avatar, nome personale, rinomina e rimozione dei contatti sono disponibili; stato personale, gruppi e blocco restano incompleti.
+- avatar, nome personale, gruppi, rinomina e rimozione dei contatti sono disponibili; stato personale e blocco restano incompleti.
 
 ### Trilli e UX
 
@@ -138,7 +150,7 @@ npm run build
 npx tauri build
 ```
 
-La suite standard corrente passa con 47 test; un test con due socket reali è escluso dalla suite automatica perché il teardown libp2p può bloccare l'harness su Windows. Il suo scenario deve essere sostituito da un collaudo end-to-end desktop deterministico.
+La suite standard corrente passa con 51 test; un test con due socket reali è escluso dalla suite automatica perché il teardown libp2p può bloccare l'harness su Windows. Il suo scenario deve essere sostituito da un collaudo end-to-end desktop deterministico.
 
 Gli installer vengono generati in:
 
