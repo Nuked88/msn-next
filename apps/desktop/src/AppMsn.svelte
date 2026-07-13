@@ -1,13 +1,14 @@
 <script lang="ts">
   import { invoke, isTauri } from '@tauri-apps/api/core'
   import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-  import { open } from '@tauri-apps/plugin-dialog'
+  import { getCurrentWebview } from '@tauri-apps/api/webview'
+  import { open, save } from '@tauri-apps/plugin-dialog'
   import QRCode from 'qrcode'
   import { onMount, tick } from 'svelte'
   import {
     Activity,
-    ChevronDown,
     Copy,
+    ExternalLink,
     Info,
     Link2,
     LockKeyhole,
@@ -29,6 +30,7 @@
     Sun,
     Trash2,
     UserRoundPlus,
+    UsersRound,
     X,
     Zap,
   } from '@lucide/svelte'
@@ -48,6 +50,8 @@
     body: string
     timestampMs: number
     emoticons: ClientEmoticonSpan[]
+    attachmentId?: string
+    attachmentMime?: string
   }
 
   type ClientEmoticonSpan = { start: number; end: number; assetId: string }
@@ -68,6 +72,27 @@
     time: string
     mine: boolean
     emoticons: ClientEmoticonSpan[]
+    attachmentId?: string
+    attachmentMime?: string
+    attachmentDataUrl?: string
+    senderPeerId?: string
+  }
+
+  type GroupChat = {
+    id: string
+    name: string
+    ownerPeerId: string
+    members: string[]
+    unread: number
+  }
+
+  type ClientGroupMessage = {
+    groupId: string
+    senderPeerId: string
+    direction: 'in' | 'out'
+    body: string
+    timestampMs: number
+    emoticons: ClientEmoticonSpan[]
   }
 
   type ClientEvent =
@@ -79,10 +104,16 @@
     | { type: 'emoticonOffered'; peerId: string; emoticon: ClientEmoticon }
     | { type: 'emoticonRemoved'; assetId: string }
     | { type: 'contactLink'; link: string }
-    | { type: 'attachmentReceived'; peerId: string; path: string }
+    | { type: 'attachmentReceived'; peerId: string; id: string; filename: string; mime: string }
     | { type: 'attachmentSent'; peerId: string; filename: string }
     | { type: 'contactRemoved'; peerId: string }
     | { type: 'conversationCleared'; peerId: string }
+    | { type: 'groupChatsUpdated'; groups: Omit<GroupChat, 'unread'>[] }
+    | { type: 'groupConversationLoaded'; groupId: string; messages: ClientGroupMessage[] }
+    | { type: 'groupMessage'; message: ClientGroupMessage }
+    | { type: 'groupConversationCleared'; groupId: string }
+    | { type: 'attachmentOpened'; id: string; dataUrl: string }
+    | { type: 'attachmentExported'; path: string }
     | { type: 'error'; message: string }
     | { type: 'ready' }
     | { type: 'stopped' }
@@ -90,7 +121,12 @@
   type Theme = 'light' | 'dark' | 'system'
   type Emoticon = { glyph: string; shortcut: string; label: string }
   type MessagePart = { text: string; emoticon?: Emoticon; custom?: ClientEmoticon }
-  type Profile = { name: string; avatarDataUrl: string | null }
+  type Profile = {
+    name: string
+    avatarDataUrl: string | null
+    previewSentImages: boolean
+    previewReceivedImages: boolean
+  }
 
   const emoticons: Emoticon[] = [
     { glyph: '🙂', shortcut: ':)', label: 'Sorriso' },
@@ -118,6 +154,7 @@
   let ownContactQr = ''
   let peerId = ''
   let selectedPeerId = ''
+  let selectedGroupId = ''
   let contacts: Contact[] = []
   let conversations: Record<string, ChatMessage[]> = {}
   let customEmoticons: ClientEmoticon[] = []
@@ -127,6 +164,8 @@
   let setupOpen = true
   let profileOpen = false
   let avatarDataUrl = ''
+  let previewSentImages = true
+  let previewReceivedImages = false
   let connectOpen = false
   let detailsOpen = false
   let emojiOpen = false
@@ -137,24 +176,39 @@
   let emoticonToSave: ClientEmoticon | undefined
   let pendingEmoticonAction = ''
   let fileSending = false
+  let pendingFileCount = 0
   let contactName = ''
   let contactNamePeer = ''
+  let chatGroups: GroupChat[] = []
+  let groupCreateOpen = false
+  let pendingGroupCreation = false
+  let groupName = ''
+  let groupMemberIds: string[] = []
+  let contextPeerId = ''
+  let contextX = 0
+  let contextY = 0
+  let fileDropActive = false
+  let imagePreview = ''
+  let pendingSentPreviews: Record<string, string[]> = {}
+  const automaticPreviewIds = new Set<string>()
   let rosterOpen = false
-  let onlineOpen = true
-  let offlineOpen = true
   let linkRequested = false
   let toastText = ''
   let toastTimer: ReturnType<typeof setTimeout>
   let messageList: HTMLDivElement
 
   $: activeContact = contacts.find((contact) => contact.peerId === selectedPeerId)
-  $: messages = selectedPeerId ? conversations[selectedPeerId] || [] : []
+  $: activeGroup = chatGroups.find((group) => group.id === selectedGroupId)
+  $: conversationKey = selectedGroupId ? `group:${selectedGroupId}` : selectedPeerId
+  $: messages = conversationKey ? conversations[conversationKey] || [] : []
   $: visibleContacts = contacts.filter((contact) =>
     contact.name.toLocaleLowerCase().includes(searchQuery.trim().toLocaleLowerCase())
   )
   $: onlineContacts = visibleContacts.filter((contact) => contact.online)
   $: offlineContacts = visibleContacts.filter((contact) => !contact.online)
-  $: ready = Boolean(activeContact?.online && activeContact?.secure)
+  $: sortedContacts = [...visibleContacts].sort((a, b) => Number(b.online) - Number(a.online) || a.name.localeCompare(b.name))
+  $: groupOnline = activeGroup?.members.filter((id) => id !== peerId && contacts.some((contact) => contact.peerId === id && contact.secure)).length || 0
+  $: ready = activeGroup ? groupOnline > 0 : Boolean(activeContact?.online && activeContact?.secure)
 
   onMount(() => {
     const media = window.matchMedia('(prefers-color-scheme: dark)')
@@ -165,10 +219,20 @@
     applyTheme()
 
     let unlisten: UnlistenFn | undefined
+    let unlistenDrop: UnlistenFn | undefined
+    const blockNativeMenu = (event: MouseEvent) => event.preventDefault()
+    window.addEventListener('contextmenu', blockNativeMenu)
     if (isTauri()) void initializeApp().then((stop) => unlisten = stop)
+    if (isTauri()) void getCurrentWebview().onDragDropEvent((event) => {
+      fileDropActive = event.payload.type === 'enter' || event.payload.type === 'over'
+      if (event.payload.type === 'drop') void sendFiles(event.payload.paths)
+      if (event.payload.type === 'drop' || event.payload.type === 'leave') fileDropActive = false
+    }).then((stop) => unlistenDrop = stop)
 
     return () => {
       unlisten?.()
+      unlistenDrop?.()
+      window.removeEventListener('contextmenu', blockNativeMenu)
       media.removeEventListener('change', syncSystemTheme)
     }
   })
@@ -191,6 +255,8 @@
       }
       displayName = profile.name
       avatarDataUrl = profile.avatarDataUrl || ''
+      previewSentImages = profile.previewSentImages
+      previewReceivedImages = profile.previewReceivedImages
       const isRunning = await invoke<boolean>('node_status')
       running = isRunning
       setupOpen = false
@@ -270,11 +336,25 @@
       return
     }
     if (event.type === 'attachmentReceived') {
-      showToast(`File ricevuto: ${event.path}`)
+      const conversation = [...(conversations[event.peerId] || [])]
+      const index = conversation.findLastIndex((message) => !message.mine && message.kind === 'file' && message.body === event.filename)
+      if (index >= 0) conversation[index] = {
+        ...conversation[index], attachmentId: event.id, attachmentMime: event.mime,
+      }
+      conversations = { ...conversations, [event.peerId]: conversation }
+      showToast(`File ricevuto: ${event.filename}`)
+      if (previewReceivedImages && event.mime.startsWith('image/')) {
+        automaticPreviewIds.add(event.id)
+        void invoke('node_read_attachment', { id: event.id, mime: event.mime }).catch((error) => {
+          automaticPreviewIds.delete(event.id)
+          showToast(String(error))
+        })
+      }
       return
     }
     if (event.type === 'attachmentSent') {
-      fileSending = false
+      pendingFileCount = Math.max(0, pendingFileCount - 1)
+      fileSending = pendingFileCount > 0
       showToast(`File inviato: ${event.filename}`)
       return
     }
@@ -300,10 +380,72 @@
       showToast('Contatto eliminato')
       return
     }
+    if (event.type === 'groupChatsUpdated') {
+      chatGroups = event.groups.map((group) => ({
+        ...group,
+        unread: chatGroups.find((current) => current.id === group.id)?.unread || 0,
+      }))
+      if (selectedGroupId && !chatGroups.some((group) => group.id === selectedGroupId)) {
+        selectedGroupId = ''
+      }
+      return
+    }
+    if (event.type === 'groupConversationLoaded') {
+      conversations = {
+        ...conversations,
+        [`group:${event.groupId}`]: event.messages.map(toGroupChatMessage),
+      }
+      if (pendingGroupCreation) {
+        pendingGroupCreation = false
+        groupCreateOpen = false
+        selectGroup(event.groupId)
+        showToast('Chat di gruppo creata')
+      }
+      scrollMessages()
+      return
+    }
+    if (event.type === 'groupMessage') {
+      const key = `group:${event.message.groupId}`
+      conversations = {
+        ...conversations,
+        [key]: [...(conversations[key] || []), toGroupChatMessage(event.message)],
+      }
+      if (event.message.direction === 'in' && selectedGroupId !== event.message.groupId) {
+        chatGroups = chatGroups.map((group) => group.id === event.message.groupId
+          ? { ...group, unread: group.unread + 1 }
+          : group)
+      }
+      scrollMessages()
+      return
+    }
+    if (event.type === 'groupConversationCleared') {
+      conversations = { ...conversations, [`group:${event.groupId}`]: [] }
+      showToast('Cronologia del gruppo eliminata')
+      return
+    }
+    if (event.type === 'attachmentOpened') {
+      for (const [id, conversation] of Object.entries(conversations)) {
+        conversations = {
+          ...conversations,
+          [id]: conversation.map((message) => message.attachmentId === event.id
+            ? { ...message, attachmentDataUrl: event.dataUrl }
+            : message),
+        }
+      }
+      if (automaticPreviewIds.has(event.id)) automaticPreviewIds.delete(event.id)
+      else imagePreview = event.dataUrl
+      return
+    }
+    if (event.type === 'attachmentExported') {
+      showToast(`File esportato: ${event.path}`)
+      return
+    }
     if (event.type === 'error') {
       linkRequested = false
       fileSending = false
+      pendingFileCount = 0
       pendingEmoticonAction = ''
+      pendingGroupCreation = false
       showToast(event.message)
       return
     }
@@ -319,7 +461,9 @@
     const existing = contacts.find((contact) => contact.peerId === next.peerId)
     if (existing) {
       contacts = contacts.map((contact) =>
-        contact.peerId === next.peerId ? { ...contact, ...next } : contact
+        contact.peerId === next.peerId
+          ? { ...contact, ...next }
+          : contact
       )
     } else {
       contacts = [...contacts, { ...next, unread: 0 }]
@@ -339,7 +483,24 @@
             : 'incoming',
       body: message.body,
       emoticons: message.emoticons || [],
+      attachmentId: message.attachmentId,
+      attachmentMime: message.attachmentMime,
       mine: message.direction === 'out',
+      time: new Intl.DateTimeFormat('it', {
+        hour: '2-digit',
+        minute: '2-digit',
+      }).format(new Date(message.timestampMs)),
+    }
+  }
+
+  function toGroupChatMessage(message: ClientGroupMessage): ChatMessage {
+    return {
+      id: `${message.timestampMs}-${crypto.randomUUID()}`,
+      kind: message.direction === 'out' ? 'outgoing' : 'incoming',
+      body: message.body,
+      emoticons: message.emoticons || [],
+      mine: message.direction === 'out',
+      senderPeerId: message.senderPeerId,
       time: new Intl.DateTimeFormat('it', {
         hour: '2-digit',
         minute: '2-digit',
@@ -357,9 +518,18 @@
 
   function addMessage(message: ClientMessage) {
     const conversation = conversations[message.peerId] || []
+    const next = toChatMessage(message)
+    if (message.direction === 'out' && message.kind === 'file') {
+      const key = `${message.peerId}\u0000${message.body}`
+      const previews = pendingSentPreviews[key]
+      if (previews?.length) {
+        next.attachmentDataUrl = previews.shift()
+        if (!previews.length) delete pendingSentPreviews[key]
+      }
+    }
     conversations = {
       ...conversations,
-      [message.peerId]: [...conversation, toChatMessage(message)],
+      [message.peerId]: [...conversation, next],
     }
     if (message.direction === 'in' && selectedPeerId !== message.peerId) {
       contacts = contacts.map((contact) =>
@@ -374,6 +544,7 @@
 
   function selectContact(id: string) {
     selectedPeerId = id
+    selectedGroupId = ''
     contactName = contacts.find((contact) => contact.peerId === id)?.name || ''
     contactNamePeer = id
     rosterOpen = false
@@ -381,6 +552,27 @@
       contact.peerId === id ? { ...contact, unread: 0 } : contact
     )
     scrollMessages()
+  }
+
+  function selectGroup(id: string) {
+    selectedGroupId = id
+    selectedPeerId = ''
+    detailsOpen = false
+    rosterOpen = false
+    chatGroups = chatGroups.map((group) => group.id === id ? { ...group, unread: 0 } : group)
+    scrollMessages()
+  }
+
+  function senderName(message: ChatMessage) {
+    if (message.mine) return displayName
+    if (!activeGroup) return activeContact?.name || 'Contatto'
+    return contacts.find((contact) => contact.peerId === message.senderPeerId)?.name
+      || `${message.senderPeerId?.slice(0, 8) || 'Partecipante'}…`
+  }
+
+  function memberName(memberId: string) {
+    if (memberId === peerId) return `${displayName} (tu)`
+    return contacts.find((contact) => contact.peerId === memberId)?.name || `${memberId.slice(0, 8)}…`
   }
 
   function openConversationDetails() {
@@ -466,6 +658,7 @@
       if (saveProfile) {
         const profile = await invoke<Profile>('profile_save', {
           name: displayName.trim(), avatarPath: null, clearAvatar: false,
+          previewSentImages, previewReceivedImages,
         })
         avatarDataUrl = profile.avatarDataUrl || ''
       }
@@ -492,9 +685,10 @@
 
   async function sendMessage() {
     const text = messageText.trim().replace(/\s*\n+\s*/g, ' ')
-    if (!text || !ready || !selectedPeerId) return
+    if (!text || !ready || (!selectedPeerId && !selectedGroupId)) return
     try {
-      await invoke('node_send_text', { peerId: selectedPeerId, text })
+      if (selectedGroupId) await invoke('node_send_group_text', { groupId: selectedGroupId, text })
+      else await invoke('node_send_text', { peerId: selectedPeerId, text })
       messageText = ''
       emojiOpen = false
     } catch (error) {
@@ -503,7 +697,7 @@
   }
 
   async function sendNudge() {
-    if (!ready || !selectedPeerId) return
+    if (!ready || !selectedPeerId || selectedGroupId) return
     try {
       await invoke('node_send_nudge', { peerId: selectedPeerId })
     } catch (error) {
@@ -512,15 +706,113 @@
   }
 
   async function chooseFile() {
-    if (!ready || !selectedPeerId) return
+    if (!ready || !selectedPeerId || selectedGroupId) return
     const selected = await open({ multiple: false, directory: false })
     if (!selected || Array.isArray(selected)) return
+    await sendFiles([selected])
+  }
+
+  async function sendFiles(paths: string[]) {
+    if (!ready || !selectedPeerId || !paths.length) return
+    const targetPeer = selectedPeerId
+    pendingFileCount += paths.length
+    fileSending = true
+    for (const path of paths) {
+      try {
+        const filename = path.split(/[\\/]/).at(-1) || path
+        if (previewSentImages && isImagePath(path)) {
+          try {
+            const preview = await invoke<string>('image_preview', { path })
+            const key = `${targetPeer}\u0000${filename}`
+            pendingSentPreviews[key] = [...(pendingSentPreviews[key] || []), preview]
+          } catch {
+            // L'anteprima è facoltativa: il file può comunque essere inviato.
+          }
+        }
+        await invoke('node_send_file', { peerId: targetPeer, path })
+      } catch (error) {
+        pendingFileCount = Math.max(0, pendingFileCount - 1)
+        fileSending = pendingFileCount > 0
+        showToast(String(error))
+      }
+    }
+  }
+
+  function isImagePath(path: string) {
+    return /\.(avif|bmp|gif|jpe?g|png|webp)$/i.test(path)
+  }
+
+  function showContactMenu(event: MouseEvent, contact: Contact) {
+    event.preventDefault()
+    contextPeerId = contact.peerId
+    contextX = Math.min(event.clientX, window.innerWidth - 220)
+    contextY = Math.min(event.clientY, window.innerHeight - 150)
+  }
+
+  function closeContextMenu() {
+    contextPeerId = ''
+  }
+
+  function manageContact(peerId: string) {
+    selectContact(peerId)
+    contactName = contacts.find((contact) => contact.peerId === peerId)?.name || ''
+    contactNamePeer = peerId
+    detailsOpen = true
+    closeContextMenu()
+  }
+
+  function openGroupCreation() {
+    groupName = ''
+    groupMemberIds = []
+    groupCreateOpen = true
+  }
+
+  function toggleGroupMember(peerId: string) {
+    groupMemberIds = groupMemberIds.includes(peerId)
+      ? groupMemberIds.filter((id) => id !== peerId)
+      : [...groupMemberIds, peerId]
+  }
+
+  async function createChatGroup() {
+    if (!groupName.trim() || groupMemberIds.length < 2) return
     try {
-      fileSending = true
-      await invoke('node_send_file', { peerId: selectedPeerId, path: selected })
+      pendingGroupCreation = true
+      await invoke('node_create_chat_group', { name: groupName.trim(), members: groupMemberIds })
     } catch (error) {
+      pendingGroupCreation = false
       showToast(String(error))
     }
+  }
+
+  async function clearGroupConversation() {
+    if (!selectedGroupId || !confirm('Eliminare la cronologia di questa chat di gruppo?')) return
+    await invoke('node_clear_group_conversation', { groupId: selectedGroupId })
+      .catch((error) => showToast(String(error)))
+  }
+
+  async function deleteChatGroup() {
+    if (!selectedGroupId || !confirm('Rimuovere questa chat di gruppo dal dispositivo?')) return
+    const id = selectedGroupId
+    selectedGroupId = ''
+    await invoke('node_delete_chat_group', { groupId: id })
+      .catch((error) => showToast(String(error)))
+  }
+
+  async function openAttachment(message: ChatMessage) {
+    if (!message.attachmentId || !message.attachmentMime) {
+      showToast('Il file appartiene a una vecchia cronologia e non ha un riferimento all’archivio')
+      return
+    }
+    if (message.attachmentMime.startsWith('image/')) {
+      await invoke('node_read_attachment', {
+        id: message.attachmentId, mime: message.attachmentMime,
+      }).catch((error) => showToast(String(error)))
+      return
+    }
+    const path = await save({ defaultPath: message.body })
+    if (path) await invoke('node_export_attachment', {
+      id: message.attachmentId, path,
+    }).catch((error) => showToast(String(error)))
   }
 
   async function chooseEmoticonFile() {
@@ -585,6 +877,7 @@
     try {
       const profile = await invoke<Profile>('profile_save', {
         name: displayName.trim(), avatarPath, clearAvatar,
+        previewSentImages, previewReceivedImages,
       })
       displayName = profile.name
       avatarDataUrl = profile.avatarDataUrl || ''
@@ -708,7 +1001,7 @@
         </button>
       </div>
       <span class:online={running} class="node-state"><i></i>{running ? 'Connesso' : 'Non connesso'}</span>
-      <button class:online={running} class="power-button" aria-label={running ? 'Disconnetti' : 'Connetti'} title={running ? 'Disconnetti' : 'Connetti'} onclick={running ? stopNode : () => setupOpen = true}>
+      <button class:online={running} class="power-button" aria-label={running ? 'Disconnetti' : 'Connetti'} title={running ? 'Disconnetti' : 'Connetti'} onclick={running ? stopNode : () => startNode(false)}>
         <Power size={16} />
       </button>
     </div>
@@ -742,58 +1035,39 @@
       </div>
 
       <section class="contact-list" aria-label="Lista contatti">
+        {#if chatGroups.length}
+          <div class="roster-section-label">Chat di gruppo</div>
+          {#each chatGroups as group (group.id)}
+            <button class:active={group.id === selectedGroupId} class="contact-row group-chat-row" onclick={() => selectGroup(group.id)}>
+              <span class="group-chat-avatar"><UsersRound size={18} /></span>
+              <span class="contact-copy"><strong>{group.name}</strong><small>{group.members.length} partecipanti</small></span>
+              {#if group.unread}<b class="unread">{group.unread}</b>{/if}
+            </button>
+          {/each}
+        {/if}
         {#if visibleContacts.length}
-          <section class="contact-group">
-            <button class="group-heading" aria-expanded={onlineOpen} onclick={() => onlineOpen = !onlineOpen}>
-              <ChevronDown class={onlineOpen ? '' : 'closed'} size={15} />
-              <strong>Online</strong>
-              <span>{onlineContacts.length}</span>
+          <div class="roster-section-label">Contatti</div>
+          {#each sortedContacts as contact (contact.peerId)}
+            <button
+              class:active={contact.peerId === selectedPeerId}
+              class="contact-row"
+              oncontextmenu={(event) => showContactMenu(event, contact)}
+              onclick={() => selectContact(contact.peerId)}
+            >
+              <span class:offline={!contact.online} class="avatar-shell contact-avatar">
+                <span>{contact.name.slice(0, 1).toUpperCase()}</span>
+                <i class:online={contact.online}></i>
+              </span>
+              <span class="contact-copy"><strong>{contact.name}</strong><small>{contactSubtitle(contact)}</small></span>
+              {#if contact.unread}<b class="unread">{contact.unread}</b>{/if}
             </button>
-            {#if onlineOpen}
-              {#each onlineContacts as contact (contact.peerId)}
-                <button class:active={contact.peerId === selectedPeerId} class="contact-row" onclick={() => selectContact(contact.peerId)}>
-                  <span class="avatar-shell contact-avatar">
-                    <span>{contact.name.slice(0, 1).toUpperCase()}</span>
-                    <i class:online={contact.online}></i>
-                  </span>
-                  <span class="contact-copy">
-                    <strong>{contact.name}</strong>
-                    <small>{contactSubtitle(contact)}</small>
-                  </span>
-                  {#if contact.unread}<b class="unread">{contact.unread}</b>{/if}
-                </button>
-              {/each}
-            {/if}
-          </section>
-
-          <section class="contact-group offline-group">
-            <button class="group-heading" aria-expanded={offlineOpen} onclick={() => offlineOpen = !offlineOpen}>
-              <ChevronDown class={offlineOpen ? '' : 'closed'} size={15} />
-              <strong>Offline</strong>
-              <span>{offlineContacts.length}</span>
-            </button>
-            {#if offlineOpen}
-              {#each offlineContacts as contact (contact.peerId)}
-                <button class:active={contact.peerId === selectedPeerId} class="contact-row" onclick={() => selectContact(contact.peerId)}>
-                  <span class="avatar-shell contact-avatar offline">
-                    <span>{contact.name.slice(0, 1).toUpperCase()}</span>
-                    <i></i>
-                  </span>
-                  <span class="contact-copy">
-                    <strong>{contact.name}</strong>
-                    <small>{contactSubtitle(contact)}</small>
-                  </span>
-                  {#if contact.unread}<b class="unread">{contact.unread}</b>{/if}
-                </button>
-              {/each}
-            {/if}
-          </section>
-        {:else if contacts.length}
+          {/each}
+        {:else if contacts.length && !chatGroups.length}
           <div class="empty-contacts compact">
             <strong>Nessun risultato</strong>
             <p>Prova a cercare con un altro nome.</p>
           </div>
-        {:else}
+        {:else if !chatGroups.length}
           <div class="empty-contacts">
             <span class="empty-people" aria-hidden="true"><i></i><i></i></span>
             <strong>La tua lista è vuota</strong>
@@ -805,6 +1079,7 @@
 
       <footer class="roster-footer">
         <button onclick={openContacts}><UserRoundPlus size={15} /> Aggiungi</button>
+        <button onclick={openGroupCreation}><UsersRound size={15} /> Nuovo gruppo</button>
         <span>{onlineContacts.length} online</span>
       </footer>
     </aside>
@@ -818,13 +1093,13 @@
             <Menu size={19} />
           </button>
           <div class="avatar-shell large">
-            <span>{activeContact?.name.slice(0, 1).toUpperCase() || '?'}</span>
-            <i class:online={activeContact?.online}></i>
+            {#if activeGroup}<UsersRound size={20} />{:else}<span>{activeContact?.name.slice(0, 1).toUpperCase() || '?'}</span>{/if}
+            {#if activeContact}<i class:online={activeContact.online}></i>{/if}
           </div>
           <span>
-            <strong>{activeContact?.name || 'msnnext'}</strong>
+            <strong>{activeGroup?.name || activeContact?.name || 'msnnext'}</strong>
             <small>
-              {ready ? 'Disponibile · conversazione protetta' : activeContact?.online ? 'Sto preparando la conversazione…' : activeContact ? 'Non in linea' : 'Scegli una persona dalla lista'}
+              {activeGroup ? `${groupOnline} partecipanti collegati · canali protetti` : ready ? 'Disponibile · conversazione protetta' : activeContact?.online ? 'Sto preparando la conversazione…' : activeContact ? 'Non in linea' : 'Scegli una conversazione dalla lista'}
             </small>
           </span>
         </div>
@@ -838,7 +1113,7 @@
 
       <div class="conversation-stage">
         <div class="messages" bind:this={messageList} aria-live="polite">
-          {#if !activeContact}
+          {#if !activeContact && !activeGroup}
             <div class="welcome">
               <div class="welcome-illustration" aria-hidden="true">
                 <span class="person one"></span>
@@ -856,11 +1131,10 @@
           {:else if messages.length === 0}
             <div class="conversation-empty">
               <div class="avatar-shell hero-avatar">
-                <span>{activeContact.name.slice(0, 1).toUpperCase()}</span>
-                <i class:online={activeContact.online}></i>
+                {#if activeGroup}<UsersRound size={30} />{:else}<span>{activeContact?.name.slice(0, 1).toUpperCase()}</span><i class:online={activeContact?.online}></i>{/if}
               </div>
-              <h2>{activeContact.name}</h2>
-              <p>{ready ? 'È online. Scrivi il primo messaggio o manda un trillo.' : 'Quando tornerà online potrete riprendere a parlare.'}</p>
+              <h2>{activeGroup?.name || activeContact?.name}</h2>
+              <p>{activeGroup ? (ready ? 'Scrivi il primo messaggio al gruppo.' : 'La chat sarà disponibile quando almeno un partecipante sarà online.') : ready ? 'È online. Scrivi il primo messaggio o manda un trillo.' : 'Quando tornerà online potrete riprendere a parlare.'}</p>
             </div>
           {:else}
             <div class="session-start"><span>Inizio della conversazione</span></div>
@@ -868,17 +1142,23 @@
               {#if message.kind === 'nudge'}
                 <div class="nudge-message">
                   <span><Zap size={18} /></span>
-                  <p><strong>{message.mine ? 'Hai inviato un trillo!' : `${activeContact.name} ti ha inviato un trillo!`}</strong><small>La finestra ha fatto un piccolo salto.</small></p>
+                  <p><strong>{message.mine ? 'Hai inviato un trillo!' : `${activeContact?.name || 'Un contatto'} ti ha inviato un trillo!`}</strong><small>La finestra ha fatto un piccolo salto.</small></p>
                   <time>{message.time}</time>
                 </div>
               {:else}
                 <article class:mine={message.mine} class:file-message={message.kind === 'file'} class="message-line">
                   <header>
-                    <strong>{message.mine ? displayName : activeContact.name}</strong>
+                  <strong>{senderName(message)}</strong>
                     <time>{message.time}</time>
                   </header>
                   {#if message.kind === 'file'}
-                    <div class="file-line"><Paperclip size={17} /><span><b>File condiviso</b><small>{message.body}</small></span></div>
+                    <button class="file-line" disabled={!message.attachmentId} onclick={() => openAttachment(message)}>
+                      {#if message.attachmentDataUrl}
+                        <img src={message.attachmentDataUrl} alt={message.body} />
+                      {:else}<Paperclip size={17} />{/if}
+                      <span><b>{message.attachmentMime?.startsWith('image/') ? 'Immagine ricevuta' : 'File condiviso'}</b><small>{message.body}</small></span>
+                      {#if message.attachmentId}<ExternalLink size={14} />{/if}
+                    </button>
                   {:else}
                     <p>
                       {#each messageParts(message) as part}
@@ -901,11 +1181,10 @@
             <header><strong>Dettagli</strong><button aria-label="Chiudi dettagli" onclick={() => detailsOpen = false}><X size={17} /></button></header>
             <div class="detail-profile">
               <div class="avatar-shell profile-avatar">
-                <span>{activeContact?.name.slice(0, 1).toUpperCase() || displayName.slice(0, 1).toUpperCase()}</span>
-                <i class:online={activeContact?.online || running}></i>
+                {#if activeGroup}<UsersRound size={25} />{:else}<span>{activeContact?.name.slice(0, 1).toUpperCase() || displayName.slice(0, 1).toUpperCase()}</span><i class:online={activeContact?.online || running}></i>{/if}
               </div>
-              <strong>{activeContact?.name || displayName}</strong>
-              <small>{activeContact ? (activeContact.online ? 'Disponibile' : 'Non in linea') : (running ? 'Online' : 'Non in linea')}</small>
+              <strong>{activeGroup?.name || activeContact?.name || displayName}</strong>
+              <small>{activeGroup ? `${activeGroup.members.length} partecipanti` : activeContact ? (activeContact.online ? 'Disponibile' : 'Non in linea') : (running ? 'Online' : 'Non in linea')}</small>
             </div>
             <section class="detail-section">
               <h3>Sicurezza</h3>
@@ -936,6 +1215,14 @@
                 <button onclick={renameContact}><Pencil size={14} /> Salva nome</button>
                 <button onclick={clearConversation}><Trash2 size={14} /> Elimina solo la chat</button>
                 <button class="danger-button" onclick={deleteContact}><Trash2 size={14} /> Elimina contatto e chat</button>
+              </section>
+            {/if}
+            {#if activeGroup}
+              <section class="detail-section group-management">
+                <h3>Partecipanti</h3>
+                <ul>{#each activeGroup.members as member}<li>{memberName(member)}</li>{/each}</ul>
+                <button onclick={clearGroupConversation}><Trash2 size={14} /> Elimina cronologia</button>
+                <button class="danger-button" onclick={deleteChatGroup}><Trash2 size={14} /> Rimuovi chat dal dispositivo</button>
               </section>
             {/if}
             <div class="privacy-note"><LockKeyhole size={14} /><span>Contatti e cronologia restano su questo dispositivo.</span></div>
@@ -988,15 +1275,15 @@
 
         <div class="chat-toolbar" aria-label="Strumenti conversazione">
           <button class:active={emojiOpen} disabled={!ready} onclick={() => emojiOpen = !emojiOpen}><Smile size={18} /><span>Emoticon</span></button>
-          <button class="nudge-tool" disabled={!ready} onclick={sendNudge}><Zap size={18} /><span>Trillo</span></button>
-          <button disabled={!ready || fileSending} onclick={chooseFile}><Paperclip size={18} /><span>{fileSending ? 'Invio…' : 'Invia file'}</span></button>
+          <button class="nudge-tool" disabled={!ready || !!activeGroup} onclick={sendNudge}><Zap size={18} /><span>Trillo</span></button>
+          <button disabled={!ready || fileSending || !!activeGroup} onclick={chooseFile}><Paperclip size={18} /><span>{fileSending ? 'Invio…' : 'Invia file'}</span></button>
         </div>
         <form class="composer" onsubmit={(event) => { event.preventDefault(); void sendMessage() }}>
           <textarea
             bind:value={messageText}
             rows="2"
             maxlength="4000"
-            placeholder={ready ? `Scrivi a ${activeContact?.name}…` : activeContact ? 'Il contatto non è disponibile.' : 'Scegli un contatto per scrivere.'}
+            placeholder={ready ? `Scrivi a ${activeGroup?.name || activeContact?.name}…` : activeGroup ? 'Nessun partecipante è disponibile.' : activeContact ? 'Il contatto non è disponibile.' : 'Scegli una conversazione per scrivere.'}
             disabled={!ready}
             onkeydown={(event) => {
               if (event.key === 'Enter' && !event.shiftKey) {
@@ -1009,9 +1296,29 @@
         </form>
         <small class="composer-hint">Invio per spedire · Maiusc+Invio per andare a capo</small>
       </footer>
+      {#if fileDropActive && ready && !activeGroup}
+        <div class="file-drop-overlay"><Paperclip size={28} /><strong>Rilascia per inviare</strong><small>File e immagini, massimo 5 GB ciascuno</small></div>
+      {/if}
     </section>
   </div>
 </main>
+
+{#if contextPeerId}
+  <button class="context-scrim" aria-label="Chiudi menu" onclick={closeContextMenu}></button>
+  <div class="contact-context-menu" style={`left:${contextX}px;top:${contextY}px`} role="menu">
+    <button onclick={() => { selectContact(contextPeerId); closeContextMenu() }}>Apri conversazione</button>
+    <button onclick={() => manageContact(contextPeerId)}>Rinomina e gestisci</button>
+    <div class="context-separator"></div>
+    <button class="danger-item" onclick={() => { selectContact(contextPeerId); closeContextMenu(); void deleteContact() }}>Elimina contatto</button>
+  </div>
+{/if}
+
+{#if imagePreview}
+  <div class="modal-backdrop image-viewer" role="dialog" aria-modal="true" aria-label="Anteprima immagine" tabindex="-1">
+    <button aria-label="Chiudi anteprima" onclick={() => imagePreview = ''}><X size={20} /></button>
+    <img src={imagePreview} alt="Immagine ricevuta" />
+  </div>
+{/if}
 
 {#if setupOpen}
   <div class="modal-backdrop">
@@ -1081,6 +1388,29 @@
   </div>
 {/if}
 
+{#if groupCreateOpen}
+  <div class="modal-backdrop">
+    <div class="modal group-create-modal" role="dialog" aria-modal="true" aria-labelledby="group-create-title">
+      <button class="modal-close" aria-label="Chiudi" onclick={() => groupCreateOpen = false}><X size={18} /></button>
+      <div class="modal-heading">
+        <span><UsersRound size={23} /></span>
+        <div><p class="step-label">Conversazione condivisa</p><h2 id="group-create-title">Nuova chat di gruppo</h2></div>
+      </div>
+      <label>Nome del gruppo<input bind:value={groupName} maxlength="64" placeholder="Per esempio: Amici" /></label>
+      <fieldset class="group-member-picker">
+        <legend>Scegli almeno due persone</legend>
+        {#each contacts as contact (contact.peerId)}
+          <label>
+            <input type="checkbox" checked={groupMemberIds.includes(contact.peerId)} onchange={() => toggleGroupMember(contact.peerId)} />
+            <span><strong>{contact.name}</strong><small>{contact.secure ? 'Online e protetto' : contact.online ? 'Connessione in preparazione' : 'Non in linea'}</small></span>
+          </label>
+        {/each}
+      </fieldset>
+      <button class="primary-button wide" disabled={!groupName.trim() || groupMemberIds.length < 2 || pendingGroupCreation} onclick={createChatGroup}>{pendingGroupCreation ? 'Creo il gruppo…' : `Crea gruppo con ${groupMemberIds.length + 1} partecipanti`}</button>
+    </div>
+  </div>
+{/if}
+
 {#if emoticonCreateOpen}
   <div class="modal-backdrop">
     <div class="modal emoticon-modal" role="dialog" aria-modal="true" aria-labelledby="create-emoticon-title">
@@ -1125,6 +1455,11 @@
         <button class="secondary-button" onclick={chooseAvatar}>Scegli avatar</button>
         {#if avatarDataUrl}<button class="secondary-button" onclick={() => saveProfile(null, true)}>Rimuovi</button>{/if}
       </div>
+      <fieldset class="preview-settings">
+        <legend>Anteprime immagini</legend>
+        <label><span><strong>Immagini inviate</strong><small>Mostrale appena premi invio</small></span><input type="checkbox" bind:checked={previewSentImages} /></label>
+        <label><span><strong>Immagini ricevute</strong><small>Mostrale senza doverle aprire</small></span><input type="checkbox" bind:checked={previewReceivedImages} /></label>
+      </fieldset>
       <button class="primary-button wide" disabled={!displayName.trim()} onclick={() => saveProfile()}>Salva profilo</button>
     </div>
   </div>

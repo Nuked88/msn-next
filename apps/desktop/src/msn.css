@@ -556,45 +556,25 @@ button:disabled {
   scrollbar-width: thin;
 }
 
-.contact-group + .contact-group {
-  margin-top: 4px;
-}
-
-.group-heading {
-  width: 100%;
-  height: 29px;
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  padding: 0 7px;
-  border: 0;
-  color: var(--text-strong);
-  background: transparent;
-  font-size: 10px;
-  text-align: left;
-  cursor: pointer;
-}
-
-.group-heading:hover {
-  color: var(--blue-strong);
-  background: color-mix(in srgb, var(--blue-soft) 54%, transparent);
-}
-
-.group-heading svg {
-  transition: transform 150ms ease;
-}
-
-.group-heading svg.closed {
-  transform: rotate(-90deg);
-}
-
-.group-heading strong {
-  flex: 1;
-}
-
-.group-heading span {
+.roster-section-label {
+  padding: 9px 7px 4px;
   color: var(--muted);
   font-size: 9px;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.group-chat-avatar {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  border: 1px solid var(--selected-border);
+  border-radius: 8px;
+  color: var(--blue-strong);
+  background: var(--blue-soft);
 }
 
 .contact-row {
@@ -788,6 +768,7 @@ button:disabled {
 }
 
 .conversation {
+  position: relative;
   min-width: 0;
   min-height: 0;
   display: grid;
@@ -1182,6 +1163,26 @@ button:disabled {
   border-radius: 5px;
   color: var(--blue-strong);
   background: var(--surface-soft);
+  text-align: left;
+  cursor: pointer;
+}
+
+.file-line:disabled {
+  cursor: default;
+  opacity: 0.78;
+}
+
+.file-line > img {
+  width: 58px;
+  height: 58px;
+  flex: 0 0 auto;
+  border-radius: 5px;
+  object-fit: cover;
+}
+
+.file-line > span {
+  min-width: 0;
+  flex: 1;
 }
 
 .file-line span {
@@ -1719,6 +1720,39 @@ button:disabled {
   gap: 7px;
 }
 
+.group-management {
+  display: grid;
+  gap: 7px;
+}
+
+.group-management ul {
+  max-height: 145px;
+  margin: 0 0 3px;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.group-management li {
+  padding: 6px 2px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+  font-size: 10px;
+}
+
+.group-management button {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--surface);
+  cursor: pointer;
+}
+
 .contact-management label {
   color: var(--muted);
   font-size: 9px;
@@ -1772,6 +1806,185 @@ button:disabled {
 
 .profile-avatar-actions button {
   flex: 1;
+}
+
+.group-create-modal { width: min(440px, calc(100vw - 32px)); }
+
+.group-member-picker {
+  max-height: 250px;
+  margin: 16px 0;
+  padding: 0;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+
+.group-member-picker legend {
+  padding: 0 6px;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.group-member-picker label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+}
+
+.group-member-picker label:last-child { border-bottom: 0; }
+.group-member-picker input { width: 16px; height: 16px; flex: 0 0 auto; accent-color: var(--blue); }
+.group-member-picker span,
+.group-member-picker strong,
+.group-member-picker small { display: block; }
+.group-member-picker span { min-width: 0; }
+.group-member-picker strong { font-size: 11px; }
+.group-member-picker small { margin-top: 2px; font-size: 9px; }
+
+.preview-settings {
+  display: grid;
+  gap: 2px;
+  margin: 16px 0;
+  padding: 0;
+  border: 0;
+  text-align: left;
+}
+
+.preview-settings legend {
+  margin-bottom: 6px;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.preview-settings label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 10px 11px;
+  border: 1px solid var(--line);
+  background: var(--surface-soft);
+  cursor: pointer;
+}
+
+.preview-settings label:first-of-type { border-radius: 7px 7px 0 0; }
+.preview-settings label:last-of-type { border-radius: 0 0 7px 7px; }
+
+.preview-settings span,
+.preview-settings strong,
+.preview-settings small {
+  display: block;
+}
+
+.preview-settings strong { font-size: 0.84rem; }
+.preview-settings small { margin-top: 2px; color: var(--text-muted); font-size: 0.72rem; }
+.preview-settings input { width: 17px; height: 17px; accent-color: var(--blue); }
+
+.context-scrim {
+  position: fixed;
+  z-index: 90;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: transparent;
+}
+
+.contact-context-menu {
+  position: fixed;
+  z-index: 91;
+  width: 210px;
+  padding: 5px;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: var(--surface-raised);
+  box-shadow: 0 10px 28px color-mix(in srgb, var(--text-strong) 22%, transparent);
+}
+
+.contact-context-menu button {
+  width: 100%;
+  min-height: 30px;
+  padding: 5px 9px;
+  border: 0;
+  border-radius: 4px;
+  color: var(--text);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.contact-context-menu button:hover {
+  background: var(--selected);
+}
+
+.contact-context-menu small {
+  display: block;
+  padding: 6px 9px 3px;
+  color: var(--muted);
+  font-size: 8px;
+  text-transform: uppercase;
+}
+
+.contact-context-menu .danger-item {
+  color: #b42318;
+}
+
+.context-separator {
+  height: 1px;
+  margin: 4px;
+  background: var(--line);
+}
+
+.file-drop-overlay {
+  position: absolute;
+  z-index: 70;
+  inset: 72px 14px 145px;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 7px;
+  border: 2px dashed var(--blue);
+  border-radius: 10px;
+  color: var(--blue-strong);
+  background: color-mix(in srgb, var(--surface-raised) 92%, transparent);
+  pointer-events: none;
+}
+
+.file-drop-overlay small {
+  color: var(--muted);
+}
+
+.image-viewer {
+  padding: 42px;
+  background: rgba(4, 14, 28, 0.88);
+}
+
+.image-viewer > img {
+  max-width: 92vw;
+  max-height: 88vh;
+  object-fit: contain;
+  border-radius: 7px;
+}
+
+.image-viewer > button {
+  position: fixed;
+  top: 18px;
+  right: 18px;
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  color: white;
+  background: rgba(255, 255, 255, 0.15);
 }
 
 .received-emoji-list {

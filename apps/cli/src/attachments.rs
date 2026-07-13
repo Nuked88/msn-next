@@ -1,6 +1,10 @@
+use chacha20poly1305::{
+    aead::{rand_core::RngCore, Aead, OsRng},
+    KeyInit, XChaCha20Poly1305, XNonce,
+};
 use msnnext_protocol::{AttachmentChunk, AttachmentManifest};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     error::Error,
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
@@ -8,7 +12,8 @@ use std::{
 };
 
 pub const CHUNK_SIZE: usize = 256 * 1024;
-pub const MAX_FILE_BYTES: u64 = 25 * 1024 * 1024;
+pub const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+const MAX_PREVIEW_BYTES: u64 = 50 * 1024 * 1024;
 
 pub fn build_manifest(path: &Path) -> Result<AttachmentManifest, Box<dyn Error>> {
     let size = fs::metadata(path)?.len();
@@ -88,28 +93,48 @@ pub fn read_chunk(
 
 pub struct Receiver {
     root: PathBuf,
-    active: HashMap<[u8; 32], AttachmentManifest>,
+    active: HashMap<[u8; 32], ActiveTransfer>,
+    cipher: XChaCha20Poly1305,
+}
+
+struct ActiveTransfer {
+    manifest: AttachmentManifest,
+    missing: HashSet<u32>,
+}
+
+pub struct CompletedAttachment {
+    pub id: [u8; 32],
+    pub filename: String,
+    pub mime: String,
 }
 
 impl Receiver {
-    pub fn new(root: PathBuf) -> Self {
-        Self {
+    pub fn new(root: PathBuf, key: [u8; 32]) -> Self {
+        let receiver = Self {
             root,
             active: HashMap::new(),
-        }
+            cipher: XChaCha20Poly1305::new((&key).into()),
+        };
+        receiver.seal_legacy_files();
+        receiver
     }
 
     pub fn accept_offer(
         &mut self,
         manifest: AttachmentManifest,
-    ) -> Result<(Vec<u32>, Option<PathBuf>), Box<dyn Error>> {
+    ) -> Result<(Vec<u32>, Option<CompletedAttachment>), Box<dyn Error>> {
         validate_manifest(&manifest)?;
-        let target = self.target_path(&manifest);
-        if let Ok(bytes) = fs::read(&target) {
+        if self
+            .load_manifest(&manifest.attachment_id)
+            .is_ok_and(|stored| stored == manifest)
+        {
+            return Ok((vec![], Some(completed(&manifest))));
+        }
+        if let Ok(bytes) = self.read_legacy(&manifest.attachment_id) {
             if bytes.len() as u64 == manifest.size
                 && blake3::hash(&bytes).as_bytes() == &manifest.attachment_id
             {
-                return Ok((vec![], Some(target)));
+                return Ok((vec![], Some(completed(&manifest))));
             }
         }
         fs::create_dir_all(self.parts_dir(&manifest.attachment_id))?;
@@ -119,27 +144,38 @@ impl Receiver {
             .enumerate()
             .filter_map(|(index, expected)| {
                 let path = self.chunk_path(&manifest.attachment_id, index as u32);
-                match fs::read(path) {
-                    Ok(bytes) if blake3::hash(&bytes).as_bytes() == expected => None,
+                match fs::read(path)
+                    .ok()
+                    .and_then(|bytes| self.decrypt(&bytes).ok())
+                {
+                    Some(bytes) if blake3::hash(&bytes).as_bytes() == expected => None,
                     _ => Some(index as u32),
                 }
             })
             .collect();
         if missing.is_empty() {
-            return Ok((missing, Some(self.assemble(&manifest)?)));
+            self.finalize(&manifest)?;
+            return Ok((missing, Some(completed(&manifest))));
         }
-        self.active.insert(manifest.attachment_id, manifest);
+        self.active.insert(
+            manifest.attachment_id,
+            ActiveTransfer {
+                manifest,
+                missing: missing.iter().copied().collect(),
+            },
+        );
         Ok((missing, None))
     }
 
     pub fn accept_chunk(
         &mut self,
         chunk: &AttachmentChunk,
-    ) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    ) -> Result<Option<CompletedAttachment>, Box<dyn Error>> {
         let manifest = self
             .active
             .get(&chunk.attachment_id)
             .ok_or("manifest mancante")?
+            .manifest
             .clone();
         let expected = manifest
             .chunks
@@ -152,60 +188,43 @@ impl Receiver {
         }
         fs::write(
             self.chunk_path(&chunk.attachment_id, chunk.index),
-            &chunk.bytes,
+            self.encrypt(&chunk.bytes)?,
         )?;
-        if self.missing(&manifest).is_empty() {
-            let path = self.assemble(&manifest)?;
+        let complete = self
+            .active
+            .get_mut(&chunk.attachment_id)
+            .is_some_and(|transfer| {
+                transfer.missing.remove(&chunk.index);
+                transfer.missing.is_empty()
+            });
+        if complete {
+            self.finalize(&manifest)?;
             self.active.remove(&chunk.attachment_id);
-            return Ok(Some(path));
+            return Ok(Some(completed(&manifest)));
         }
         Ok(None)
     }
 
-    fn missing(&self, manifest: &AttachmentManifest) -> Vec<u32> {
-        manifest
-            .chunks
-            .iter()
-            .enumerate()
-            .filter_map(|(index, expected)| {
-                fs::read(self.chunk_path(&manifest.attachment_id, index as u32))
-                    .ok()
-                    .filter(|bytes| blake3::hash(bytes).as_bytes() == expected)
-                    .is_none()
-                    .then_some(index as u32)
-            })
-            .collect()
-    }
-
-    fn assemble(&self, manifest: &AttachmentManifest) -> Result<PathBuf, Box<dyn Error>> {
+    fn finalize(&self, manifest: &AttachmentManifest) -> Result<(), Box<dyn Error>> {
         fs::create_dir_all(&self.root)?;
-        let id = blake3::Hash::from_bytes(manifest.attachment_id)
-            .to_hex()
-            .to_string();
-        let target = self.target_path(manifest);
-        let temporary = self.root.join(format!(".{id}.tmp"));
-        let mut output = File::create(&temporary)?;
+        let parts = self.parts_dir(&manifest.attachment_id);
+        let mut size = 0_u64;
+        let mut hash = blake3::Hasher::new();
         for index in 0..manifest.chunks.len() {
-            output.write_all(&fs::read(
-                self.chunk_path(&manifest.attachment_id, index as u32),
-            )?)?;
+            let encrypted = fs::read(self.chunk_path(&manifest.attachment_id, index as u32))?;
+            let bytes = self.decrypt(&encrypted)?;
+            size += bytes.len() as u64;
+            hash.update(&bytes);
         }
-        output.flush()?;
-        drop(output);
-        let bytes = fs::read(&temporary)?;
-        if bytes.len() as u64 != manifest.size
-            || blake3::hash(&bytes).as_bytes() != &manifest.attachment_id
-        {
-            fs::remove_file(&temporary).ok();
+        if size != manifest.size || hash.finalize().as_bytes() != &manifest.attachment_id {
             return Err("file ricostruito non valido".into());
         }
-        if target.exists() {
-            fs::remove_file(&temporary)?;
-        } else {
-            fs::rename(&temporary, &target)?;
-        }
-        fs::remove_dir_all(self.parts_dir(&manifest.attachment_id)).ok();
-        Ok(target)
+        let metadata = cbor4ii::serde::to_vec(Vec::new(), manifest)?;
+        fs::write(parts.join("manifest.cbor"), self.encrypt(&metadata)?)?;
+        let completed = self.completed_dir(&manifest.attachment_id);
+        fs::remove_dir_all(&completed).ok();
+        fs::rename(parts, completed)?;
+        Ok(())
     }
 
     fn parts_dir(&self, id: &[u8; 32]) -> PathBuf {
@@ -217,12 +236,119 @@ impl Receiver {
         self.parts_dir(id).join(format!("{index}.part"))
     }
 
-    fn target_path(&self, manifest: &AttachmentManifest) -> PathBuf {
-        let id = blake3::Hash::from_bytes(manifest.attachment_id)
-            .to_hex()
-            .to_string();
+    fn completed_dir(&self, id: &[u8; 32]) -> PathBuf {
         self.root
-            .join(format!("{}-{}", &id[..12], manifest.filename))
+            .join(blake3::Hash::from_bytes(*id).to_hex().as_str())
+    }
+
+    fn target_path_for_id(&self, id: &[u8; 32]) -> PathBuf {
+        let id = blake3::Hash::from_bytes(*id).to_hex().to_string();
+        self.root.join(format!("{id}.vault"))
+    }
+
+    pub fn read(&self, id: &[u8; 32]) -> Result<Vec<u8>, Box<dyn Error>> {
+        if let Ok(bytes) = self.read_legacy(id) {
+            return Ok(bytes);
+        }
+        let manifest = self.load_manifest(id)?;
+        if manifest.size > MAX_PREVIEW_BYTES {
+            return Err("anteprima limitata a 50 MB; esporta il file per aprirlo".into());
+        }
+        let mut output = Vec::with_capacity(manifest.size as usize);
+        for index in 0..manifest.chunks.len() {
+            let path = self.completed_dir(id).join(format!("{index}.part"));
+            output.extend(self.decrypt(&fs::read(path)?)?);
+        }
+        Ok(output)
+    }
+
+    pub fn export(&self, id: &[u8; 32], path: &Path) -> Result<(), Box<dyn Error>> {
+        if let Ok(bytes) = self.read_legacy(id) {
+            fs::write(path, bytes)?;
+            return Ok(());
+        }
+        let manifest = self.load_manifest(id)?;
+        let mut output = File::create(path)?;
+        for index in 0..manifest.chunks.len() {
+            let part = self.completed_dir(id).join(format!("{index}.part"));
+            output.write_all(&self.decrypt(&fs::read(part)?)?)?;
+        }
+        output.flush()?;
+        Ok(())
+    }
+
+    fn read_legacy(&self, id: &[u8; 32]) -> Result<Vec<u8>, Box<dyn Error>> {
+        self.decrypt(&fs::read(self.target_path_for_id(id))?)
+    }
+
+    fn load_manifest(&self, id: &[u8; 32]) -> Result<AttachmentManifest, Box<dyn Error>> {
+        let encrypted = fs::read(self.completed_dir(id).join("manifest.cbor"))?;
+        Ok(cbor4ii::serde::from_slice(&self.decrypt(&encrypted)?)?)
+    }
+
+    fn encrypt(&self, bytes: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+        let mut nonce = [0; 24];
+        OsRng.fill_bytes(&mut nonce);
+        let mut encrypted = nonce.to_vec();
+        encrypted.extend(
+            self.cipher
+                .encrypt(XNonce::from_slice(&nonce), bytes)
+                .map_err(|_| "cifratura allegato fallita")?,
+        );
+        Ok(encrypted)
+    }
+
+    fn decrypt(&self, bytes: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+        if bytes.len() < 24 {
+            return Err("allegato cifrato non valido".into());
+        }
+        self.cipher
+            .decrypt(XNonce::from_slice(&bytes[..24]), &bytes[24..])
+            .map_err(|_| "allegato non decifrabile".into())
+    }
+
+    fn seal_legacy_files(&self) {
+        if let Ok(directories) = fs::read_dir(self.root.join(".parts")) {
+            for directory in directories.flatten() {
+                let Ok(parts) = fs::read_dir(directory.path()) else {
+                    continue;
+                };
+                for part in parts.flatten() {
+                    let path = part.path();
+                    let Ok(bytes) = fs::read(&path) else { continue };
+                    if self.decrypt(&bytes).is_err() {
+                        if let Ok(encrypted) = self.encrypt(&bytes) {
+                            fs::write(path, encrypted).ok();
+                        }
+                    }
+                }
+            }
+        }
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() || path.extension().is_some_and(|ext| ext == "vault") {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else { continue };
+            let id = *blake3::hash(&bytes).as_bytes();
+            let Ok(encrypted) = self.encrypt(&bytes) else {
+                continue;
+            };
+            if fs::write(self.target_path_for_id(&id), encrypted).is_ok() {
+                fs::remove_file(path).ok();
+            }
+        }
+    }
+}
+
+fn completed(manifest: &AttachmentManifest) -> CompletedAttachment {
+    CompletedAttachment {
+        id: manifest.attachment_id,
+        filename: manifest.filename.clone(),
+        mime: manifest.mime.clone(),
     }
 }
 
@@ -238,8 +364,24 @@ fn validate_manifest(manifest: &AttachmentManifest) -> Result<(), Box<dyn Error>
     if manifest.chunks.len() != expected_chunks {
         return Err("numero chunk non valido".into());
     }
-    if manifest.filename.is_empty() || manifest.filename.len() > 200 || manifest.mime.len() > 100 {
+    if manifest.filename.is_empty()
+        || manifest.filename.len() > 200
+        || manifest.mime.len() > 100
+        || manifest.mime.contains(['\t', '\r', '\n'])
+    {
         return Err("metadati file non validi".into());
+    }
+    if !matches!(
+        manifest.mime.as_str(),
+        "image/png"
+            | "image/jpeg"
+            | "image/gif"
+            | "image/webp"
+            | "video/mp4"
+            | "video/webm"
+            | "application/octet-stream"
+    ) {
+        return Err("tipo file non consentito".into());
     }
     if Path::new(&manifest.filename)
         .file_name()
@@ -263,7 +405,7 @@ mod tests {
         let source = root.join("source.bin");
         fs::write(&source, vec![7; CHUNK_SIZE + 10]).unwrap();
         let manifest = build_manifest(&source).unwrap();
-        let mut receiver = Receiver::new(root.join("received"));
+        let mut receiver = Receiver::new(root.join("received"), [11; 32]);
         assert_eq!(
             receiver.accept_offer(manifest.clone()).unwrap().0,
             vec![0, 1]
@@ -272,14 +414,26 @@ mod tests {
             .accept_chunk(&read_chunk(&source, &manifest, 0).unwrap())
             .unwrap();
 
-        let mut resumed = Receiver::new(root.join("received"));
+        let mut resumed = Receiver::new(root.join("received"), [11; 32]);
         assert_eq!(resumed.accept_offer(manifest.clone()).unwrap().0, vec![1]);
         let completed = resumed
             .accept_chunk(&read_chunk(&source, &manifest, 1).unwrap())
             .unwrap()
             .unwrap();
-        assert_eq!(fs::read(completed).unwrap(), fs::read(source).unwrap());
-        let mut duplicate = Receiver::new(root.join("received"));
+        assert_eq!(
+            resumed.read(&completed.id).unwrap(),
+            fs::read(&source).unwrap()
+        );
+        assert!(
+            !fs::read(resumed.completed_dir(&completed.id).join("0.part"))
+                .unwrap()
+                .windows(16)
+                .any(|window| window == [7; 16])
+        );
+        let exported = root.join("exported.bin");
+        resumed.export(&completed.id, &exported).unwrap();
+        assert_eq!(fs::read(exported).unwrap(), fs::read(source).unwrap());
+        let mut duplicate = Receiver::new(root.join("received"), [11; 32]);
         let (missing, completed) = duplicate.accept_offer(manifest).unwrap();
         assert!(missing.is_empty() && completed.is_some());
         fs::remove_dir_all(root).ok();

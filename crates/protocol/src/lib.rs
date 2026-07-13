@@ -19,11 +19,29 @@ pub struct Envelope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChatEvent {
     Text(TextMessage),
+    GroupDefinition(GroupDefinition),
+    GroupText(GroupTextMessage),
     Nudge(Nudge),
     EmoticonOffer(EmoticonOffer),
     AttachmentOffer(AttachmentManifest),
     AttachmentChunk(AttachmentChunk),
     Presence(PresenceUpdate),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupDefinition {
+    pub group_id: [u8; 16],
+    pub name: String,
+    pub owner_peer: String,
+    pub members: Vec<String>,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupTextMessage {
+    pub group_id: [u8; 16],
+    pub message: TextMessage,
+    pub timestamp_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

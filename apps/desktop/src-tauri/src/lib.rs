@@ -1,10 +1,13 @@
 use std::{
+    collections::HashSet,
+    io::Cursor,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
     },
     thread,
+    time::Duration,
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -20,6 +23,7 @@ type RunningNode = (u64, CommandSender);
 struct NodeState {
     commands: Arc<Mutex<Option<RunningNode>>>,
     next_generation: Arc<AtomicU64>,
+    workers: Arc<(Mutex<HashSet<u64>>, Condvar)>,
 }
 
 #[derive(Deserialize)]
@@ -34,6 +38,10 @@ struct NodeConfig {
 struct StoredProfile {
     name: String,
     avatar_file: Option<String>,
+    #[serde(default = "enabled_by_default")]
+    preview_sent_images: bool,
+    #[serde(default)]
+    preview_received_images: bool,
 }
 
 #[derive(Serialize)]
@@ -41,6 +49,12 @@ struct StoredProfile {
 struct ProfileView {
     name: String,
     avatar_data_url: Option<String>,
+    preview_sent_images: bool,
+    preview_received_images: bool,
+}
+
+fn enabled_by_default() -> bool {
+    true
 }
 
 fn profile_view(data_dir: &Path, profile: StoredProfile) -> Result<ProfileView, String> {
@@ -56,6 +70,8 @@ fn profile_view(data_dir: &Path, profile: StoredProfile) -> Result<ProfileView, 
     Ok(ProfileView {
         name: profile.name,
         avatar_data_url,
+        preview_sent_images: profile.preview_sent_images,
+        preview_received_images: profile.preview_received_images,
     })
 }
 
@@ -68,6 +84,22 @@ fn worker_is_current(current_generation: Option<u64>, worker_generation: u64) ->
         None => true,
         Some(current) => current == worker_generation,
     }
+}
+
+fn wait_for_worker(
+    workers: &(Mutex<HashSet<u64>>, Condvar),
+    generation: u64,
+    timeout: Duration,
+) -> Result<bool, String> {
+    let running = workers
+        .0
+        .lock()
+        .map_err(|_| "stato worker non disponibile")?;
+    let (running, _) = workers
+        .1
+        .wait_timeout_while(running, timeout, |workers| workers.contains(&generation))
+        .map_err(|_| "arresto del nodo non disponibile")?;
+    Ok(!running.contains(&generation))
 }
 
 fn decode_qr_image(path: &Path) -> Result<String, String> {
@@ -125,6 +157,12 @@ fn node_start(
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    state
+        .workers
+        .0
+        .lock()
+        .map_err(|_| "stato worker non disponibile")?
+        .insert(generation);
     *command_slot = Some((generation, command_tx));
     drop(command_slot);
 
@@ -143,6 +181,7 @@ fn node_start(
     });
 
     let state_slot = state.commands.clone();
+    let workers = state.workers.clone();
     thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -170,6 +209,10 @@ fn node_start(
                         *commands = None;
                     }
                 }
+                if let Ok(mut running) = workers.0.lock() {
+                    running.remove(&generation);
+                    workers.1.notify_all();
+                }
                 return;
             }
         };
@@ -196,6 +239,10 @@ fn node_start(
             {
                 *commands = None;
             }
+        }
+        if let Ok(mut running) = workers.0.lock() {
+            running.remove(&generation);
+            workers.1.notify_all();
         }
     });
     Ok(())
@@ -318,6 +365,62 @@ fn node_clear_conversation(state: State<'_, NodeState>, peer_id: String) -> Resu
 }
 
 #[tauri::command]
+fn node_create_chat_group(
+    state: State<'_, NodeState>,
+    name: String,
+    members: Vec<String>,
+) -> Result<(), String> {
+    let members = members
+        .iter()
+        .map(|member| parse_peer(member))
+        .collect::<Result<Vec<_>, _>>()?;
+    send_command(&state, ClientCommand::CreateChatGroup { name, members })
+}
+
+#[tauri::command]
+fn node_send_group_text(
+    state: State<'_, NodeState>,
+    group_id: String,
+    text: String,
+) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Err("il messaggio è vuoto".into());
+    }
+    send_command(&state, ClientCommand::SendGroupText { group_id, text })
+}
+
+#[tauri::command]
+fn node_clear_group_conversation(
+    state: State<'_, NodeState>,
+    group_id: String,
+) -> Result<(), String> {
+    send_command(&state, ClientCommand::ClearGroupConversation { group_id })
+}
+
+#[tauri::command]
+fn node_delete_chat_group(state: State<'_, NodeState>, group_id: String) -> Result<(), String> {
+    send_command(&state, ClientCommand::DeleteChatGroup { group_id })
+}
+
+#[tauri::command]
+fn node_read_attachment(
+    state: State<'_, NodeState>,
+    id: String,
+    mime: String,
+) -> Result<(), String> {
+    send_command(&state, ClientCommand::ReadAttachment { id, mime })
+}
+
+#[tauri::command]
+fn node_export_attachment(
+    state: State<'_, NodeState>,
+    id: String,
+    path: PathBuf,
+) -> Result<(), String> {
+    send_command(&state, ClientCommand::ExportAttachment { id, path })
+}
+
+#[tauri::command]
 fn node_import_contact(state: State<'_, NodeState>, link: String) -> Result<(), String> {
     send_command(&state, ClientCommand::ImportContactLink { link })
 }
@@ -330,6 +433,30 @@ fn node_request_contact_link(state: State<'_, NodeState>) -> Result<(), String> 
 #[tauri::command]
 fn scan_contact_qr(path: String) -> Result<String, String> {
     decode_qr_image(Path::new(&path))
+}
+
+#[tauri::command]
+fn image_preview(path: String) -> Result<String, String> {
+    const MAX_PREVIEW_SOURCE_BYTES: u64 = 100 * 1024 * 1024;
+    let path = Path::new(&path);
+    if std::fs::metadata(path)
+        .map_err(|error| format!("immagine non leggibile: {error}"))?
+        .len()
+        > MAX_PREVIEW_SOURCE_BYTES
+    {
+        return Err("immagine troppo grande per l’anteprima".into());
+    }
+    let image = image::open(path)
+        .map_err(|error| format!("immagine non leggibile: {error}"))?
+        .thumbnail(1280, 1280);
+    let mut bytes = Cursor::new(Vec::new());
+    image
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .map_err(|error| format!("anteprima non creata: {error}"))?;
+    Ok(format!(
+        "data:image/png;base64,{}",
+        BASE64.encode(bytes.into_inner())
+    ))
 }
 
 #[tauri::command]
@@ -354,6 +481,8 @@ fn profile_save(
     name: String,
     avatar_path: Option<String>,
     clear_avatar: bool,
+    preview_sent_images: Option<bool>,
+    preview_received_images: Option<bool>,
 ) -> Result<ProfileView, String> {
     let name = name.trim();
     if name.is_empty() || name.len() > 64 {
@@ -368,6 +497,16 @@ fn profile_save(
     let previous: Option<StoredProfile> = std::fs::read(&profile_path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let sent_previews = preview_sent_images
+        .or_else(|| previous.as_ref().map(|profile| profile.preview_sent_images))
+        .unwrap_or(true);
+    let received_previews = preview_received_images
+        .or_else(|| {
+            previous
+                .as_ref()
+                .map(|profile| profile.preview_received_images)
+        })
+        .unwrap_or(false);
     let avatar_file = if clear_avatar {
         if let Some(file) = previous
             .as_ref()
@@ -390,6 +529,8 @@ fn profile_save(
     let profile = StoredProfile {
         name: name.to_owned(),
         avatar_file,
+        preview_sent_images: sent_previews,
+        preview_received_images: received_previews,
     };
     std::fs::write(
         &profile_path,
@@ -429,8 +570,11 @@ fn node_stop(state: State<'_, NodeState>) -> Result<(), String> {
         .lock()
         .map_err(|_| "stato del nodo non disponibile")?
         .take();
-    if let Some((_, commands)) = commands {
+    if let Some((generation, commands)) = commands {
         let _ = commands.send(ClientCommand::Shutdown);
+        if !wait_for_worker(&state.workers, generation, Duration::from_secs(5))? {
+            return Err("il nodo non si è arrestato in tempo; riprova".into());
+        }
     }
     Ok(())
 }
@@ -462,9 +606,16 @@ pub fn run() {
             node_rename_contact,
             node_delete_contact,
             node_clear_conversation,
+            node_create_chat_group,
+            node_send_group_text,
+            node_clear_group_conversation,
+            node_delete_chat_group,
+            node_read_attachment,
+            node_export_attachment,
             node_import_contact,
             node_request_contact_link,
             scan_contact_qr,
+            image_preview,
             profile_load,
             profile_save,
             node_status,
@@ -488,6 +639,18 @@ mod tests {
         assert!(worker_is_current(None, 1));
         assert!(worker_is_current(Some(2), 2));
         assert!(!worker_is_current(Some(2), 1));
+    }
+
+    #[test]
+    fn reconnect_waits_for_previous_worker_to_stop() {
+        let workers = Arc::new((Mutex::new(HashSet::from([1])), Condvar::new()));
+        let background = workers.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            background.0.lock().unwrap().remove(&1);
+            background.1.notify_all();
+        });
+        assert!(wait_for_worker(&workers, 1, Duration::from_secs(1)).unwrap());
     }
 
     #[test]

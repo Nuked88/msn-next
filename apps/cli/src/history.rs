@@ -3,6 +3,7 @@ use chacha20poly1305::{
     KeyInit, XChaCha20Poly1305, XNonce,
 };
 use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 use std::{error::Error, fs, path::Path};
 
 pub struct History {
@@ -22,6 +23,15 @@ pub struct ContactEntry {
     pub peer: String,
     pub name: String,
     pub link: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GroupChatEntry {
+    pub id: String,
+    pub name: String,
+    pub owner_peer: String,
+    pub members: Vec<String>,
+    pub revision: u64,
 }
 
 impl History {
@@ -47,6 +57,10 @@ impl History {
         );
         CREATE TABLE IF NOT EXISTS ignored_contacts (
             peer TEXT PRIMARY KEY
+        );
+        CREATE TABLE IF NOT EXISTS group_chats (
+            id TEXT PRIMARY KEY,
+            definition BLOB NOT NULL
         );",
         )?;
         Ok(Self {
@@ -236,6 +250,75 @@ impl History {
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+
+    pub fn save_group_chat(&self, group: &GroupChatEntry) -> Result<(), Box<dyn Error>> {
+        if group.id.len() != 32 || !group.id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("id chat di gruppo non valido".into());
+        }
+        let encoded = cbor4ii::serde::to_vec(Vec::new(), group)?;
+        let encrypted = self.seal(&encoded)?;
+        self.connection.execute(
+            "INSERT INTO group_chats (id, definition) VALUES (?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET definition = excluded.definition",
+            params![group.id, encrypted],
+        )?;
+        Ok(())
+    }
+
+    pub fn group_chat(&self, id: &str) -> Result<Option<GroupChatEntry>, Box<dyn Error>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT definition FROM group_chats WHERE id = ?1")?;
+        let mut rows = statement.query([id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let encrypted: Vec<u8> = row.get(0)?;
+        Ok(Some(cbor4ii::serde::from_slice(&self.unseal(&encrypted)?)?))
+    }
+
+    pub fn group_chats(&self) -> Result<Vec<GroupChatEntry>, Box<dyn Error>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT definition FROM group_chats ORDER BY id")?;
+        let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut groups = Vec::new();
+        for row in rows {
+            groups.push(cbor4ii::serde::from_slice(&self.unseal(&row?)?)?);
+        }
+        groups.sort_by(|left: &GroupChatEntry, right: &GroupChatEntry| {
+            left.name.to_lowercase().cmp(&right.name.to_lowercase())
+        });
+        Ok(groups)
+    }
+
+    pub fn delete_group_chat(&self, id: &str) -> Result<(), Box<dyn Error>> {
+        self.clear_conversation(&format!("group:{id}"))?;
+        self.connection
+            .execute("DELETE FROM group_chats WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+        let mut nonce = [0; 24];
+        OsRng.fill_bytes(&mut nonce);
+        let ciphertext = self
+            .cipher
+            .encrypt(XNonce::from_slice(&nonce), plaintext)
+            .map_err(|_| "cifratura dati fallita")?;
+        let mut encrypted = nonce.to_vec();
+        encrypted.extend(ciphertext);
+        Ok(encrypted)
+    }
+
+    fn unseal(&self, encrypted: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+        if encrypted.len() < 24 {
+            return Err("dato cifrato danneggiato".into());
+        }
+        self.cipher
+            .decrypt(XNonce::from_slice(&encrypted[..24]), &encrypted[24..])
+            .map_err(|_| "dato non decifrabile".into())
+    }
 }
 
 #[cfg(test)]
@@ -318,6 +401,33 @@ mod tests {
         history.allow_contact("peer-a").unwrap();
         assert!(history.ignored_contacts().unwrap().is_empty());
         drop(history);
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn group_chat_definition_is_persistent_and_encrypted() {
+        let path =
+            std::env::temp_dir().join(format!("msnnext-group-chat-{}.db", std::process::id()));
+        fs::remove_file(&path).ok();
+        let group = GroupChatEntry {
+            id: "00112233445566778899aabbccddeeff".into(),
+            name: "Segreto gruppo".into(),
+            owner_peer: "owner".into(),
+            members: vec!["owner".into(), "alice".into(), "bob".into()],
+            revision: 1,
+        };
+        {
+            let history = History::open(&path, [11; 32]).unwrap();
+            history.save_group_chat(&group).unwrap();
+            assert_eq!(
+                history.group_chat(&group.id).unwrap().unwrap().name,
+                group.name
+            );
+        }
+        assert!(!fs::read(&path)
+            .unwrap()
+            .windows(group.name.len())
+            .any(|bytes| bytes == group.name.as_bytes()));
         fs::remove_file(path).ok();
     }
 }
