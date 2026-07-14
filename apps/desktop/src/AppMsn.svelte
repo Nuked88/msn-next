@@ -90,9 +90,12 @@
     groupId: string
     senderPeerId: string
     direction: 'in' | 'out'
+    kind: string
     body: string
     timestampMs: number
     emoticons: ClientEmoticonSpan[]
+    attachmentId?: string
+    attachmentMime?: string
   }
 
   type ClientEvent =
@@ -105,6 +108,7 @@
     | { type: 'emoticonRemoved'; assetId: string }
     | { type: 'contactLink'; link: string }
     | { type: 'attachmentReceived'; peerId: string; id: string; filename: string; mime: string }
+    | { type: 'groupAttachmentReceived'; groupId: string; id: string; filename: string; mime: string }
     | { type: 'attachmentSent'; peerId: string; filename: string }
     | { type: 'contactRemoved'; peerId: string }
     | { type: 'conversationCleared'; peerId: string }
@@ -196,6 +200,7 @@
   let toastText = ''
   let toastTimer: ReturnType<typeof setTimeout>
   let messageList: HTMLDivElement
+  let messageEditor: HTMLDivElement
 
   $: activeContact = contacts.find((contact) => contact.peerId === selectedPeerId)
   $: activeGroup = chatGroups.find((group) => group.id === selectedGroupId)
@@ -406,9 +411,13 @@
     }
     if (event.type === 'groupMessage') {
       const key = `group:${event.message.groupId}`
+      const next = toGroupChatMessage(event.message)
+      if (event.message.direction === 'out' && event.message.kind === 'file') {
+        consumeSentPreview(next, key, event.message.body)
+      }
       conversations = {
         ...conversations,
-        [key]: [...(conversations[key] || []), toGroupChatMessage(event.message)],
+        [key]: [...(conversations[key] || []), next],
       }
       if (event.message.direction === 'in' && selectedGroupId !== event.message.groupId) {
         chatGroups = chatGroups.map((group) => group.id === event.message.groupId
@@ -416,6 +425,24 @@
           : group)
       }
       scrollMessages()
+      return
+    }
+    if (event.type === 'groupAttachmentReceived') {
+      const key = `group:${event.groupId}`
+      const conversation = [...(conversations[key] || [])]
+      const index = conversation.findLastIndex((message) => !message.mine && message.kind === 'file' && message.body === event.filename)
+      if (index >= 0) conversation[index] = {
+        ...conversation[index], attachmentId: event.id, attachmentMime: event.mime,
+      }
+      conversations = { ...conversations, [key]: conversation }
+      showToast(`File ricevuto nel gruppo: ${event.filename}`)
+      if (previewReceivedImages && event.mime.startsWith('image/')) {
+        automaticPreviewIds.add(event.id)
+        void invoke('node_read_attachment', { id: event.id, mime: event.mime }).catch((error) => {
+          automaticPreviewIds.delete(event.id)
+          showToast(String(error))
+        })
+      }
       return
     }
     if (event.type === 'groupConversationCleared') {
@@ -496,11 +523,13 @@
   function toGroupChatMessage(message: ClientGroupMessage): ChatMessage {
     return {
       id: `${message.timestampMs}-${crypto.randomUUID()}`,
-      kind: message.direction === 'out' ? 'outgoing' : 'incoming',
+      kind: message.kind === 'file' ? 'file' : message.direction === 'out' ? 'outgoing' : 'incoming',
       body: message.body,
       emoticons: message.emoticons || [],
       mine: message.direction === 'out',
       senderPeerId: message.senderPeerId,
+      attachmentId: message.attachmentId,
+      attachmentMime: message.attachmentMime,
       time: new Intl.DateTimeFormat('it', {
         hour: '2-digit',
         minute: '2-digit',
@@ -520,12 +549,7 @@
     const conversation = conversations[message.peerId] || []
     const next = toChatMessage(message)
     if (message.direction === 'out' && message.kind === 'file') {
-      const key = `${message.peerId}\u0000${message.body}`
-      const previews = pendingSentPreviews[key]
-      if (previews?.length) {
-        next.attachmentDataUrl = previews.shift()
-        if (!previews.length) delete pendingSentPreviews[key]
-      }
+      consumeSentPreview(next, message.peerId, message.body)
     }
     conversations = {
       ...conversations,
@@ -540,6 +564,14 @@
     }
     if (message.kind === 'nudge') shakeWindow()
     scrollMessages()
+  }
+
+  function consumeSentPreview(message: ChatMessage, conversation: string, filename: string) {
+    const key = `${conversation}\u0000${filename}`
+    const previews = pendingSentPreviews[key]
+    if (!previews?.length) return
+    message.attachmentDataUrl = previews.shift()
+    if (!previews.length) delete pendingSentPreviews[key]
   }
 
   function selectContact(id: string) {
@@ -635,14 +667,98 @@
     return parts
   }
 
+  function draftText(node: Node): string {
+    if (node.nodeType === Node.TEXT_NODE) return node.textContent || ''
+    if (node instanceof HTMLElement && node.dataset.trigger) return node.dataset.trigger
+    if (node instanceof HTMLBRElement) return '\n'
+    return Array.from(node.childNodes).map(draftText).join('')
+  }
+
+  function insertAtDraftCaret(text: string) {
+    messageEditor.focus()
+    const selection = window.getSelection()
+    const range = document.createRange()
+    if (selection?.anchorNode && messageEditor.contains(selection.anchorNode)) {
+      range.setStart(selection.anchorNode, selection.anchorOffset)
+    } else {
+      range.selectNodeContents(messageEditor)
+      range.collapse(false)
+    }
+    range.collapse(true)
+    const node = document.createTextNode(text)
+    range.insertNode(node)
+    range.setStart(node, text.length)
+    range.collapse(true)
+    selection?.removeAllRanges()
+    selection?.addRange(range)
+  }
+
+  function decorateDraftAtCaret() {
+    const selection = window.getSelection()
+    const node = selection?.anchorNode
+    if (!(node instanceof Text) || !messageEditor.contains(node)) return
+    const offset = selection?.anchorOffset || 0
+    const prefix = node.data.slice(0, offset)
+    const match = [
+      ...customEmoticons.map((item) => ({ trigger: item.trigger, item })),
+      ...emoticons.map((item) => ({ trigger: item.shortcut, item })),
+    ].sort((a, b) => b.trigger.length - a.trigger.length)
+      .find(({ trigger }) => prefix.endsWith(trigger))
+    if (!match) return
+
+    const token = match.item && 'dataUrl' in match.item
+      ? document.createElement('img')
+      : document.createElement('span')
+    token.dataset.trigger = match.trigger
+    token.className = 'draft-emoticon'
+    token.contentEditable = 'false'
+    if (token instanceof HTMLImageElement && 'dataUrl' in match.item) {
+      token.src = match.item.dataUrl
+      token.alt = match.item.name
+    } else {
+      token.textContent = 'glyph' in match.item ? match.item.glyph : match.trigger
+    }
+    const range = document.createRange()
+    range.setStart(node, offset - match.trigger.length)
+    range.setEnd(node, offset)
+    range.deleteContents()
+    range.insertNode(token)
+    range.setStartAfter(token)
+    range.collapse(true)
+    selection?.removeAllRanges()
+    selection?.addRange(range)
+  }
+
+  function syncDraft() {
+    decorateDraftAtCaret()
+    messageText = draftText(messageEditor).slice(0, 4000)
+    if (!messageText.trim()) {
+      messageText = ''
+      messageEditor.replaceChildren()
+    }
+  }
+
+  function insertDraftTrigger(trigger: string) {
+    if (!ready) return
+    insertAtDraftCaret(`${messageText && !messageText.endsWith(' ') ? ' ' : ''}${trigger}`)
+    decorateDraftAtCaret()
+    insertAtDraftCaret(' ')
+    syncDraft()
+  }
+
   function insertEmoticon(item: Emoticon) {
-    const spacer = messageText && !messageText.endsWith(' ') ? ' ' : ''
-    messageText += `${spacer}${item.shortcut} `
+    insertDraftTrigger(item.shortcut)
   }
 
   function insertCustomEmoticon(item: ClientEmoticon) {
-    const spacer = messageText && !messageText.endsWith(' ') ? ' ' : ''
-    messageText += `${spacer}${item.trigger} `
+    insertDraftTrigger(item.trigger)
+  }
+
+  function pasteDraft(event: ClipboardEvent) {
+    event.preventDefault()
+    const remaining = Math.max(0, 4000 - messageText.length)
+    insertAtDraftCaret((event.clipboardData?.getData('text/plain') || '').slice(0, remaining))
+    syncDraft()
   }
 
   function scrollMessages() {
@@ -690,6 +806,7 @@
       if (selectedGroupId) await invoke('node_send_group_text', { groupId: selectedGroupId, text })
       else await invoke('node_send_text', { peerId: selectedPeerId, text })
       messageText = ''
+      messageEditor.replaceChildren()
       emojiOpen = false
     } catch (error) {
       showToast(String(error))
@@ -706,16 +823,19 @@
   }
 
   async function chooseFile() {
-    if (!ready || !selectedPeerId || selectedGroupId) return
+    if (!ready || (!selectedPeerId && !selectedGroupId)) return
     const selected = await open({ multiple: false, directory: false })
     if (!selected || Array.isArray(selected)) return
     await sendFiles([selected])
   }
 
   async function sendFiles(paths: string[]) {
-    if (!ready || !selectedPeerId || !paths.length) return
+    if (!ready || (!selectedPeerId && !selectedGroupId) || !paths.length) return
     const targetPeer = selectedPeerId
-    pendingFileCount += paths.length
+    const targetGroup = selectedGroupId
+    const targetConversation = targetGroup ? `group:${targetGroup}` : targetPeer
+    const targetCount = targetGroup ? Math.max(1, groupOnline) : 1
+    pendingFileCount += paths.length * targetCount
     fileSending = true
     for (const path of paths) {
       try {
@@ -723,15 +843,16 @@
         if (previewSentImages && isImagePath(path)) {
           try {
             const preview = await invoke<string>('image_preview', { path })
-            const key = `${targetPeer}\u0000${filename}`
+            const key = `${targetConversation}\u0000${filename}`
             pendingSentPreviews[key] = [...(pendingSentPreviews[key] || []), preview]
           } catch {
             // L'anteprima è facoltativa: il file può comunque essere inviato.
           }
         }
-        await invoke('node_send_file', { peerId: targetPeer, path })
+        if (targetGroup) await invoke('node_send_group_file', { groupId: targetGroup, path })
+        else await invoke('node_send_file', { peerId: targetPeer, path })
       } catch (error) {
-        pendingFileCount = Math.max(0, pendingFileCount - 1)
+        pendingFileCount = Math.max(0, pendingFileCount - targetCount)
         fileSending = pendingFileCount > 0
         showToast(String(error))
       }
@@ -1156,7 +1277,7 @@
                       {#if message.attachmentDataUrl}
                         <img src={message.attachmentDataUrl} alt={message.body} />
                       {:else}<Paperclip size={17} />{/if}
-                      <span><b>{message.attachmentMime?.startsWith('image/') ? 'Immagine ricevuta' : 'File condiviso'}</b><small>{message.body}</small></span>
+                      <span><b>{message.attachmentMime?.startsWith('image/') ? (message.mine ? 'Immagine inviata' : 'Immagine ricevuta') : (message.mine ? 'File inviato' : 'File ricevuto')}</b><small>{message.body}</small></span>
                       {#if message.attachmentId}<ExternalLink size={14} />{/if}
                     </button>
                   {:else}
@@ -1276,27 +1397,38 @@
         <div class="chat-toolbar" aria-label="Strumenti conversazione">
           <button class:active={emojiOpen} disabled={!ready} onclick={() => emojiOpen = !emojiOpen}><Smile size={18} /><span>Emoticon</span></button>
           <button class="nudge-tool" disabled={!ready || !!activeGroup} onclick={sendNudge}><Zap size={18} /><span>Trillo</span></button>
-          <button disabled={!ready || fileSending || !!activeGroup} onclick={chooseFile}><Paperclip size={18} /><span>{fileSending ? 'Invio…' : 'Invia file'}</span></button>
+          <button disabled={!ready || fileSending} onclick={chooseFile}><Paperclip size={18} /><span>{fileSending ? 'Invio…' : 'Invia file'}</span></button>
         </div>
         <form class="composer" onsubmit={(event) => { event.preventDefault(); void sendMessage() }}>
-          <textarea
-            bind:value={messageText}
-            rows="2"
-            maxlength="4000"
-            placeholder={ready ? `Scrivi a ${activeGroup?.name || activeContact?.name}…` : activeGroup ? 'Nessun partecipante è disponibile.' : activeContact ? 'Il contatto non è disponibile.' : 'Scegli una conversazione per scrivere.'}
-            disabled={!ready}
+          <div
+            bind:this={messageEditor}
+            class="message-editor"
+            class:disabled={!ready}
+            contenteditable={ready}
+            role="textbox"
+            tabindex={ready ? 0 : -1}
+            aria-label="Messaggio"
+            aria-multiline="true"
+            aria-disabled={!ready}
+            data-placeholder={ready ? `Scrivi a ${activeGroup?.name || activeContact?.name}…` : activeGroup ? 'Nessun partecipante è disponibile.' : activeContact ? 'Il contatto non è disponibile.' : 'Scegli una conversazione per scrivere.'}
+            oninput={syncDraft}
+            onpaste={pasteDraft}
+            ondrop={(event) => event.preventDefault()}
             onkeydown={(event) => {
-              if (event.key === 'Enter' && !event.shiftKey) {
+              if (event.key === 'Enter' && !event.isComposing) {
                 event.preventDefault()
-                void sendMessage()
+                if (event.shiftKey) {
+                  insertAtDraftCaret('\n')
+                  syncDraft()
+                } else void sendMessage()
               }
             }}
-          ></textarea>
+          ></div>
           <button type="submit" class="send-button" disabled={!ready || !messageText.trim()}><Send size={17} /> Invia</button>
         </form>
         <small class="composer-hint">Invio per spedire · Maiusc+Invio per andare a capo</small>
       </footer>
-      {#if fileDropActive && ready && !activeGroup}
+      {#if fileDropActive && ready}
         <div class="file-drop-overlay"><Paperclip size={28} /><strong>Rilascia per inviare</strong><small>File e immagini, massimo 5 GB ciascuno</small></div>
       {/if}
     </section>

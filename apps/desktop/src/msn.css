@@ -525,7 +525,6 @@ button:disabled {
 }
 
 .search-field input::placeholder,
-.composer textarea::placeholder,
 .modal input::placeholder {
   color: var(--faint);
 }
@@ -1500,12 +1499,12 @@ button:disabled {
   padding-top: 8px;
 }
 
-.composer textarea {
+.message-editor {
   min-width: 0;
   min-height: 58px;
   max-height: 118px;
   flex: 1;
-  resize: vertical;
+  overflow-y: auto;
   padding: 8px 9px;
   border: 1px solid var(--line-strong);
   border-radius: 5px;
@@ -1515,16 +1514,41 @@ button:disabled {
   box-shadow: inset 0 1px 4px color-mix(in srgb, var(--text-strong) 7%, transparent);
   font-size: 11px;
   line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
-.composer textarea:focus {
+.message-editor:focus {
   border-color: var(--blue);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--blue) 15%, transparent);
 }
 
-.composer textarea:disabled {
+.message-editor.disabled {
   color: var(--faint);
   background: var(--surface-sunken);
+}
+
+.message-editor:empty::before {
+  color: var(--faint);
+  content: attr(data-placeholder);
+  pointer-events: none;
+}
+
+.draft-emoticon {
+  width: 1.35em;
+  height: 1.35em;
+  display: inline-grid;
+  place-items: center;
+  margin: 0 0.08em;
+  object-fit: contain;
+  vertical-align: -0.25em;
+  animation: draft-emoticon-in 140ms ease-out;
+}
+
+span.draft-emoticon { width: auto; font-size: 1.2em; }
+
+@keyframes draft-emoticon-in {
+  from { opacity: 0; transform: scale(0.72); }
 }
 
 .send-button {
@@ -1837,7 +1861,6 @@ button:disabled {
 }
 
 .group-member-picker label:last-child { border-bottom: 0; }
-.group-member-picker input { width: 16px; height: 16px; flex: 0 0 auto; accent-color: var(--blue); }
 .group-member-picker span,
 .group-member-picker strong,
 .group-member-picker small { display: block; }
@@ -1885,7 +1908,6 @@ button:disabled {
 
 .preview-settings strong { font-size: 0.84rem; }
 .preview-settings small { margin-top: 2px; color: var(--text-muted); font-size: 0.72rem; }
-.preview-settings input { width: 17px; height: 17px; accent-color: var(--blue); }
 
 .context-scrim {
   position: fixed;
@@ -2279,6 +2301,18 @@ button:disabled {
 .modal input:focus {
   border-color: var(--blue);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--blue) 16%, transparent);
+}
+
+.modal input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  min-height: 0;
+  flex: 0 0 15px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  box-shadow: none;
+  accent-color: var(--blue);
 }
 
 .modal details {

@@ -24,6 +24,7 @@ pub enum ChatEvent {
     Nudge(Nudge),
     EmoticonOffer(EmoticonOffer),
     AttachmentOffer(AttachmentManifest),
+    GroupAttachmentOffer(GroupAttachmentOffer),
     AttachmentChunk(AttachmentChunk),
     Presence(PresenceUpdate),
 }
@@ -42,6 +43,12 @@ pub struct GroupTextMessage {
     pub group_id: [u8; 16],
     pub message: TextMessage,
     pub timestamp_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupAttachmentOffer {
+    pub group_id: [u8; 16],
+    pub manifest: AttachmentManifest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
