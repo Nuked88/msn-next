@@ -2,6 +2,7 @@
   import { invoke, isTauri } from '@tauri-apps/api/core'
   import { listen, type UnlistenFn } from '@tauri-apps/api/event'
   import { getCurrentWebview } from '@tauri-apps/api/webview'
+  import { getCurrentWindow } from '@tauri-apps/api/window'
   import { open, save } from '@tauri-apps/plugin-dialog'
   import QRCode from 'qrcode'
   import { onMount, tick } from 'svelte'
@@ -14,6 +15,7 @@
     LockKeyhole,
     Menu,
     MessageCircleMore,
+    Minus,
     Monitor,
     Moon,
     Paperclip,
@@ -27,6 +29,7 @@
     ShieldCheck,
     Smile,
     Sparkles,
+    Square,
     Sun,
     Trash2,
     UserRoundPlus,
@@ -142,6 +145,16 @@
     { glyph: '❤️', shortcut: '<3', label: 'Cuore' },
     { glyph: '😎', shortcut: '8)', label: 'Forte' },
   ]
+
+  const appWindow = isTauri() ? getCurrentWindow() : null
+
+  function dragWindow(event: MouseEvent) {
+    if (event.button === 0 && !(event.target as HTMLElement).closest('button')) void appWindow?.startDragging()
+  }
+
+  function maximizeWindow(event: MouseEvent) {
+    if (!(event.target as HTMLElement).closest('button')) void appWindow?.toggleMaximize()
+  }
 
   const savedTheme = typeof localStorage === 'undefined' ? null : localStorage.getItem('msnnext-theme')
   let theme: Theme = savedTheme === 'light' || savedTheme === 'dark' || savedTheme === 'system'
@@ -1103,7 +1116,8 @@
 </script>
 
 <main class:details-open={detailsOpen} class:roster-open={rosterOpen} class="app-frame">
-  <header class="app-titlebar">
+  <!-- svelte-ignore a11y_no_static_element_interactions -- native window drag has keyboard-accessible controls beside it -->
+  <header class="app-titlebar" onmousedown={dragWindow} ondblclick={maximizeWindow}>
     <div class="wordmark" aria-label="msnnext">
       <span class="wordmark-people" aria-hidden="true"><i></i><i></i></span>
       <strong>msnnext</strong>
@@ -1125,6 +1139,11 @@
       <button class:online={running} class="power-button" aria-label={running ? 'Disconnetti' : 'Connetti'} title={running ? 'Disconnetti' : 'Connetti'} onclick={running ? stopNode : () => startNode(false)}>
         <Power size={16} />
       </button>
+      <div class="window-controls">
+        <button aria-label="Riduci a icona" title="Riduci a icona" onclick={() => void appWindow?.minimize()}><Minus size={15} /></button>
+        <button aria-label="Ingrandisci o ripristina" title="Ingrandisci o ripristina" onclick={() => void appWindow?.toggleMaximize()}><Square size={12} /></button>
+        <button class="window-close" aria-label="Chiudi" title="Chiudi" onclick={() => void appWindow?.close()}><X size={16} /></button>
+      </div>
     </div>
   </header>
 
