@@ -390,6 +390,21 @@ fn node_send_group_text(
 }
 
 #[tauri::command]
+fn node_send_group_file(
+    state: State<'_, NodeState>,
+    group_id: String,
+    path: String,
+) -> Result<(), String> {
+    send_command(
+        &state,
+        ClientCommand::SendGroupFile {
+            group_id,
+            path: PathBuf::from(path),
+        },
+    )
+}
+
+#[tauri::command]
 fn node_clear_group_conversation(
     state: State<'_, NodeState>,
     group_id: String,
@@ -608,6 +623,7 @@ pub fn run() {
             node_clear_conversation,
             node_create_chat_group,
             node_send_group_text,
+            node_send_group_file,
             node_clear_group_conversation,
             node_delete_chat_group,
             node_read_attachment,

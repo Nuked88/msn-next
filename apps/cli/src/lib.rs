@@ -4,7 +4,7 @@ mod contacts;
 mod crypto;
 mod history;
 
-use attachments::{build_manifest, read_chunk, Receiver};
+use attachments::{build_manifest, read_chunk, CompletedAttachment, Receiver};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chacha20poly1305::aead::rand_core::{OsRng, RngCore};
 use connectivity::{split_peer_address, FallbackPlanner, Recovery};
@@ -30,8 +30,9 @@ use libp2p::{
 };
 use msnnext_protocol::{
     resolve_emoticons, validate_text_message, validate_triggers, AttachmentManifest, ChatEvent,
-    Emoticon, EmoticonOffer, Envelope, GroupDefinition, GroupTextMessage, Mime, Nudge,
-    NudgeRateLimit, PresenceUpdate, ProtocolResponse, TextMessage, Trigger, PROTOCOL_VERSION,
+    Emoticon, EmoticonOffer, Envelope, GroupAttachmentOffer, GroupDefinition, GroupTextMessage,
+    Mime, Nudge, NudgeRateLimit, PresenceUpdate, ProtocolResponse, TextMessage, Trigger,
+    PROTOCOL_VERSION,
 };
 use serde::Serialize;
 use std::{
@@ -70,6 +71,7 @@ pub enum ClientCommand {
     ClearConversation { peer: PeerId },
     CreateChatGroup { name: String, members: Vec<PeerId> },
     SendGroupText { group_id: String, text: String },
+    SendGroupFile { group_id: String, path: PathBuf },
     ClearGroupConversation { group_id: String },
     DeleteChatGroup { group_id: String },
     ReadAttachment { id: String, mime: String },
@@ -94,6 +96,7 @@ impl ClientCommand {
             | Self::DeleteEmoticon { .. }
             | Self::CreateChatGroup { .. }
             | Self::SendGroupText { .. }
+            | Self::SendGroupFile { .. }
             | Self::ClearGroupConversation { .. }
             | Self::DeleteChatGroup { .. }
             | Self::ReadAttachment { .. }
@@ -169,9 +172,12 @@ pub struct ClientGroupMessage {
     pub group_id: String,
     pub sender_peer_id: String,
     pub direction: String,
+    pub kind: String,
     pub body: String,
     pub timestamp_ms: u64,
     pub emoticons: Vec<ClientEmoticonSpan>,
+    pub attachment_id: Option<String>,
+    pub attachment_mime: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -210,6 +216,12 @@ pub enum ClientEvent {
     },
     AttachmentReceived {
         peer_id: String,
+        id: String,
+        filename: String,
+        mime: String,
+    },
+    GroupAttachmentReceived {
+        group_id: String,
         id: String,
         filename: String,
         mime: String,
@@ -271,6 +283,7 @@ struct PendingOffer {
     path: PathBuf,
     manifest: AttachmentManifest,
     retries: u8,
+    group_id: Option<[u8; 16]>,
 }
 
 struct PendingTransfer {
@@ -291,6 +304,7 @@ struct Incoming<'a> {
     notifications: bool,
     peer_names: &'a mut HashMap<PeerId, String>,
     local_peer_id: PeerId,
+    incoming_attachments: &'a mut HashMap<(PeerId, [u8; 32]), HashSet<Option<String>>>,
 }
 
 fn build_swarm(
@@ -467,6 +481,7 @@ pub async fn run(
     let mut shared_emoticons = HashSet::<(PeerId, [u8; 32])>::new();
     let mut pending_emoticons = HashMap::<[u8; 32], EmoticonOffer>::new();
     let mut attachment_receiver = Receiver::new(args.downloads.clone(), attachment_key);
+    let mut incoming_attachments = HashMap::<(PeerId, [u8; 32]), HashSet<Option<String>>>::new();
     let mut peer_names = HashMap::<PeerId, String>::new();
     let mut nudge_counter = 0_u64;
     let mut stdin_open = true;
@@ -548,14 +563,31 @@ pub async fn run(
             .into_iter()
             .rev()
             .filter_map(|entry| {
-                let sender_peer_id = entry.kind.strip_prefix("group-text:")?.to_owned();
+                let (kind, sender_peer_id) = entry
+                    .kind
+                    .strip_prefix("group-text:")
+                    .map(|sender| ("text", sender.to_owned()))
+                    .or_else(|| {
+                        entry
+                            .kind
+                            .strip_prefix("group-file:")
+                            .map(|sender| ("file", sender.to_owned()))
+                    })?;
+                let attachment = (kind == "file")
+                    .then(|| decode_attachment(&entry.body))
+                    .flatten();
                 Some(ClientGroupMessage {
                     group_id: group.id.clone(),
                     sender_peer_id,
                     direction: entry.direction,
-                    body: entry.body,
+                    kind: kind.into(),
+                    body: attachment
+                        .as_ref()
+                        .map_or(entry.body, |item| item.2.clone()),
                     timestamp_ms: entry.timestamp_ms,
                     emoticons: Vec::new(),
+                    attachment_id: attachment.as_ref().map(|item| item.0.clone()),
+                    attachment_mime: attachment.map(|item| item.1),
                 })
             })
             .collect();
@@ -713,7 +745,7 @@ pub async fn run(
                         for peer in &peers {
                             record(&history, peer, "out", "file", &manifest.filename);
                             if let Some(request_id) = send_event(&mut swarm, &mut sessions, *peer, local_peer_id, &mut sent_numbers, ChatEvent::AttachmentOffer(manifest.clone())) {
-                                pending_offers.insert(request_id, PendingOffer { peer: *peer, path: path.clone(), manifest: manifest.clone(), retries: 0 });
+                                pending_offers.insert(request_id, PendingOffer { peer: *peer, path: path.clone(), manifest: manifest.clone(), retries: 0, group_id: None });
                             }
                         }
                     }
@@ -955,6 +987,7 @@ pub async fn run(
                                     path,
                                     manifest,
                                     retries: 0,
+                                    group_id: None,
                                 });
                             }
                         }
@@ -1160,10 +1193,80 @@ pub async fn run(
                         group_id,
                         sender_peer_id: local_peer_id.to_string(),
                         direction: "out".into(),
+                        kind: "text".into(),
                         body: text,
                         timestamp_ms,
                         emoticons: emoticons.iter().map(|span| ClientEmoticonSpan { start: span.start, end: span.end, asset_id: hex_asset_id(&span.asset_id) }).collect(),
+                        attachment_id: None,
+                        attachment_mime: None,
                     }});
+                }
+                Some(ClientCommand::SendGroupFile { group_id, path }) => {
+                    let parsed_id = match parse_group_id(&group_id) {
+                        Ok(id) => id,
+                        Err(message) => { let _ = events.send(ClientEvent::Error { message }); continue; }
+                    };
+                    let Some(group) = history.group_chat(&group_id)? else {
+                        let _ = events.send(ClientEvent::Error { message: "chat di gruppo non trovata".into() });
+                        continue;
+                    };
+                    if !group.members.contains(&local_peer_id.to_string()) {
+                        let _ = events.send(ClientEvent::Error { message: "non fai parte di questa chat".into() });
+                        continue;
+                    }
+                    let recipients = group.members.iter()
+                        .filter_map(|value| value.parse::<PeerId>().ok())
+                        .filter(|peer| *peer != local_peer_id && sessions.contains_key(peer))
+                        .collect::<Vec<_>>();
+                    if recipients.is_empty() {
+                        let _ = events.send(ClientEvent::Error { message: "nessun partecipante è online con una sessione protetta".into() });
+                        continue;
+                    }
+                    match build_manifest(&path) {
+                        Ok(manifest) => {
+                            let timestamp_ms = now_ms();
+                            history.record(
+                                &group_history_key(&group_id),
+                                "out",
+                                &format!("group-file:{local_peer_id}"),
+                                &encode_attachment(&manifest),
+                                timestamp_ms,
+                            )?;
+                            for recipient in recipients {
+                                if let Some(request_id) = send_event(
+                                    &mut swarm,
+                                    &mut sessions,
+                                    recipient,
+                                    local_peer_id,
+                                    &mut sent_numbers,
+                                    ChatEvent::GroupAttachmentOffer(GroupAttachmentOffer {
+                                        group_id: parsed_id,
+                                        manifest: manifest.clone(),
+                                    }),
+                                ) {
+                                    pending_offers.insert(request_id, PendingOffer {
+                                        peer: recipient,
+                                        path: path.clone(),
+                                        manifest: manifest.clone(),
+                                        retries: 0,
+                                        group_id: Some(parsed_id),
+                                    });
+                                }
+                            }
+                            let _ = events.send(ClientEvent::GroupMessage { message: ClientGroupMessage {
+                                group_id,
+                                sender_peer_id: local_peer_id.to_string(),
+                                direction: "out".into(),
+                                kind: "file".into(),
+                                body: manifest.filename.clone(),
+                                timestamp_ms,
+                                emoticons: Vec::new(),
+                                attachment_id: None,
+                                attachment_mime: Some(manifest.mime),
+                            }});
+                        }
+                        Err(error) => { let _ = events.send(ClientEvent::Error { message: error.to_string() }); }
+                    }
                 }
                 Some(ClientCommand::ClearGroupConversation { group_id }) => {
                     match parse_group_id(&group_id).and_then(|_| history.clear_conversation(&group_history_key(&group_id)).map_err(|error| error.to_string())) {
@@ -1324,6 +1427,7 @@ pub async fn run(
                                     notifications: args.notifications,
                                     peer_names: &mut peer_names,
                                     local_peer_id,
+                                    incoming_attachments: &mut incoming_attachments,
                                 }),
                                 true,
                             ),
@@ -1408,6 +1512,7 @@ pub async fn run(
                                         notifications: args.notifications,
                                         peer_names: &mut peer_names,
                                         local_peer_id,
+                                        incoming_attachments: &mut incoming_attachments,
                                     });
                                     if let Some(event) = client_event {
                                         let _ = events.send(event);
@@ -1477,13 +1582,20 @@ pub async fn run(
                     if let Some(mut pending) = pending_offers.remove(&request_id) {
                         if let Some(retries) = next_request_retry(pending.retries) {
                             pending.retries = retries;
+                            let event = pending.group_id.map_or_else(
+                                || ChatEvent::AttachmentOffer(pending.manifest.clone()),
+                                |group_id| ChatEvent::GroupAttachmentOffer(GroupAttachmentOffer {
+                                    group_id,
+                                    manifest: pending.manifest.clone(),
+                                }),
+                            );
                             if let Some(next_id) = send_event(
                                 &mut swarm,
                                 &mut sessions,
                                 pending.peer,
                                 local_peer_id,
                                 &mut sent_numbers,
-                                ChatEvent::AttachmentOffer(pending.manifest.clone()),
+                                event,
                             ) {
                                 pending_offers.insert(next_id, pending);
                             }
@@ -1782,7 +1894,9 @@ fn client_event_from_chat(
         }),
         ChatEvent::EmoticonOffer(_) => None,
         ChatEvent::AttachmentChunk(_) => None,
-        ChatEvent::GroupDefinition(_) | ChatEvent::GroupText(_) => None,
+        ChatEvent::GroupDefinition(_)
+        | ChatEvent::GroupText(_)
+        | ChatEvent::GroupAttachmentOffer(_) => None,
     }
 }
 
@@ -2238,6 +2352,7 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                     group_id: id,
                     sender_peer_id: peer.to_string(),
                     direction: "in".into(),
+                    kind: "text".into(),
                     body: group_message.message.text.clone(),
                     timestamp_ms: group_message.timestamp_ms,
                     emoticons: group_message
@@ -2250,6 +2365,8 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                             asset_id: hex_asset_id(&span.asset_id),
                         })
                         .collect(),
+                    attachment_id: None,
+                    attachment_mime: None,
                 },
             });
             notify(
@@ -2258,6 +2375,56 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                 &group_message.message.text,
             );
             ProtocolResponse::Ack
+        }
+        ChatEvent::GroupAttachmentOffer(offer) => {
+            let id = hex_group_id(&offer.group_id);
+            let group = match context.history.group_chat(&id) {
+                Ok(Some(group)) => group,
+                Ok(None) => return ProtocolResponse::Rejected("chat di gruppo sconosciuta".into()),
+                Err(error) => return ProtocolResponse::Rejected(error.to_string()),
+            };
+            if !group.members.contains(&peer.to_string())
+                || !group.members.contains(&context.local_peer_id.to_string())
+            {
+                return ProtocolResponse::Rejected("mittente non appartenente al gruppo".into());
+            }
+            match context.attachments.accept_offer(offer.manifest.clone()) {
+                Ok((missing, completed)) => {
+                    if let Err(error) = context.history.record(
+                        &group_history_key(&id),
+                        "in",
+                        &format!("group-file:{peer}"),
+                        &encode_attachment(&offer.manifest),
+                        now_ms(),
+                    ) {
+                        return ProtocolResponse::Rejected(error.to_string());
+                    }
+                    let _ = context.events.send(ClientEvent::GroupMessage {
+                        message: ClientGroupMessage {
+                            group_id: id.clone(),
+                            sender_peer_id: peer.to_string(),
+                            direction: "in".into(),
+                            kind: "file".into(),
+                            body: offer.manifest.filename.clone(),
+                            timestamp_ms: now_ms(),
+                            emoticons: Vec::new(),
+                            attachment_id: Some(hex_asset_id(&offer.manifest.attachment_id)),
+                            attachment_mime: Some(offer.manifest.mime.clone()),
+                        },
+                    });
+                    if let Some(completed) = completed {
+                        emit_attachment_received(context.events, peer, Some(id), &completed);
+                    } else {
+                        context
+                            .incoming_attachments
+                            .entry((peer, offer.manifest.attachment_id))
+                            .or_default()
+                            .insert(Some(id));
+                    }
+                    ProtocolResponse::MissingChunks(missing)
+                }
+                Err(error) => ProtocolResponse::Rejected(error.to_string()),
+            }
         }
         ChatEvent::Nudge(_) => match context
             .nudge_limits
@@ -2312,12 +2479,13 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                     if let Some(completed) = completed {
                         println!("{peer}: file già presente nell'archivio cifrato");
                         notify(context.notifications, "File ricevuto", &manifest.filename);
-                        let _ = context.events.send(ClientEvent::AttachmentReceived {
-                            peer_id: peer.to_string(),
-                            id: hex_asset_id(&completed.id),
-                            filename: completed.filename,
-                            mime: completed.mime,
-                        });
+                        emit_attachment_received(context.events, peer, None, &completed);
+                    } else {
+                        context
+                            .incoming_attachments
+                            .entry((peer, manifest.attachment_id))
+                            .or_default()
+                            .insert(None);
                     }
                     ProtocolResponse::MissingChunks(missing)
                 }
@@ -2328,12 +2496,13 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
             Ok(Some(completed)) => {
                 println!("{peer}: file ricevuto nell'archivio cifrato");
                 notify(context.notifications, "File ricevuto", &completed.filename);
-                let _ = context.events.send(ClientEvent::AttachmentReceived {
-                    peer_id: peer.to_string(),
-                    id: hex_asset_id(&completed.id),
-                    filename: completed.filename,
-                    mime: completed.mime,
-                });
+                let destinations = context
+                    .incoming_attachments
+                    .remove(&(peer, completed.id))
+                    .unwrap_or_else(|| HashSet::from([None]));
+                for group_id in destinations {
+                    emit_attachment_received(context.events, peer, group_id, &completed);
+                }
                 ProtocolResponse::Ack
             }
             Ok(None) => ProtocolResponse::Ack,
@@ -2352,6 +2521,30 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
             ProtocolResponse::Ack
         }
     }
+}
+
+fn emit_attachment_received(
+    events: &mpsc::UnboundedSender<ClientEvent>,
+    peer: PeerId,
+    group_id: Option<String>,
+    completed: &CompletedAttachment,
+) {
+    let id = hex_asset_id(&completed.id);
+    let event = match group_id {
+        Some(group_id) => ClientEvent::GroupAttachmentReceived {
+            group_id,
+            id,
+            filename: completed.filename.clone(),
+            mime: completed.mime.clone(),
+        },
+        None => ClientEvent::AttachmentReceived {
+            peer_id: peer.to_string(),
+            id,
+            filename: completed.filename.clone(),
+            mime: completed.mime.clone(),
+        },
+    };
+    let _ = events.send(event);
 }
 
 fn record(history: &History, peer: &PeerId, direction: &str, kind: &str, body: &str) {
@@ -3048,6 +3241,23 @@ mod tests {
             validate_group_definition(&group),
             Err("partecipanti del gruppo non validi")
         );
+    }
+
+    #[test]
+    fn group_file_is_not_shown_before_membership_validation() {
+        let peer = PeerId::from(Keypair::generate_ed25519().public());
+        let event = ChatEvent::GroupAttachmentOffer(GroupAttachmentOffer {
+            group_id: [1; 16],
+            manifest: AttachmentManifest {
+                attachment_id: *blake3::hash(&[]).as_bytes(),
+                filename: "foto.png".into(),
+                mime: "image/png".into(),
+                size: 0,
+                chunk_size: attachments::CHUNK_SIZE as u32,
+                chunks: Vec::new(),
+            },
+        });
+        assert!(client_event_from_chat(peer, &event, "in", true, None).is_none());
     }
 
     #[test]

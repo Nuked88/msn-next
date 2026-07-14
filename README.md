@@ -82,9 +82,9 @@ Il file originale inviato non viene copiato nell'archivio di msnnext: viene lett
 
 ### Chat di gruppo
 
-- la creazione, la cronologia locale e i messaggi testuali funzionano tramite invio separato a ogni partecipante online;
+- la creazione, la cronologia locale, i messaggi e gli allegati funzionano tramite invio separato a ogni partecipante online;
 - non esiste ancora consegna offline: chi non è collegato al momento non riceve il messaggio;
-- file, trilli e modifica successiva dei partecipanti non sono ancora disponibili nelle chat di gruppo.
+- trilli e modifica successiva dei partecipanti non sono ancora disponibili nelle chat di gruppo.
 
 ### Collegamento e presenza
 
@@ -150,7 +150,7 @@ npm run build
 npx tauri build
 ```
 
-La suite standard corrente passa con 51 test; un test con due socket reali è escluso dalla suite automatica perché il teardown libp2p può bloccare l'harness su Windows. Il suo scenario deve essere sostituito da un collaudo end-to-end desktop deterministico.
+La suite standard corrente passa con 52 test; un test con due socket reali è escluso dalla suite automatica perché il teardown libp2p può bloccare l'harness su Windows. Il suo scenario deve essere sostituito da un collaudo end-to-end desktop deterministico.
 
 Gli installer vengono generati in:
 
