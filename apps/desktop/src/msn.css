@@ -127,7 +127,7 @@ button:disabled {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 10px 0 15px;
+  padding: 0 0 0 15px;
   border-bottom: 1px solid var(--line-strong);
   color: var(--title-ink);
   background:
@@ -225,6 +225,7 @@ button:disabled {
 
 .titlebar-tools {
   gap: 9px;
+  align-self: stretch;
 }
 
 .theme-switcher {
@@ -297,6 +298,33 @@ button:disabled {
 .power-button.online {
   color: var(--title-ink);
   background: color-mix(in srgb, var(--surface-raised) 62%, transparent);
+}
+
+.window-controls {
+  align-self: stretch;
+  display: flex;
+  margin-left: 1px;
+  border-left: 1px solid color-mix(in srgb, var(--line-strong) 65%, transparent);
+}
+
+.window-controls button {
+  width: 42px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  color: var(--title-ink);
+  background: transparent;
+  cursor: default;
+}
+
+.window-controls button:hover {
+  background: color-mix(in srgb, var(--surface-raised) 48%, transparent);
+}
+
+.window-controls .window-close:hover {
+  color: #fff;
+  background: #c42b1c;
 }
 
 .workspace {
