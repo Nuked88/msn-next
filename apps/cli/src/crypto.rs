@@ -2,6 +2,8 @@ use aws_lc_rs::{
     agreement::{self, EphemeralPrivateKey, UnparsedPublicKey, X25519},
     kem::{Ciphertext, DecapsulationKey, EncapsulationKey, ML_KEM_768},
     rand::SystemRandom,
+    signature::{KeyPair, VerificationAlgorithm},
+    unstable::signature::{PqdsaKeyPair, ML_DSA_65, ML_DSA_65_SIGNING},
 };
 use chacha20poly1305::{
     aead::{rand_core::RngCore, Aead, OsRng, Payload},
@@ -15,6 +17,29 @@ use zeroize::{ZeroizeOnDrop, Zeroizing};
 const HYBRID_HANDSHAKE_VERSION: u16 = 1;
 const RATCHET_VERSION: u16 = 1;
 const MAX_SKIPPED_MESSAGE_KEYS: u64 = 64;
+
+pub(crate) struct MlDsaIdentity(PqdsaKeyPair);
+
+impl MlDsaIdentity {
+    pub(crate) fn from_seed(seed: &[u8; 32]) -> Result<Self, Box<dyn Error>> {
+        Ok(Self(PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, seed)?))
+    }
+
+    pub(crate) fn public_key(&self) -> &[u8] {
+        self.0.public_key().as_ref()
+    }
+
+    pub(crate) fn sign(&self, message: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+        let mut signature = vec![0; ML_DSA_65_SIGNING.signature_len()];
+        let length = self.0.sign(message, &mut signature)?;
+        signature.truncate(length);
+        Ok(signature)
+    }
+
+    pub(crate) fn verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
+        ML_DSA_65.verify_sig(public_key, message, signature).is_ok()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct HybridClientHello {
@@ -422,6 +447,22 @@ fn derive_session_key(
 mod tests {
     use super::*;
     use libp2p::{identity::Keypair, PeerId};
+
+    #[test]
+    fn ml_dsa_identity_signatures_reject_tampering() {
+        let identity = MlDsaIdentity::from_seed(&[9; 32]).unwrap();
+        let signature = identity.sign(b"contatto").unwrap();
+        assert!(MlDsaIdentity::verify(
+            identity.public_key(),
+            b"contatto",
+            &signature
+        ));
+        assert!(!MlDsaIdentity::verify(
+            identity.public_key(),
+            b"contatto alterato",
+            &signature
+        ));
+    }
 
     fn peers() -> (PeerId, PeerId) {
         (

@@ -352,7 +352,7 @@ fn completed(manifest: &AttachmentManifest) -> CompletedAttachment {
     }
 }
 
-fn validate_manifest(manifest: &AttachmentManifest) -> Result<(), Box<dyn Error>> {
+pub(crate) fn validate_manifest(manifest: &AttachmentManifest) -> Result<(), Box<dyn Error>> {
     if manifest.size > MAX_FILE_BYTES || manifest.chunk_size as usize != CHUNK_SIZE {
         return Err("manifest fuori dai limiti".into());
     }

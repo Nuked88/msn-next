@@ -11,7 +11,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use msnnext_core::{ClientCommand, ClientConfig, ClientEvent};
+use msnnext_core::{ClientCommand, ClientConfig, ClientEvent, GroupModeration};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::mpsc;
@@ -42,6 +42,8 @@ struct StoredProfile {
     preview_sent_images: bool,
     #[serde(default)]
     preview_received_images: bool,
+    #[serde(default = "enabled_by_default")]
+    nudge_sound: bool,
 }
 
 #[derive(Serialize)]
@@ -51,6 +53,14 @@ struct ProfileView {
     avatar_data_url: Option<String>,
     preview_sent_images: bool,
     preview_received_images: bool,
+    nudge_sound: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+struct StoredIdentity {
+    version: u8,
+    classic: Vec<u8>,
+    ml_dsa_seed: [u8; 32],
 }
 
 fn enabled_by_default() -> bool {
@@ -72,11 +82,71 @@ fn profile_view(data_dir: &Path, profile: StoredProfile) -> Result<ProfileView, 
         avatar_data_url,
         preview_sent_images: profile.preview_sent_images,
         preview_received_images: profile.preview_received_images,
+        nudge_sound: profile.nudge_sound,
     })
 }
 
 fn parse_peer(value: &str) -> Result<libp2p_identity::PeerId, String> {
     msnnext_core::parse_peer_id(value)
+}
+
+fn desktop_identity(data_dir: &Path) -> Result<StoredIdentity, String> {
+    let entry = keyring::Entry::new("app.msnnext.desktop", "identity-v1")
+        .map_err(|error| format!("keystore non disponibile: {error}"))?;
+    let legacy_path = data_dir.join("identity.key");
+    let identity = match entry.get_secret() {
+        Ok(bytes) => match serde_json::from_slice::<StoredIdentity>(&bytes) {
+            Ok(identity) if identity.version == 1 => identity,
+            _ => {
+                libp2p_identity::Keypair::from_protobuf_encoding(&bytes)
+                    .map_err(|error| format!("identità nel keystore non valida: {error}"))?;
+                let identity = StoredIdentity {
+                    version: 1,
+                    classic: bytes,
+                    ml_dsa_seed: msnnext_core::generate_secret(),
+                };
+                entry
+                    .set_secret(&serde_json::to_vec(&identity).map_err(|error| error.to_string())?)
+                    .map_err(|error| format!("aggiornamento del keystore fallito: {error}"))?;
+                identity
+            }
+        },
+        Err(keyring::Error::NoEntry) => {
+            let bytes = if legacy_path.exists() {
+                std::fs::read(&legacy_path).map_err(|error| error.to_string())?
+            } else {
+                libp2p_identity::Keypair::generate_ed25519()
+                    .to_protobuf_encoding()
+                    .map_err(|error| error.to_string())?
+            };
+            libp2p_identity::Keypair::from_protobuf_encoding(&bytes)
+                .map_err(|error| format!("identità locale non valida: {error}"))?;
+            let identity = StoredIdentity {
+                version: 1,
+                classic: bytes,
+                ml_dsa_seed: msnnext_core::generate_secret(),
+            };
+            let encoded = serde_json::to_vec(&identity).map_err(|error| error.to_string())?;
+            entry
+                .set_secret(&encoded)
+                .map_err(|error| format!("salvataggio nel keystore fallito: {error}"))?;
+            if entry.get_secret().map_err(|error| error.to_string())? != encoded {
+                return Err("verifica del keystore fallita".into());
+            }
+            identity
+        }
+        Err(error) => return Err(format!("lettura del keystore fallita: {error}")),
+    };
+    libp2p_identity::Keypair::from_protobuf_encoding(&identity.classic)
+        .map_err(|error| format!("identità nel keystore non valida: {error}"))?;
+    if legacy_path.exists() {
+        let legacy = std::fs::read(&legacy_path).map_err(|error| error.to_string())?;
+        if legacy != identity.classic {
+            return Err("l'identità nel keystore non coincide con identity.key".into());
+        }
+        std::fs::remove_file(legacy_path).map_err(|error| error.to_string())?;
+    }
+    Ok(identity)
 }
 
 fn worker_is_current(current_generation: Option<u64>, worker_generation: u64) -> bool {
@@ -152,7 +222,9 @@ fn node_start(
         .app_data_dir()
         .map_err(|error| error.to_string())?;
     std::fs::create_dir_all(&data_dir).map_err(|error| error.to_string())?;
+    let identity = desktop_identity(&data_dir)?;
     let client_config = ClientConfig::desktop(config.name, data_dir, config.connect)
+        .and_then(|config| config.with_identity_bytes(identity.classic, identity.ml_dsa_seed))
         .map_err(|error| error.to_string())?;
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -292,6 +364,21 @@ fn node_send_file(
 }
 
 #[tauri::command]
+fn node_cancel_file_transfers(state: State<'_, NodeState>) -> Result<(), String> {
+    send_command(&state, ClientCommand::CancelFileTransfers)
+}
+
+#[tauri::command]
+fn node_accept_attachment(state: State<'_, NodeState>, offer_id: u64) -> Result<(), String> {
+    send_command(&state, ClientCommand::AcceptAttachment { offer_id })
+}
+
+#[tauri::command]
+fn node_reject_attachment(state: State<'_, NodeState>, offer_id: u64) -> Result<(), String> {
+    send_command(&state, ClientCommand::RejectAttachment { offer_id })
+}
+
+#[tauri::command]
 fn node_create_emoticon(
     state: State<'_, NodeState>,
     path: String,
@@ -375,6 +462,36 @@ fn node_create_chat_group(
         .map(|member| parse_peer(member))
         .collect::<Result<Vec<_>, _>>()?;
     send_command(&state, ClientCommand::CreateChatGroup { name, members })
+}
+
+#[tauri::command]
+fn node_moderate_group(
+    state: State<'_, NodeState>,
+    group_id: String,
+    peer_id: String,
+    action: String,
+    duration_ms: Option<u64>,
+) -> Result<(), String> {
+    let action = match action.as_str() {
+        "admin" => GroupModeration::SetAdmin(true),
+        "member" => GroupModeration::SetAdmin(false),
+        "silence" => GroupModeration::SetSilenced(true),
+        "unsilence" => GroupModeration::SetSilenced(false),
+        "tempBan" => GroupModeration::Ban(Some(
+            duration_ms.ok_or("scegli la durata del ban temporaneo")?,
+        )),
+        "permaBan" => GroupModeration::Ban(None),
+        "unban" => GroupModeration::Unban,
+        _ => return Err("azione di moderazione non valida".into()),
+    };
+    send_command(
+        &state,
+        ClientCommand::ModerateGroup {
+            group_id,
+            peer: parse_peer(&peer_id)?,
+            action,
+        },
+    )
 }
 
 #[tauri::command]
@@ -490,6 +607,7 @@ fn profile_load(app: AppHandle) -> Result<Option<ProfileView>, String> {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri espone questi campi come argomenti nominati alla WebView.
 fn profile_save(
     app: AppHandle,
     state: State<'_, NodeState>,
@@ -498,6 +616,7 @@ fn profile_save(
     clear_avatar: bool,
     preview_sent_images: Option<bool>,
     preview_received_images: Option<bool>,
+    nudge_sound: Option<bool>,
 ) -> Result<ProfileView, String> {
     let name = name.trim();
     if name.is_empty() || name.len() > 64 {
@@ -522,6 +641,9 @@ fn profile_save(
                 .map(|profile| profile.preview_received_images)
         })
         .unwrap_or(false);
+    let nudge_sound = nudge_sound
+        .or_else(|| previous.as_ref().map(|profile| profile.nudge_sound))
+        .unwrap_or(true);
     let avatar_file = if clear_avatar {
         if let Some(file) = previous
             .as_ref()
@@ -546,6 +668,7 @@ fn profile_save(
         avatar_file,
         preview_sent_images: sent_previews,
         preview_received_images: received_previews,
+        nudge_sound,
     };
     std::fs::write(
         &profile_path,
@@ -614,6 +737,9 @@ pub fn run() {
             node_send_text,
             node_send_nudge,
             node_send_file,
+            node_cancel_file_transfers,
+            node_accept_attachment,
+            node_reject_attachment,
             node_create_emoticon,
             node_save_emoticon,
             node_update_emoticon,
@@ -622,6 +748,7 @@ pub fn run() {
             node_delete_contact,
             node_clear_conversation,
             node_create_chat_group,
+            node_moderate_group,
             node_send_group_text,
             node_send_group_file,
             node_clear_group_conversation,

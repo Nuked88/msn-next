@@ -1516,6 +1516,27 @@ button:disabled {
   background: var(--yellow-soft);
 }
 
+.transfer-progress {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(100px, 2fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 0 14px 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.transfer-progress span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transfer-progress progress {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
 .chat-toolbar button:disabled {
   opacity: 0.38;
 }
@@ -1778,7 +1799,7 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
 }
 
 .group-management ul {
-  max-height: 145px;
+  max-height: 260px;
   margin: 0 0 3px;
   padding: 0;
   overflow-y: auto;
@@ -1786,10 +1807,68 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
 }
 
 .group-management li {
-  padding: 6px 2px;
+  padding: 8px 2px;
   border-bottom: 1px solid var(--line);
   color: var(--text);
   font-size: 10px;
+}
+
+.group-member-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.group-member-copy {
+  min-width: 0;
+  flex: 1;
+}
+
+.group-member-copy > strong {
+  display: block;
+  overflow: hidden;
+  color: var(--text-strong);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.group-member-copy small {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-top: 3px;
+}
+
+.group-member-copy b,
+.group-member-copy i {
+  padding: 2px 4px;
+  border-radius: 3px;
+  color: var(--blue-strong);
+  background: var(--blue-soft);
+  font-size: 7px;
+  font-style: normal;
+  font-weight: 700;
+}
+
+.group-member-copy i {
+  color: #986400;
+  background: var(--yellow-soft);
+}
+
+.group-member-copy .ban-status {
+  color: #b42318;
+  background: color-mix(in srgb, #b42318 10%, var(--surface));
+}
+
+.group-member-row select {
+  width: 92px;
+  height: 28px;
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--text);
+  background: var(--surface);
+  font-size: 8px;
 }
 
 .group-management button {
@@ -2016,7 +2095,8 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
   background: rgba(4, 14, 28, 0.88);
 }
 
-.image-viewer > img {
+.image-viewer > img,
+.image-viewer > video {
   max-width: 92vw;
   max-height: 88vh;
   object-fit: contain;
@@ -2221,7 +2301,7 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
 }
 
 .modal-body,
-.connect-modal {
+.modal:not(.setup-modal) {
   padding: 24px 27px 25px;
 }
 
