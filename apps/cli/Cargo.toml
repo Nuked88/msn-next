@@ -21,5 +21,5 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread"] }
 qrcode = { version = "0.14.1", default-features = false }
-aws-lc-rs = { version = "1.17.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+aws-lc-rs = { version = "=1.17.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm", "unstable"] }
 zeroize = { version = "1.9.0", features = ["zeroize_derive"] }

@@ -42,6 +42,9 @@ Messenger desktop P2P ispirato a MSN Messenger. L'obiettivo è mantenere testo, 
 - anteprime immagini inviate e ricevute configurabili dal profilo;
 - limiti e validazione per emoticon PNG, JPEG, GIF e WebP;
 - trilli cifrati e sottoposti a rate limit.
+- identità desktop nel keystore del sistema operativo, con migrazione automatica del precedente `identity.key`;
+- link contatto v2 firmati Ed25519 e ML-DSA-65; il QR usa una scheda v3 compatta firmata Ed25519 perché una firma ML-DSA-65 non entra in un singolo QR, mantenendo la lettura delle schede v1;
+- CSP restrittiva per la WebView e fingerprint mostrato nella GUI.
 
 ## Cosa funziona oggi
 
@@ -63,7 +66,7 @@ La stabilità della reconnessione è stata migliorata e provata manualmente con 
 Il flusso è presente nel core e nella GUI, con creazione, salvataggio, rinomina della scorciatoia ed eliminazione:
 
 - invio, anteprima, salvataggio sul destinatario e riutilizzo tramite scorciatoia devono ancora essere collaudati end-to-end tra due applicazioni installate;
-- gli span delle emoticon non vengono conservati nella cronologia, quindi dopo il riavvio il messaggio può tornare a mostrare solo il trigger testuale;
+- gli span delle emoticon vengono conservati nella cronologia cifrata e ripristinati dopo il riavvio;
 - i conflitti tra scorciatoie vengono rifiutati, ma la GUI non propone ancora automaticamente una scorciatoia alternativa.
 
 Il risultato richiesto da `GROUND.md` resta: scegliere un'immagine o GIF, assegnare una combinazione, vederla nel messaggio del destinatario e permettergli di salvarla in pochi secondi.
@@ -73,16 +76,17 @@ Il risultato richiesto da `GROUND.md` resta: scegliere un'immagine o GIF, assegn
 Il protocollo Rust a chunk, il drag-and-drop e l'archivio cifrato sono integrati; l'esperienza resta incompleta:
 
 - manca una verifica end-to-end affidabile tra due applicazioni desktop;
-- le immagini hanno anteprima inline e visualizzazione interna; i video non hanno ancora un player;
-- non ci sono richiesta di accettazione o rifiuto, avanzamento, velocità, annullamento e ritentativo visibili;
-- non è ancora disponibile una barra di avanzamento per i singoli chunk;
+- immagini e video fino al limite di anteprima vengono visualizzati internamente;
+- ogni file ricevuto richiede accettazione esplicita e le offerte pendenti sono limitate;
+- l'invio mostra l'avanzamento per chunk e può essere annullato; restano velocità e annullamento di una ricezione già accettata;
 - i file non visualizzabili vengono esportati esplicitamente dall'utente; non sono aperti automaticamente in chiaro.
 
-Il file originale inviato non viene copiato nell'archivio di msnnext: viene letto a chunk dal percorso scelto, verificato con BLAKE3 e spedito sul canale cifrato. Sul destinatario i chunk restano cifrati nella directory dati dell'app e vengono decifrati solo in memoria per l'anteprima oppure in streaming verso un percorso scelto durante l'esportazione; non viene usata la cartella temporanea. La chiave dell'archivio deriva però dall'identità locale, che oggi è conservata sullo stesso dispositivo: protegge i file dalla lettura casuale, ma non ancora da un attaccante che copi l'intera directory dati. Per quest'ultimo caso serve il key store del sistema operativo.
+Il file originale inviato non viene copiato nell'archivio di msnnext: viene letto a chunk dal percorso scelto, verificato con BLAKE3 e spedito sul canale cifrato. Sul destinatario i chunk restano cifrati nella directory dati dell'app e vengono decifrati solo in memoria per l'anteprima oppure in streaming verso un percorso scelto durante l'esportazione; non viene usata la cartella temporanea. La chiave dell'archivio deriva dall'identità locale, ora custodita nel keystore del sistema operativo sulla versione desktop.
 
 ### Chat di gruppo
 
 - la creazione, la cronologia locale, i messaggi e gli allegati funzionano tramite invio separato a ogni partecipante online;
+- proprietario, amministratori e membri hanno una gerarchia persistente; proprietario e amministratori possono applicare silence, ban temporanei e ban permanenti;
 - non esiste ancora consegna offline: chi non è collegato al momento non riceve il messaggio;
 - trilli e modifica successiva dei partecipanti non sono ancora disponibili nelle chat di gruppo.
 
@@ -96,23 +100,20 @@ Il file originale inviato non viene copiato nell'archivio di msnnext: viene lett
 
 ### Trilli e UX
 
-- manca il suono configurabile del trillo;
-- l'animazione attuale muove il contenuto della webview, non ancora la finestra nativa come MSN;
+- il trillo sposta la finestra nativa, con fallback sulla WebView, e dispone di un suono disattivabile;
 - mancano impostazioni, accessibilità e controllo completo delle notifiche.
 
 ### Sicurezza ancora da completare
 
-- firme identitarie ibride Ed25519 + ML-DSA;
-- verifica utente tramite fingerprint o QR della sessione;
-- salvataggio della chiave del database nel key store del sistema operativo;
-- Content Security Policy più restrittiva per la webview;
+- firma ML-DSA del transcript dell'handshake applicativo, oltre alle schede contatto v2 già firmate in modo ibrido;
+- memorizzazione esplicita dell'esito del confronto fingerprint/QR;
 - audit crittografico e di sicurezza indipendente;
 - protocollo di migrazione/versionamento delle primitive crittografiche.
 
 ## Prossime priorità
 
-1. Riprodurre e correggere il flusso completo delle emoticon personalizzate tra due GUI.
-2. Completare immagini, video e file con stato, avanzamento, accettazione, annullamento e anteprima.
+1. Collaudare il flusso completo delle emoticon personalizzate tra due GUI installate.
+2. Aggiungere velocità e annullamento delle ricezioni già accettate.
 3. Eseguire test prolungati di collegamento, disconnessione e reconnessione con due applicazioni installate.
 4. Completare trillo nativo, suono, presenza, avatar e gestione contatti.
 5. Collaudare bootstrap, relay e hole punching su reti reali.
@@ -150,7 +151,7 @@ npm run build
 npx tauri build
 ```
 
-La suite standard corrente passa con 52 test; un test con due socket reali è escluso dalla suite automatica perché il teardown libp2p può bloccare l'harness su Windows. Il suo scenario deve essere sostituito da un collaudo end-to-end desktop deterministico.
+La suite standard corrente passa con 58 test; un test con due socket reali è escluso dalla suite automatica perché il teardown libp2p può bloccare l'harness su Windows. Il suo scenario deve essere sostituito da un collaudo end-to-end desktop deterministico.
 
 Gli installer vengono generati in:
 

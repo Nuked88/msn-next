@@ -4,7 +4,7 @@ mod contacts;
 mod crypto;
 mod history;
 
-use attachments::{build_manifest, read_chunk, CompletedAttachment, Receiver};
+use attachments::{build_manifest, read_chunk, validate_manifest, CompletedAttachment, Receiver};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chacha20poly1305::aead::rand_core::{OsRng, RngCore};
 use connectivity::{split_peer_address, FallbackPlanner, Recovery};
@@ -30,9 +30,9 @@ use libp2p::{
 };
 use msnnext_protocol::{
     resolve_emoticons, validate_text_message, validate_triggers, AttachmentManifest, ChatEvent,
-    Emoticon, EmoticonOffer, Envelope, GroupAttachmentOffer, GroupDefinition, GroupTextMessage,
-    Mime, Nudge, NudgeRateLimit, PresenceUpdate, ProtocolResponse, TextMessage, Trigger,
-    PROTOCOL_VERSION,
+    Emoticon, EmoticonOffer, Envelope, GroupAttachmentOffer, GroupBan, GroupDefinition,
+    GroupTextMessage, Mime, Nudge, NudgeRateLimit, PresenceUpdate, ProtocolResponse, TextMessage,
+    Trigger, PROTOCOL_VERSION,
 };
 use serde::Serialize;
 use std::{
@@ -55,29 +55,93 @@ const MAX_EMOTICON_BYTES: usize = 350_000;
 const MAX_EMOTICON_SIDE: usize = 512;
 const MAX_REQUEST_RETRIES: u8 = 2;
 const CHAT_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+const TEXT_HISTORY_PREFIX: &str = "msnnext-text-v1:";
+const MAX_PENDING_INBOUND_OFFERS: usize = 8;
+const ATTACHMENT_DECISION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug)]
 pub enum ClientCommand {
-    SendText { peer: PeerId, text: String },
-    SendNudge { peer: PeerId },
-    SendFile { peer: PeerId, path: PathBuf },
-    CreateEmoticon { path: PathBuf, trigger: String },
-    SaveEmoticon { asset_id: String, trigger: String },
-    UpdateEmoticon { asset_id: String, trigger: String },
-    DeleteEmoticon { asset_id: String },
-    ImportContactLink { link: String },
-    RenameContact { peer: PeerId, name: String },
-    DeleteContact { peer: PeerId },
-    ClearConversation { peer: PeerId },
-    CreateChatGroup { name: String, members: Vec<PeerId> },
-    SendGroupText { group_id: String, text: String },
-    SendGroupFile { group_id: String, path: PathBuf },
-    ClearGroupConversation { group_id: String },
-    DeleteChatGroup { group_id: String },
-    ReadAttachment { id: String, mime: String },
-    ExportAttachment { id: String, path: PathBuf },
+    SendText {
+        peer: PeerId,
+        text: String,
+    },
+    SendNudge {
+        peer: PeerId,
+    },
+    SendFile {
+        peer: PeerId,
+        path: PathBuf,
+    },
+    CreateEmoticon {
+        path: PathBuf,
+        trigger: String,
+    },
+    SaveEmoticon {
+        asset_id: String,
+        trigger: String,
+    },
+    UpdateEmoticon {
+        asset_id: String,
+        trigger: String,
+    },
+    DeleteEmoticon {
+        asset_id: String,
+    },
+    ImportContactLink {
+        link: String,
+    },
+    RenameContact {
+        peer: PeerId,
+        name: String,
+    },
+    DeleteContact {
+        peer: PeerId,
+    },
+    ClearConversation {
+        peer: PeerId,
+    },
+    CreateChatGroup {
+        name: String,
+        members: Vec<PeerId>,
+    },
+    ModerateGroup {
+        group_id: String,
+        peer: PeerId,
+        action: GroupModeration,
+    },
+    SendGroupText {
+        group_id: String,
+        text: String,
+    },
+    SendGroupFile {
+        group_id: String,
+        path: PathBuf,
+    },
+    ClearGroupConversation {
+        group_id: String,
+    },
+    DeleteChatGroup {
+        group_id: String,
+    },
+    ReadAttachment {
+        id: String,
+        mime: String,
+    },
+    ExportAttachment {
+        id: String,
+        path: PathBuf,
+    },
+    CancelFileTransfers,
+    AcceptAttachment {
+        offer_id: u64,
+    },
+    RejectAttachment {
+        offer_id: u64,
+    },
     RequestContactLink,
-    UpdateDisplayName { name: String },
+    UpdateDisplayName {
+        name: String,
+    },
     Shutdown,
 }
 
@@ -95,12 +159,16 @@ impl ClientCommand {
             | Self::UpdateEmoticon { .. }
             | Self::DeleteEmoticon { .. }
             | Self::CreateChatGroup { .. }
+            | Self::ModerateGroup { .. }
             | Self::SendGroupText { .. }
             | Self::SendGroupFile { .. }
             | Self::ClearGroupConversation { .. }
             | Self::DeleteChatGroup { .. }
             | Self::ReadAttachment { .. }
             | Self::ExportAttachment { .. }
+            | Self::CancelFileTransfers
+            | Self::AcceptAttachment { .. }
+            | Self::RejectAttachment { .. }
             | Self::ImportContactLink { .. }
             | Self::RequestContactLink
             | Self::UpdateDisplayName { .. }
@@ -109,10 +177,24 @@ impl ClientCommand {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum GroupModeration {
+    SetAdmin(bool),
+    SetSilenced(bool),
+    Ban(Option<u64>),
+    Unban,
+}
+
 pub fn parse_peer_id(value: &str) -> Result<PeerId, String> {
     value
         .parse()
         .map_err(|error| format!("peer id non valido: {error}"))
+}
+
+pub fn generate_secret() -> [u8; 32] {
+    let mut secret = [0; 32];
+    OsRng.fill_bytes(&mut secret);
+    secret
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -122,6 +204,7 @@ pub struct ClientContact {
     pub name: String,
     pub online: bool,
     pub secure: bool,
+    pub fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -164,6 +247,16 @@ pub struct ClientGroupChat {
     pub name: String,
     pub owner_peer_id: String,
     pub members: Vec<String>,
+    pub admins: Vec<String>,
+    pub silenced: Vec<String>,
+    pub bans: Vec<ClientGroupBan>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientGroupBan {
+    pub peer_id: String,
+    pub expires_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -190,6 +283,7 @@ pub enum ClientEvent {
     Started {
         peer_id: String,
         display_name: String,
+        fingerprint: String,
     },
     ContactUpdated {
         contact: ClientContact,
@@ -213,6 +307,7 @@ pub enum ClientEvent {
     },
     ContactLink {
         link: String,
+        qr_link: String,
     },
     AttachmentReceived {
         peer_id: String,
@@ -229,6 +324,20 @@ pub enum ClientEvent {
     AttachmentSent {
         peer_id: String,
         filename: String,
+    },
+    AttachmentProgress {
+        filename: String,
+        completed_chunks: usize,
+        total_chunks: usize,
+    },
+    AttachmentTransfersCancelled,
+    IncomingAttachmentOffered {
+        offer_id: u64,
+        peer_id: String,
+        filename: String,
+        mime: String,
+        size: u64,
+        group_id: Option<String>,
     },
     ContactRemoved {
         peer_id: String,
@@ -293,6 +402,15 @@ struct PendingTransfer {
     remaining: VecDeque<u32>,
     current: u32,
     retries: u8,
+    completed: usize,
+    total: usize,
+}
+
+struct PendingInboundOffer {
+    peer: PeerId,
+    request_id: request_response::InboundRequestId,
+    event: ChatEvent,
+    channel: request_response::ResponseChannel<ProtocolResponse>,
 }
 
 struct Incoming<'a> {
@@ -342,7 +460,8 @@ fn build_swarm(
                         StreamProtocol::new("/msnnext/chat/2"),
                         ProtocolSupport::Full,
                     )],
-                    request_response::Config::default(),
+                    request_response::Config::default()
+                        .with_request_timeout(ATTACHMENT_DECISION_TIMEOUT),
                 ),
                 handshake: request_response::cbor::Behaviour::new(
                     [(
@@ -384,8 +503,16 @@ pub async fn run(
     mut commands: mpsc::UnboundedReceiver<ClientCommand>,
     events: mpsc::UnboundedSender<ClientEvent>,
 ) -> Result<(), Box<dyn Error>> {
-    let identity = load_or_create_identity(&args.identity)?;
-    let public_key = identity.public();
+    let identity = match args.identity_bytes {
+        Some(bytes) => Keypair::from_protobuf_encoding(&bytes)?,
+        None => load_or_create_identity(&args.identity)?,
+    };
+    let ml_dsa_seed = match args.ml_dsa_seed {
+        Some(seed) => seed,
+        None => load_or_create_secret(&args.identity.with_extension("mldsa.key"))?,
+    };
+    let ml_dsa_identity = crypto::MlDsaIdentity::from_seed(&ml_dsa_seed)?;
+    let contact_identity = identity.clone();
     let identity_bytes = identity.to_protobuf_encoding()?;
     let history_key = blake3::derive_key("msnnext local history v1", &identity_bytes);
     let attachment_key = blake3::derive_key("msnnext attachment vault v1", &identity_bytes);
@@ -439,6 +566,7 @@ pub async fn run(
     let _ = events.send(ClientEvent::Started {
         peer_id: local_peer_id.to_string(),
         display_name: display_name.clone(),
+        fingerprint: peer_fingerprint(local_peer_id),
     });
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -482,6 +610,8 @@ pub async fn run(
     let mut pending_emoticons = HashMap::<[u8; 32], EmoticonOffer>::new();
     let mut attachment_receiver = Receiver::new(args.downloads.clone(), attachment_key);
     let mut incoming_attachments = HashMap::<(PeerId, [u8; 32]), HashSet<Option<String>>>::new();
+    let mut pending_inbound_offers = HashMap::<u64, PendingInboundOffer>::new();
+    let mut inbound_offer_counter = 0_u64;
     let mut peer_names = HashMap::<PeerId, String>::new();
     let mut nudge_counter = 0_u64;
     let mut stdin_open = true;
@@ -515,6 +645,7 @@ pub async fn run(
                 name,
                 online: false,
                 secure: false,
+                fingerprint: peer_fingerprint(peer_id),
             },
         });
         let messages = history
@@ -525,15 +656,21 @@ pub async fn run(
                 let attachment = (entry.kind == "file")
                     .then(|| decode_attachment(&entry.body))
                     .flatten();
+                let text = (entry.kind == "text").then(|| decode_text_history(&entry.body));
                 ClientMessage {
                     peer_id: entry.peer,
                     direction: entry.direction,
                     kind: entry.kind,
-                    body: attachment
-                        .as_ref()
-                        .map_or(entry.body, |item| item.2.clone()),
+                    body: text.as_ref().map_or_else(
+                        || {
+                            attachment
+                                .as_ref()
+                                .map_or(entry.body, |item| item.2.clone())
+                        },
+                        |message| message.text.clone(),
+                    ),
                     timestamp_ms: entry.timestamp_ms,
-                    emoticons: Vec::new(),
+                    emoticons: text.as_ref().map(client_emoticon_spans).unwrap_or_default(),
                     attachment_id: attachment.as_ref().map(|item| item.0.clone()),
                     attachment_mime: attachment.map(|item| item.1),
                 }
@@ -576,16 +713,22 @@ pub async fn run(
                 let attachment = (kind == "file")
                     .then(|| decode_attachment(&entry.body))
                     .flatten();
+                let text = (kind == "text").then(|| decode_text_history(&entry.body));
                 Some(ClientGroupMessage {
                     group_id: group.id.clone(),
                     sender_peer_id,
                     direction: entry.direction,
                     kind: kind.into(),
-                    body: attachment
-                        .as_ref()
-                        .map_or(entry.body, |item| item.2.clone()),
+                    body: text.as_ref().map_or_else(
+                        || {
+                            attachment
+                                .as_ref()
+                                .map_or(entry.body, |item| item.2.clone())
+                        },
+                        |message| message.text.clone(),
+                    ),
                     timestamp_ms: entry.timestamp_ms,
-                    emoticons: Vec::new(),
+                    emoticons: text.as_ref().map(client_emoticon_spans).unwrap_or_default(),
                     attachment_id: attachment.as_ref().map(|item| item.0.clone()),
                     attachment_mime: attachment.map(|item| item.1),
                 })
@@ -647,7 +790,8 @@ pub async fn run(
                         path,
                         &display_name,
                         local_peer_id,
-                        &public_key,
+                        &contact_identity,
+                        &ml_dsa_identity,
                         contact_addresses(&swarm).into_iter(),
                     ) {
                         Ok(()) => println!("scheda contatto salvata in {}", path.display()),
@@ -655,14 +799,15 @@ pub async fn run(
                     }
                 },
                 Some(line) if line == "contact qr" => {
-                    let result = contacts::link(
+                    let result = contacts::share_links(
                         &display_name,
                         local_peer_id,
-                        &public_key,
-                        contact_addresses(&swarm).into_iter(),
+                        &contact_identity,
+                        &ml_dsa_identity,
+                        contact_addresses(&swarm),
                     )
-                    .and_then(|link| {
-                        let qr = contacts::render_qr(&link)?;
+                    .and_then(|(link, qr_link)| {
+                        let qr = contacts::render_qr(&qr_link)?;
                         Ok((link, qr))
                     });
                     match result {
@@ -725,8 +870,9 @@ pub async fn run(
                     let text = line[5..].to_owned();
                     let emoticons = resolve_emoticons(&text, &triggers)
                         .map_err(|error| format!("trigger emoticon non valido: {error:?}"))?;
-                    for peer in &peers { record(&history, peer, "out", "text", &text); }
-                    let event = ChatEvent::Text(TextMessage { text, emoticons });
+                    let message = TextMessage { text, emoticons };
+                    for peer in &peers { record_text(&history, peer, "out", &message); }
+                    let event = ChatEvent::Text(message);
                     broadcast(&mut swarm, &mut sessions, &peers, local_peer_id, &mut sent_numbers, event);
                 }
                 Some(line) if line.starts_with("emote ") => match parse_emote_command(&line, &args.emotes, &mut triggers) {
@@ -760,15 +906,17 @@ pub async fn run(
                     contact_link_requested = true;
                     let addresses = contact_addresses(&swarm);
                     if !addresses.is_empty() {
-                        match contacts::link(
+                        let links = contacts::share_links(
                             &display_name,
                             local_peer_id,
-                            &public_key,
-                            addresses.into_iter(),
-                        ) {
-                            Ok(link) => {
+                            &contact_identity,
+                            &ml_dsa_identity,
+                            addresses,
+                        );
+                        match links {
+                            Ok((link, qr_link)) => {
                                 contact_link_requested = false;
-                                let _ = events.send(ClientEvent::ContactLink { link });
+                                let _ = events.send(ClientEvent::ContactLink { link, qr_link });
                             }
                             Err(error) => {
                                 let _ = events.send(ClientEvent::Error { message: error.to_string() });
@@ -811,6 +959,7 @@ pub async fn run(
                                     name,
                                     online: false,
                                     secure: false,
+                                    fingerprint: peer_fingerprint(peer_id),
                                 },
                             });
                             connect_contact(
@@ -870,18 +1019,12 @@ pub async fn run(
                             }
                         }
                     }
-                    let client_emoticons = emoticons
-                        .iter()
-                        .map(|span| ClientEmoticonSpan {
-                            start: span.start,
-                            end: span.end,
-                            asset_id: hex_asset_id(&span.asset_id),
-                        })
-                        .collect();
-                    let event = ChatEvent::Text(TextMessage {
+                    let message = TextMessage {
                         text: text.clone(),
                         emoticons,
-                    });
+                    };
+                    let client_emoticons = client_emoticon_spans(&message);
+                    let event = ChatEvent::Text(message.clone());
                     if send_event(
                         &mut swarm,
                         &mut sessions,
@@ -891,7 +1034,7 @@ pub async fn run(
                         event,
                     ).is_some() {
                         let timestamp_ms = now_ms();
-                        record(&history, &peer, "out", "text", &text);
+                        record_text(&history, &peer, "out", &message);
                         let _ = events.send(ClientEvent::Message {
                             message: ClientMessage {
                                 peer_id: peer.to_string(),
@@ -1086,7 +1229,7 @@ pub async fn run(
                             let name = name.trim().to_owned();
                             peer_names.insert(peer, name.clone());
                             let _ = events.send(ClientEvent::ContactUpdated { contact: ClientContact {
-                                peer_id: peer.to_string(), name, online: peers.contains(&peer), secure: sessions.contains_key(&peer),
+                                peer_id: peer.to_string(), name, online: peers.contains(&peer), secure: sessions.contains_key(&peer), fingerprint: peer_fingerprint(peer),
                             }});
                         }
                         Err(error) => { let _ = events.send(ClientEvent::Error { message: error.to_string() }); }
@@ -1135,6 +1278,9 @@ pub async fn run(
                         name: name.to_owned(),
                         owner_peer: local_peer_id.to_string(),
                         members: member_ids,
+                        admins: Vec::new(),
+                        silenced: Vec::new(),
+                        bans: Vec::new(),
                         revision: 1,
                     };
                     history.save_group_chat(&group)?;
@@ -1145,6 +1291,45 @@ pub async fn run(
                     send_group_chats(&history.group_chats()?, &events);
                     let _ = events.send(ClientEvent::GroupConversationLoaded { group_id: group.id, messages: Vec::new() });
                 }
+                Some(ClientCommand::ModerateGroup { group_id, peer, action }) => {
+                    if let Err(message) = parse_group_id(&group_id) {
+                        let _ = events.send(ClientEvent::Error { message });
+                        continue;
+                    }
+                    let Some(mut group) = history.group_chat(&group_id)? else {
+                        let _ = events.send(ClientEvent::Error { message: "chat di gruppo non trovata".into() });
+                        continue;
+                    };
+                    if let Err(message) = apply_group_moderation(
+                        &mut group,
+                        local_peer_id,
+                        peer,
+                        action,
+                        now_ms(),
+                    ) {
+                        let _ = events.send(ClientEvent::Error { message: message.into() });
+                        continue;
+                    }
+                    history.save_group_chat(&group)?;
+                    let definition = group_definition(&group)?;
+                    let recipients = group
+                        .members
+                        .iter()
+                        .filter_map(|value| value.parse::<PeerId>().ok())
+                        .filter(|member| *member != local_peer_id && sessions.contains_key(member))
+                        .collect::<Vec<_>>();
+                    for member in recipients {
+                        send_event(
+                            &mut swarm,
+                            &mut sessions,
+                            member,
+                            local_peer_id,
+                            &mut sent_numbers,
+                            ChatEvent::GroupDefinition(definition.clone()),
+                        );
+                    }
+                    send_group_chats(&history.group_chats()?, &events);
+                }
                 Some(ClientCommand::SendGroupText { group_id, text }) => {
                     let parsed_id = match parse_group_id(&group_id) {
                         Ok(id) => id,
@@ -1154,23 +1339,28 @@ pub async fn run(
                         let _ = events.send(ClientEvent::Error { message: "chat di gruppo non trovata".into() });
                         continue;
                     };
-                    if !group.members.contains(&local_peer_id.to_string()) {
-                        let _ = events.send(ClientEvent::Error { message: "non fai parte di questa chat".into() });
+                    let timestamp_ms = now_ms();
+                    if !group_member_can_send(&group, &local_peer_id.to_string(), timestamp_ms) {
+                        let _ = events.send(ClientEvent::Error { message: "non puoi scrivere: sei silenziato o bannato".into() });
                         continue;
                     }
                     let emoticons = match resolve_emoticons(&text, &triggers) {
                         Ok(emoticons) => emoticons,
                         Err(error) => { let _ = events.send(ClientEvent::Error { message: format!("trigger emoticon non valido: {error:?}") }); continue; }
                     };
-                    let timestamp_ms = now_ms();
+                    let message = TextMessage { text: text.clone(), emoticons: emoticons.clone() };
                     let group_event = ChatEvent::GroupText(GroupTextMessage {
                         group_id: parsed_id,
-                        message: TextMessage { text: text.clone(), emoticons: emoticons.clone() },
+                        message: message.clone(),
                         timestamp_ms,
                     });
                     let recipients = group.members.iter()
                         .filter_map(|value| value.parse::<PeerId>().ok())
-                        .filter(|peer| *peer != local_peer_id && sessions.contains_key(peer))
+                        .filter(|peer| {
+                            *peer != local_peer_id
+                                && sessions.contains_key(peer)
+                                && !active_group_ban(&group, &peer.to_string(), timestamp_ms)
+                        })
                         .collect::<Vec<_>>();
                     if recipients.is_empty() {
                         let _ = events.send(ClientEvent::Error { message: "nessun partecipante è online con una sessione protetta".into() });
@@ -1188,7 +1378,7 @@ pub async fn run(
                         }
                         send_event(&mut swarm, &mut sessions, *recipient, local_peer_id, &mut sent_numbers, group_event.clone());
                     }
-                    history.record(&group_history_key(&group_id), "out", &format!("group-text:{local_peer_id}"), &text, timestamp_ms)?;
+                    history.record(&group_history_key(&group_id), "out", &format!("group-text:{local_peer_id}"), &encode_text_history(&message)?, timestamp_ms)?;
                     let _ = events.send(ClientEvent::GroupMessage { message: ClientGroupMessage {
                         group_id,
                         sender_peer_id: local_peer_id.to_string(),
@@ -1210,13 +1400,18 @@ pub async fn run(
                         let _ = events.send(ClientEvent::Error { message: "chat di gruppo non trovata".into() });
                         continue;
                     };
-                    if !group.members.contains(&local_peer_id.to_string()) {
-                        let _ = events.send(ClientEvent::Error { message: "non fai parte di questa chat".into() });
+                    let timestamp_ms = now_ms();
+                    if !group_member_can_send(&group, &local_peer_id.to_string(), timestamp_ms) {
+                        let _ = events.send(ClientEvent::Error { message: "non puoi inviare file: sei silenziato o bannato".into() });
                         continue;
                     }
                     let recipients = group.members.iter()
                         .filter_map(|value| value.parse::<PeerId>().ok())
-                        .filter(|peer| *peer != local_peer_id && sessions.contains_key(peer))
+                        .filter(|peer| {
+                            *peer != local_peer_id
+                                && sessions.contains_key(peer)
+                                && !active_group_ban(&group, &peer.to_string(), timestamp_ms)
+                        })
                         .collect::<Vec<_>>();
                     if recipients.is_empty() {
                         let _ = events.send(ClientEvent::Error { message: "nessun partecipante è online con una sessione protetta".into() });
@@ -1224,7 +1419,6 @@ pub async fn run(
                     }
                     match build_manifest(&path) {
                         Ok(manifest) => {
-                            let timestamp_ms = now_ms();
                             history.record(
                                 &group_history_key(&group_id),
                                 "out",
@@ -1300,6 +1494,50 @@ pub async fn run(
                         Err(message) => { let _ = events.send(ClientEvent::Error { message }); }
                     }
                 }
+                Some(ClientCommand::CancelFileTransfers) => {
+                    pending_offers.clear();
+                    pending_transfers.clear();
+                    let _ = events.send(ClientEvent::AttachmentTransfersCancelled);
+                }
+                Some(ClientCommand::AcceptAttachment { offer_id }) => {
+                    let Some(pending) = pending_inbound_offers.remove(&offer_id) else {
+                        let _ = events.send(ClientEvent::Error { message: "offerta file scaduta".into() });
+                        continue;
+                    };
+                    let client_event = client_event_from_chat(
+                        pending.peer,
+                        &pending.event,
+                        "in",
+                        true,
+                        peer_names.get(&pending.peer).map(String::as_str),
+                    );
+                    let response = receive_event(pending.peer, &pending.event, &mut Incoming {
+                        pending_emoticons: &mut pending_emoticons,
+                        events: &events,
+                        nudge_limits: &mut incoming_nudge_limits,
+                        attachments: &mut attachment_receiver,
+                        history: &history,
+                        notifications: args.notifications,
+                        peer_names: &mut peer_names,
+                        local_peer_id,
+                        incoming_attachments: &mut incoming_attachments,
+                    });
+                    if !matches!(&response, ProtocolResponse::Rejected(_)) {
+                        if let Some(event) = client_event {
+                            let _ = events.send(event);
+                        }
+                    }
+                    swarm.behaviour_mut().secure_chat.send_response(pending.channel, response).ok();
+                }
+                Some(ClientCommand::RejectAttachment { offer_id }) => {
+                    let Some(pending) = pending_inbound_offers.remove(&offer_id) else {
+                        continue;
+                    };
+                    swarm.behaviour_mut().secure_chat.send_response(
+                        pending.channel,
+                        ProtocolResponse::Rejected("file rifiutato dall'utente".into()),
+                    ).ok();
+                }
                 None => commands_open = false,
             },
             event = swarm.select_next_some() => match event {
@@ -1313,15 +1551,17 @@ pub async fn run(
                     if contact_link_requested {
                         let addresses = contact_addresses(&swarm);
                         if !addresses.is_empty() {
-                            match contacts::link(
+                            let links = contacts::share_links(
                                 &display_name,
                                 local_peer_id,
-                                &public_key,
-                                addresses.into_iter(),
-                            ) {
-                                Ok(link) => {
+                                &contact_identity,
+                                &ml_dsa_identity,
+                                addresses,
+                            );
+                            match links {
+                                Ok((link, qr_link)) => {
                                     contact_link_requested = false;
-                                    let _ = events.send(ClientEvent::ContactLink { link });
+                                    let _ = events.send(ClientEvent::ContactLink { link, qr_link });
                                 }
                                 Err(error) => {
                                     let _ = events.send(ClientEvent::Error {
@@ -1364,6 +1604,7 @@ pub async fn run(
                                     .unwrap_or_else(|| "Nuovo contatto".into()),
                                 online: true,
                                 secure: false,
+                                fingerprint: peer_fingerprint(peer_id),
                             },
                         });
                         send_event(&mut swarm, &mut sessions, peer_id, local_peer_id, &mut sent_numbers, ChatEvent::Presence(PresenceUpdate { display_name: display_name.clone(), online: true }));
@@ -1391,6 +1632,7 @@ pub async fn run(
                                         .unwrap_or_else(|| "Contatto".into()),
                                     online: false,
                                     secure: false,
+                                    fingerprint: peer_fingerprint(peer_id),
                                 },
                             });
                         }
@@ -1481,7 +1723,7 @@ pub async fn run(
                     request_response::Message::Response { .. } => {}
                 },
                 SwarmEvent::Behaviour(BehaviourEvent::SecureChat(request_response::Event::Message { peer, message, .. })) => match message {
-                    request_response::Message::Request { request, channel, .. } => {
+                    request_response::Message::Request { request_id, request, channel } => {
                         let envelope = sessions
                             .get_mut(&peer)
                             .ok_or("sessione sicura non disponibile")
@@ -1492,6 +1734,49 @@ pub async fn run(
                         let response = match envelope {
                             Ok(envelope) => match validate_envelope(peer, local_peer_id, &envelope) {
                                 Ok(()) => {
+                                    match incoming_offer_details(
+                                        peer,
+                                        local_peer_id,
+                                        &envelope.event,
+                                        &history,
+                                    ) {
+                                        Ok(Some((manifest, group_id))) => {
+                                            if pending_inbound_offers.len() >= MAX_PENDING_INBOUND_OFFERS {
+                                                swarm.behaviour_mut().secure_chat.send_response(
+                                                    channel,
+                                                    ProtocolResponse::Rejected("troppe offerte file in attesa".into()),
+                                                ).ok();
+                                                continue;
+                                            }
+                                            inbound_offer_counter = inbound_offer_counter
+                                                .checked_add(1)
+                                                .unwrap_or(1);
+                                            let offer_id = inbound_offer_counter;
+                                            let _ = events.send(ClientEvent::IncomingAttachmentOffered {
+                                                offer_id,
+                                                peer_id: peer.to_string(),
+                                                filename: manifest.filename.clone(),
+                                                mime: manifest.mime.clone(),
+                                                size: manifest.size,
+                                                group_id,
+                                            });
+                                            pending_inbound_offers.insert(offer_id, PendingInboundOffer {
+                                                peer,
+                                                request_id,
+                                                event: envelope.event,
+                                                channel,
+                                            });
+                                            continue;
+                                        }
+                                        Ok(None) => {}
+                                        Err(error) => {
+                                            swarm.behaviour_mut().secure_chat.send_response(
+                                                channel,
+                                                ProtocolResponse::Rejected(error),
+                                            ).ok();
+                                            continue;
+                                        }
+                                    }
                                     let client_event = client_event_from_chat(
                                         peer, &envelope.event, "in", true,
                                         peer_names.get(&peer).map(String::as_str),
@@ -1529,23 +1814,40 @@ pub async fn run(
                         if let Some(pending) = pending_offers.remove(&request_id) {
                             match response {
                                 ProtocolResponse::MissingChunks(indices) => {
-                                    println!("invio {}: {} chunk richiesti", pending.manifest.filename, indices.len());
-                                    send_next_transfer_chunk(
-                                        &mut swarm,
-                                        &mut sessions,
-                                        &mut sent_numbers,
-                                        &mut pending_transfers,
-                                        local_peer_id,
-                                        &events,
-                                        PendingTransfer {
-                                            peer: pending.peer,
-                                            path: pending.path,
-                                            manifest: pending.manifest,
-                                            remaining: indices.into(),
-                                            current: 0,
-                                            retries: 0,
-                                        },
-                                    );
+                                    match validate_missing_chunks(indices, pending.manifest.chunks.len()) {
+                                        Ok(remaining) => {
+                                            println!("invio {}: {} chunk richiesti", pending.manifest.filename, remaining.len());
+                                            let total = remaining.len();
+                                            let _ = events.send(ClientEvent::AttachmentProgress {
+                                                filename: pending.manifest.filename.clone(),
+                                                completed_chunks: 0,
+                                                total_chunks: total,
+                                            });
+                                            send_next_transfer_chunk(
+                                                &mut swarm,
+                                                &mut sessions,
+                                                &mut sent_numbers,
+                                                &mut pending_transfers,
+                                                local_peer_id,
+                                                &events,
+                                                PendingTransfer {
+                                                    peer: pending.peer,
+                                                    path: pending.path,
+                                                    manifest: pending.manifest,
+                                                    remaining,
+                                                    current: 0,
+                                                    retries: 0,
+                                                    completed: 0,
+                                                    total,
+                                                },
+                                            );
+                                        }
+                                        Err(error) => {
+                                            let _ = events.send(ClientEvent::Error {
+                                                message: format!("richiesta chunk non valida: {error}"),
+                                            });
+                                        }
+                                    }
                                 }
                                 ProtocolResponse::Rejected(error) => {
                                     let _ = events.send(ClientEvent::Error { message: format!("file rifiutato: {error}") });
@@ -1559,15 +1861,24 @@ pub async fn run(
                             }
                         } else if let Some(transfer) = pending_transfers.remove(&request_id) {
                             match response {
-                                ProtocolResponse::Ack => send_next_transfer_chunk(
-                                    &mut swarm,
-                                    &mut sessions,
-                                    &mut sent_numbers,
-                                    &mut pending_transfers,
-                                    local_peer_id,
-                                    &events,
-                                    transfer,
-                                ),
+                                ProtocolResponse::Ack => {
+                                    let mut transfer = transfer;
+                                    transfer.completed += 1;
+                                    let _ = events.send(ClientEvent::AttachmentProgress {
+                                        filename: transfer.manifest.filename.clone(),
+                                        completed_chunks: transfer.completed,
+                                        total_chunks: transfer.total,
+                                    });
+                                    send_next_transfer_chunk(
+                                        &mut swarm,
+                                        &mut sessions,
+                                        &mut sent_numbers,
+                                        &mut pending_transfers,
+                                        local_peer_id,
+                                        &events,
+                                        transfer,
+                                    )
+                                },
                                 ProtocolResponse::Rejected(error) => {
                                     let _ = events.send(ClientEvent::Error { message: format!("trasferimento rifiutato: {error}") });
                                 }
@@ -1623,7 +1934,8 @@ pub async fn run(
                         eprintln!("invio cifrato fallito per {peer}: {error}");
                     }
                 }
-                SwarmEvent::Behaviour(BehaviourEvent::SecureChat(request_response::Event::InboundFailure { peer, error, .. })) => {
+                SwarmEvent::Behaviour(BehaviourEvent::SecureChat(request_response::Event::InboundFailure { peer, request_id, error, .. })) => {
+                    pending_inbound_offers.retain(|_, pending| pending.request_id != request_id);
                     eprintln!("messaggio cifrato non ricevibile da {peer}: {error}");
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::SecureChat(request_response::Event::ResponseSent { .. })) => {}
@@ -1685,6 +1997,7 @@ pub async fn run(
                                                 .unwrap_or_else(|| "Contatto".into()),
                                             online: true,
                                             secure: true,
+                                            fingerprint: peer_fingerprint(peer),
                                         },
                                     });
                                     send_group_definitions_for_peer(
@@ -1729,6 +2042,7 @@ pub async fn run(
                                         .unwrap_or_else(|| "Contatto".into()),
                                     online: true,
                                     secure: true,
+                                    fingerprint: peer_fingerprint(peer),
                                 },
                             });
                             send_group_definitions_for_peer(
@@ -1846,6 +2160,7 @@ fn client_event_from_chat(
                 name: local_name.unwrap_or(&presence.display_name).to_owned(),
                 online: presence.online,
                 secure,
+                fingerprint: peer_fingerprint(peer),
             },
         }),
         ChatEvent::Text(message) => Some(ClientEvent::Message {
@@ -2185,6 +2500,23 @@ fn send_next_transfer_chunk(
     );
 }
 
+fn validate_missing_chunks(
+    indices: Vec<u32>,
+    chunk_count: usize,
+) -> Result<VecDeque<u32>, &'static str> {
+    if indices.len() > chunk_count {
+        return Err("troppi indici");
+    }
+    let mut unique = HashSet::with_capacity(indices.len());
+    if indices
+        .iter()
+        .any(|&index| index as usize >= chunk_count || !unique.insert(index))
+    {
+        return Err("indice duplicato o fuori limite");
+    }
+    Ok(indices.into())
+}
+
 fn send_current_transfer_chunk(
     swarm: &mut Swarm<Behaviour>,
     sessions: &mut HashMap<PeerId, RatchetSession>,
@@ -2253,10 +2585,55 @@ fn validate_envelope(
     }
 }
 
+fn incoming_offer_details(
+    peer: PeerId,
+    local_peer_id: PeerId,
+    event: &ChatEvent,
+    history: &History,
+) -> Result<Option<(AttachmentManifest, Option<String>)>, String> {
+    let (manifest, group_id) = match event {
+        ChatEvent::AttachmentOffer(manifest) => (manifest, None),
+        ChatEvent::GroupAttachmentOffer(offer) => {
+            let id = hex_group_id(&offer.group_id);
+            let group = history
+                .group_chat(&id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "chat di gruppo sconosciuta".to_owned())?;
+            if !group.members.contains(&peer.to_string())
+                || !group.members.contains(&local_peer_id.to_string())
+            {
+                return Err("mittente non appartenente al gruppo".into());
+            }
+            let received_at = now_ms();
+            if !group_member_can_send(&group, &peer.to_string(), received_at)
+                || active_group_ban(&group, &local_peer_id.to_string(), received_at)
+            {
+                return Err("file bloccato dalla moderazione".into());
+            }
+            (&offer.manifest, Some(id))
+        }
+        _ => return Ok(None),
+    };
+    validate_manifest(manifest).map_err(|error| error.to_string())?;
+    Ok(Some((manifest.clone(), group_id)))
+}
+
 fn device_id(peer: PeerId) -> [u8; 16] {
     blake3::hash(&peer.to_bytes()).as_bytes()[..16]
         .try_into()
         .expect("16 bytes")
+}
+
+fn peer_fingerprint(peer: PeerId) -> String {
+    let hex = blake3::hash(&peer.to_bytes())
+        .to_hex()
+        .to_string()
+        .to_uppercase();
+    hex.as_bytes()[..32]
+        .chunks(4)
+        .map(|chunk| std::str::from_utf8(chunk).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn conversation_id(first: PeerId, second: PeerId) -> [u8; 32] {
@@ -2277,15 +2654,15 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                 message.text,
                 message.emoticons.len()
             );
-            record(context.history, &peer, "in", "text", &message.text);
+            record_text(context.history, &peer, "in", message);
             notify(context.notifications, "Nuovo messaggio", &message.text);
             ProtocolResponse::Ack
         }
         ChatEvent::GroupDefinition(definition) => {
-            if definition.owner_peer != peer.to_string()
-                || !definition
-                    .members
-                    .contains(&context.local_peer_id.to_string())
+            let sender = peer.to_string();
+            if !definition
+                .members
+                .contains(&context.local_peer_id.to_string())
             {
                 return ProtocolResponse::Rejected("invito al gruppo non autorizzato".into());
             }
@@ -2294,22 +2671,42 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                 Ok(existing) => existing,
                 Err(error) => return ProtocolResponse::Rejected(error.to_string()),
             };
-            if existing.as_ref().is_some_and(|group| {
-                group.owner_peer != definition.owner_peer || group.revision > definition.revision
-            }) {
-                return ProtocolResponse::Rejected("definizione del gruppo non valida".into());
-            }
-            if existing
-                .as_ref()
-                .is_some_and(|group| group.revision == definition.revision)
-            {
-                return ProtocolResponse::Ack;
+            match &existing {
+                None if definition.owner_peer != sender => {
+                    return ProtocolResponse::Rejected("invito al gruppo non autorizzato".into());
+                }
+                Some(group)
+                    if group.owner_peer != definition.owner_peer
+                        || group.revision > definition.revision =>
+                {
+                    return ProtocolResponse::Rejected("definizione del gruppo non valida".into());
+                }
+                Some(group) if sender != group.owner_peer && !group.admins.contains(&sender) => {
+                    return ProtocolResponse::Rejected(
+                        "aggiornamento gruppo non autorizzato".into(),
+                    );
+                }
+                Some(group) if group.revision == definition.revision => {
+                    return ProtocolResponse::Ack;
+                }
+                Some(group)
+                    if sender != group.owner_peer
+                        && !admin_group_update_allowed(group, definition, &sender) =>
+                {
+                    return ProtocolResponse::Rejected(
+                        "aggiornamento gruppo non autorizzato".into(),
+                    );
+                }
+                _ => {}
             }
             let group = GroupChatEntry {
                 id: id.clone(),
                 name: definition.name.trim().to_owned(),
                 owner_peer: definition.owner_peer.clone(),
                 members: definition.members.clone(),
+                admins: definition.admins.clone(),
+                silenced: definition.silenced.clone(),
+                bans: definition.bans.clone(),
                 revision: definition.revision,
             };
             if let Err(error) = context.history.save_group_chat(&group) {
@@ -2333,16 +2730,21 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                 Ok(None) => return ProtocolResponse::Rejected("chat di gruppo sconosciuta".into()),
                 Err(error) => return ProtocolResponse::Rejected(error.to_string()),
             };
-            if !group.members.contains(&peer.to_string())
-                || !group.members.contains(&context.local_peer_id.to_string())
+            let received_at = now_ms();
+            if !group_member_can_send(&group, &peer.to_string(), received_at)
+                || active_group_ban(&group, &context.local_peer_id.to_string(), received_at)
             {
-                return ProtocolResponse::Rejected("mittente non appartenente al gruppo".into());
+                return ProtocolResponse::Rejected("messaggio bloccato dalla moderazione".into());
             }
+            let encoded = match encode_text_history(&group_message.message) {
+                Ok(encoded) => encoded,
+                Err(error) => return ProtocolResponse::Rejected(error.to_string()),
+            };
             if let Err(error) = context.history.record(
                 &group_history_key(&id),
                 "in",
                 &format!("group-text:{peer}"),
-                &group_message.message.text,
+                &encoded,
                 group_message.timestamp_ms,
             ) {
                 return ProtocolResponse::Rejected(error.to_string());
@@ -2383,10 +2785,11 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                 Ok(None) => return ProtocolResponse::Rejected("chat di gruppo sconosciuta".into()),
                 Err(error) => return ProtocolResponse::Rejected(error.to_string()),
             };
-            if !group.members.contains(&peer.to_string())
-                || !group.members.contains(&context.local_peer_id.to_string())
+            let received_at = now_ms();
+            if !group_member_can_send(&group, &peer.to_string(), received_at)
+                || active_group_ban(&group, &context.local_peer_id.to_string(), received_at)
             {
-                return ProtocolResponse::Rejected("mittente non appartenente al gruppo".into());
+                return ProtocolResponse::Rejected("file bloccato dalla moderazione".into());
             }
             match context.attachments.accept_offer(offer.manifest.clone()) {
                 Ok((missing, completed)) => {
@@ -2553,6 +2956,41 @@ fn record(history: &History, peer: &PeerId, direction: &str, kind: &str, body: &
     }
 }
 
+fn record_text(history: &History, peer: &PeerId, direction: &str, message: &TextMessage) {
+    match encode_text_history(message) {
+        Ok(body) => record(history, peer, direction, "text", &body),
+        Err(error) => eprintln!("cronologia non aggiornata: {error}"),
+    }
+}
+
+fn encode_text_history(message: &TextMessage) -> Result<String, Box<dyn Error>> {
+    let bytes = cbor4ii::serde::to_vec(Vec::new(), message)?;
+    Ok(format!("{TEXT_HISTORY_PREFIX}{}", BASE64.encode(bytes)))
+}
+
+fn decode_text_history(body: &str) -> TextMessage {
+    body.strip_prefix(TEXT_HISTORY_PREFIX)
+        .and_then(|encoded| BASE64.decode(encoded).ok())
+        .and_then(|bytes| cbor4ii::serde::from_slice::<TextMessage>(&bytes).ok())
+        .filter(|message| validate_text_message(message).is_ok())
+        .unwrap_or_else(|| TextMessage {
+            text: body.to_owned(),
+            emoticons: Vec::new(),
+        })
+}
+
+fn client_emoticon_spans(message: &TextMessage) -> Vec<ClientEmoticonSpan> {
+    message
+        .emoticons
+        .iter()
+        .map(|span| ClientEmoticonSpan {
+            start: span.start,
+            end: span.end,
+            asset_id: hex_asset_id(&span.asset_id),
+        })
+        .collect()
+}
+
 fn encode_attachment(manifest: &AttachmentManifest) -> String {
     format!(
         "{}\t{}\t{}",
@@ -2591,7 +3029,157 @@ fn validate_group_definition(group: &GroupDefinition) -> Result<(), &'static str
     {
         return Err("partecipanti del gruppo non validi");
     }
+    let admins = group.admins.iter().collect::<HashSet<_>>();
+    let silenced = group.silenced.iter().collect::<HashSet<_>>();
+    let banned = group
+        .bans
+        .iter()
+        .map(|ban| &ban.peer_id)
+        .collect::<HashSet<_>>();
+    if admins.len() != group.admins.len()
+        || silenced.len() != group.silenced.len()
+        || banned.len() != group.bans.len()
+        || group
+            .admins
+            .iter()
+            .any(|peer| peer == &group.owner_peer || !group.members.contains(peer))
+        || group.silenced.iter().any(|peer| {
+            peer == &group.owner_peer
+                || group.admins.contains(peer)
+                || !group.members.contains(peer)
+        })
+        || group.bans.iter().any(|ban| {
+            ban.peer_id == group.owner_peer
+                || group.admins.contains(&ban.peer_id)
+                || !group.members.contains(&ban.peer_id)
+                || ban.expires_at_ms == Some(0)
+        })
+    {
+        return Err("ruoli o sanzioni del gruppo non validi");
+    }
     Ok(())
+}
+
+fn active_group_ban(group: &GroupChatEntry, peer: &str, timestamp_ms: u64) -> bool {
+    group.bans.iter().any(|ban| {
+        ban.peer_id == peer
+            && match ban.expires_at_ms {
+                None => true,
+                Some(expires) => expires > timestamp_ms,
+            }
+    })
+}
+
+fn group_member_can_send(group: &GroupChatEntry, peer: &str, timestamp_ms: u64) -> bool {
+    group.members.iter().any(|member| member == peer)
+        && !group.silenced.iter().any(|member| member == peer)
+        && !active_group_ban(group, peer, timestamp_ms)
+}
+
+fn apply_group_moderation(
+    group: &mut GroupChatEntry,
+    actor: PeerId,
+    target: PeerId,
+    action: GroupModeration,
+    timestamp_ms: u64,
+) -> Result<(), &'static str> {
+    let actor = actor.to_string();
+    let target = target.to_string();
+    let owner = actor == group.owner_peer;
+    let admin = group.admins.contains(&actor);
+    if !owner && !admin {
+        return Err("non hai diritti di moderazione");
+    }
+    if !group.members.contains(&target) || target == group.owner_peer {
+        return Err("partecipante non moderabile");
+    }
+    if !owner && group.admins.contains(&target) {
+        return Err("un amministratore non può moderare un altro amministratore");
+    }
+
+    let previous = (
+        group.admins.clone(),
+        group.silenced.clone(),
+        group.bans.clone(),
+    );
+    match action {
+        GroupModeration::SetAdmin(enabled) => {
+            if !owner {
+                return Err("solo il proprietario può assegnare diritti");
+            }
+            if enabled {
+                if !group.admins.contains(&target) {
+                    group.admins.push(target.clone());
+                    group.admins.sort();
+                }
+                group.silenced.retain(|peer| peer != &target);
+                group.bans.retain(|ban| ban.peer_id != target);
+            } else {
+                group.admins.retain(|peer| peer != &target);
+            }
+        }
+        GroupModeration::SetSilenced(enabled) => {
+            if group.admins.contains(&target) {
+                return Err("rimuovi prima i diritti di amministratore");
+            }
+            if enabled && !group.silenced.contains(&target) {
+                group.silenced.push(target.clone());
+                group.silenced.sort();
+            } else if !enabled {
+                group.silenced.retain(|peer| peer != &target);
+            }
+        }
+        GroupModeration::Ban(duration_ms) => {
+            if group.admins.contains(&target) {
+                return Err("rimuovi prima i diritti di amministratore");
+            }
+            let expires_at_ms = duration_ms
+                .map(|duration| {
+                    if !(60_000..=30 * 24 * 60 * 60 * 1_000).contains(&duration) {
+                        return Err("durata ban non valida");
+                    }
+                    timestamp_ms
+                        .checked_add(duration)
+                        .ok_or("durata ban non valida")
+                })
+                .transpose()?;
+            group.silenced.retain(|peer| peer != &target);
+            group.bans.retain(|ban| ban.peer_id != target);
+            group.bans.push(GroupBan {
+                peer_id: target,
+                expires_at_ms,
+            });
+            group
+                .bans
+                .sort_by(|left, right| left.peer_id.cmp(&right.peer_id));
+        }
+        GroupModeration::Unban => group.bans.retain(|ban| ban.peer_id != target),
+    }
+    if previous
+        == (
+            group.admins.clone(),
+            group.silenced.clone(),
+            group.bans.clone(),
+        )
+    {
+        return Err("nessuna modifica da applicare");
+    }
+    group.revision = group.revision.checked_add(1).ok_or("revisioni esaurite")?;
+    Ok(())
+}
+
+fn admin_group_update_allowed(
+    existing: &GroupChatEntry,
+    definition: &GroupDefinition,
+    actor: &str,
+) -> bool {
+    // ponytail: revisioni lineari; passare a un log firmato se servono moderatori concorrenti offline.
+    existing.admins.iter().any(|admin| admin == actor)
+        && definition.revision == existing.revision.checked_add(1).unwrap_or_default()
+        && definition.name == existing.name
+        && definition.owner_peer == existing.owner_peer
+        && definition.members == existing.members
+        && definition.admins == existing.admins
 }
 
 fn hex_group_id(id: &[u8; 16]) -> String {
@@ -2617,6 +3205,9 @@ fn group_definition(group: &GroupChatEntry) -> Result<GroupDefinition, String> {
         name: group.name.clone(),
         owner_peer: group.owner_peer.clone(),
         members: group.members.clone(),
+        admins: group.admins.clone(),
+        silenced: group.silenced.clone(),
+        bans: group.bans.clone(),
         revision: group.revision,
     };
     validate_group_definition(&definition).map_err(str::to_owned)?;
@@ -2631,6 +3222,16 @@ fn send_group_chats(groups: &[GroupChatEntry], events: &mpsc::UnboundedSender<Cl
             name: group.name.clone(),
             owner_peer_id: group.owner_peer.clone(),
             members: group.members.clone(),
+            admins: group.admins.clone(),
+            silenced: group.silenced.clone(),
+            bans: group
+                .bans
+                .iter()
+                .map(|ban| ClientGroupBan {
+                    peer_id: ban.peer_id.clone(),
+                    expires_at_ms: ban.expires_at_ms,
+                })
+                .collect(),
         })
         .collect();
     let _ = events.send(ClientEvent::GroupChatsUpdated { groups });
@@ -2648,7 +3249,9 @@ fn send_group_definitions_for_peer(
         return;
     };
     for group in groups.iter().filter(|group| {
-        group.owner_peer == local_peer_id.to_string() && group.members.contains(&peer.to_string())
+        (group.owner_peer == local_peer_id.to_string()
+            || group.admins.contains(&local_peer_id.to_string()))
+            && group.members.contains(&peer.to_string())
     }) {
         if let Ok(definition) = group_definition(group) {
             send_event(
@@ -2966,6 +3569,20 @@ fn load_or_create_identity(path: &Path) -> Result<Keypair, Box<dyn Error>> {
     Ok(identity)
 }
 
+fn load_or_create_secret(path: &Path) -> Result<[u8; 32], Box<dyn Error>> {
+    if path.exists() {
+        return Ok(fs::read(path)?
+            .try_into()
+            .map_err(|_| "chiave ML-DSA locale non valida")?);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let secret = generate_secret();
+    fs::write(path, secret)?;
+    Ok(secret)
+}
+
 pub struct ClientConfig {
     listen: Multiaddr,
     listen_tcp: Multiaddr,
@@ -2974,6 +3591,8 @@ pub struct ClientConfig {
     relays: Vec<Multiaddr>,
     relay_server: bool,
     identity: PathBuf,
+    identity_bytes: Option<Vec<u8>>,
+    ml_dsa_seed: Option<[u8; 32]>,
     emotes: PathBuf,
     downloads: PathBuf,
     history: PathBuf,
@@ -2982,6 +3601,17 @@ pub struct ClientConfig {
 }
 
 impl ClientConfig {
+    pub fn with_identity_bytes(
+        mut self,
+        bytes: Vec<u8>,
+        ml_dsa_seed: [u8; 32],
+    ) -> Result<Self, Box<dyn Error>> {
+        Keypair::from_protobuf_encoding(&bytes)?;
+        self.identity_bytes = Some(bytes);
+        self.ml_dsa_seed = Some(ml_dsa_seed);
+        Ok(self)
+    }
+
     pub fn desktop(
         name: String,
         data_dir: PathBuf,
@@ -3001,6 +3631,8 @@ impl ClientConfig {
             relays: Vec::new(),
             relay_server: false,
             identity: data_dir.join("identity.key"),
+            identity_bytes: None,
+            ml_dsa_seed: None,
             emotes: data_dir.join("emoticons"),
             downloads: data_dir.join("downloads"),
             history: data_dir.join("history.db"),
@@ -3065,6 +3697,8 @@ impl ClientConfig {
             relays,
             relay_server,
             identity,
+            identity_bytes: None,
+            ml_dsa_seed: None,
             emotes,
             downloads,
             history,
@@ -3233,6 +3867,9 @@ mod tests {
             name: "Amici".into(),
             owner_peer: owner.clone(),
             members: vec![owner, alice, bob],
+            admins: Vec::new(),
+            silenced: Vec::new(),
+            bans: Vec::new(),
             revision: 1,
         };
         assert_eq!(validate_group_definition(&group), Ok(()));
@@ -3241,6 +3878,66 @@ mod tests {
             validate_group_definition(&group),
             Err("partecipanti del gruppo non validi")
         );
+    }
+
+    #[test]
+    fn group_moderation_enforces_hierarchy_and_expiry() {
+        let owner = PeerId::from(Keypair::generate_ed25519().public());
+        let admin = PeerId::from(Keypair::generate_ed25519().public());
+        let member = PeerId::from(Keypair::generate_ed25519().public());
+        let mut group = GroupChatEntry {
+            id: hex_group_id(&[1; 16]),
+            name: "Amici".into(),
+            owner_peer: owner.to_string(),
+            members: vec![owner.to_string(), admin.to_string(), member.to_string()],
+            admins: vec![admin.to_string()],
+            silenced: Vec::new(),
+            bans: Vec::new(),
+            revision: 1,
+        };
+        let before_admin_update = group.clone();
+
+        apply_group_moderation(
+            &mut group,
+            admin,
+            member,
+            GroupModeration::SetSilenced(true),
+            1_000,
+        )
+        .unwrap();
+        let definition = group_definition(&group).unwrap();
+        assert!(admin_group_update_allowed(
+            &before_admin_update,
+            &definition,
+            &admin.to_string()
+        ));
+        let mut privilege_escalation = definition;
+        privilege_escalation.admins.clear();
+        assert!(!admin_group_update_allowed(
+            &before_admin_update,
+            &privilege_escalation,
+            &admin.to_string()
+        ));
+        assert!(!group_member_can_send(&group, &member.to_string(), 1_000));
+        assert!(apply_group_moderation(
+            &mut group,
+            admin,
+            member,
+            GroupModeration::SetAdmin(true),
+            1_000,
+        )
+        .is_err());
+
+        apply_group_moderation(
+            &mut group,
+            owner,
+            member,
+            GroupModeration::Ban(Some(60_000)),
+            1_000,
+        )
+        .unwrap();
+        assert!(!group_member_can_send(&group, &member.to_string(), 60_999));
+        assert!(group_member_can_send(&group, &member.to_string(), 61_000));
     }
 
     #[test]
@@ -3258,6 +3955,47 @@ mod tests {
             },
         });
         assert!(client_event_from_chat(peer, &event, "in", true, None).is_none());
+    }
+
+    #[test]
+    fn incoming_file_offer_is_validated_before_user_consent() {
+        let path = std::env::temp_dir().join(format!(
+            "msnnext-offer-validation-{}-{}.sqlite3",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::remove_file(&path).ok();
+        let history = History::open(&path, [5; 32]).unwrap();
+        let peer = PeerId::from(Keypair::generate_ed25519().public());
+        let local = PeerId::from(Keypair::generate_ed25519().public());
+        let mut manifest = AttachmentManifest {
+            attachment_id: *blake3::hash(&[]).as_bytes(),
+            filename: "foto.png".into(),
+            mime: "image/png".into(),
+            size: 0,
+            chunk_size: attachments::CHUNK_SIZE as u32,
+            chunks: Vec::new(),
+        };
+
+        assert!(incoming_offer_details(
+            peer,
+            local,
+            &ChatEvent::AttachmentOffer(manifest.clone()),
+            &history
+        )
+        .unwrap()
+        .is_some());
+
+        manifest.filename = "../foto.png".into();
+        assert!(incoming_offer_details(
+            peer,
+            local,
+            &ChatEvent::AttachmentOffer(manifest),
+            &history
+        )
+        .is_err());
+        drop(history);
+        fs::remove_file(path).ok();
     }
 
     #[test]
@@ -3308,6 +4046,38 @@ mod tests {
         assert_eq!(next_request_retry(0), Some(1));
         assert_eq!(next_request_retry(1), Some(2));
         assert_eq!(next_request_retry(2), None);
+    }
+
+    #[test]
+    fn missing_chunk_requests_are_unique_and_in_bounds() {
+        assert_eq!(
+            validate_missing_chunks(vec![2, 0, 1], 3).unwrap(),
+            VecDeque::from([2, 0, 1])
+        );
+        assert!(validate_missing_chunks(vec![0, 0], 2).is_err());
+        assert!(validate_missing_chunks(vec![2], 2).is_err());
+        assert!(validate_missing_chunks(vec![0, 1, 2], 2).is_err());
+    }
+
+    #[test]
+    fn text_history_preserves_custom_emoticon_spans() {
+        let message = TextMessage {
+            text: "ciao :x:".into(),
+            emoticons: vec![msnnext_protocol::EmoticonSpan {
+                start: 5,
+                end: 8,
+                asset_id: [4; 32],
+            }],
+        };
+
+        assert_eq!(
+            decode_text_history(&encode_text_history(&message).unwrap()),
+            message
+        );
+        assert_eq!(
+            decode_text_history("messaggio precedente").text,
+            "messaggio precedente"
+        );
     }
 
     #[test]
@@ -3386,10 +4156,11 @@ mod tests {
                 alice_commands
                     .send(ClientCommand::RequestContactLink)
                     .unwrap();
-                let ClientEvent::ContactLink { link } = receive_until(&mut alice_events, |event| {
-                    matches!(event, ClientEvent::ContactLink { .. })
-                })
-                .await
+                let ClientEvent::ContactLink { link, .. } =
+                    receive_until(&mut alice_events, |event| {
+                        matches!(event, ClientEvent::ContactLink { .. })
+                    })
+                    .await
                 else {
                     unreachable!()
                 };

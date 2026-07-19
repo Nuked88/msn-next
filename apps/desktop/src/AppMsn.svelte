@@ -3,6 +3,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event'
   import { getCurrentWebview } from '@tauri-apps/api/webview'
   import { getCurrentWindow } from '@tauri-apps/api/window'
+  import { PhysicalPosition } from '@tauri-apps/api/dpi'
   import { open, save } from '@tauri-apps/plugin-dialog'
   import QRCode from 'qrcode'
   import { onMount, tick } from 'svelte'
@@ -44,6 +45,7 @@
     online: boolean
     secure: boolean
     unread: number
+    fingerprint: string
   }
 
   type ClientMessage = {
@@ -86,7 +88,21 @@
     name: string
     ownerPeerId: string
     members: string[]
+    admins: string[]
+    silenced: string[]
+    bans: GroupBan[]
     unread: number
+  }
+
+  type GroupBan = { peerId: string; expiresAtMs: number | null }
+
+  type IncomingAttachmentOffer = {
+    offerId: number
+    peerId: string
+    filename: string
+    mime: string
+    size: number
+    groupId?: string
   }
 
   type ClientGroupMessage = {
@@ -102,17 +118,20 @@
   }
 
   type ClientEvent =
-    | { type: 'started'; peerId: string; displayName: string }
+    | { type: 'started'; peerId: string; displayName: string; fingerprint: string }
     | { type: 'contactUpdated'; contact: Omit<Contact, 'unread'> }
     | { type: 'conversationLoaded'; peerId: string; messages: ClientMessage[] }
     | { type: 'message'; message: ClientMessage }
     | { type: 'emoticonCatalog'; emoticons: ClientEmoticon[] }
     | { type: 'emoticonOffered'; peerId: string; emoticon: ClientEmoticon }
     | { type: 'emoticonRemoved'; assetId: string }
-    | { type: 'contactLink'; link: string }
+    | { type: 'contactLink'; link: string; qrLink: string }
     | { type: 'attachmentReceived'; peerId: string; id: string; filename: string; mime: string }
     | { type: 'groupAttachmentReceived'; groupId: string; id: string; filename: string; mime: string }
     | { type: 'attachmentSent'; peerId: string; filename: string }
+    | { type: 'attachmentProgress'; filename: string; completedChunks: number; totalChunks: number }
+    | { type: 'attachmentTransfersCancelled' }
+    | ({ type: 'incomingAttachmentOffered' } & IncomingAttachmentOffer)
     | { type: 'contactRemoved'; peerId: string }
     | { type: 'conversationCleared'; peerId: string }
     | { type: 'groupChatsUpdated'; groups: Omit<GroupChat, 'unread'>[] }
@@ -133,6 +152,7 @@
     avatarDataUrl: string | null
     previewSentImages: boolean
     previewReceivedImages: boolean
+    nudgeSound: boolean
   }
 
   const emoticons: Emoticon[] = [
@@ -170,6 +190,7 @@
   let ownContactLink = ''
   let ownContactQr = ''
   let peerId = ''
+  let ownFingerprint = ''
   let selectedPeerId = ''
   let selectedGroupId = ''
   let contacts: Contact[] = []
@@ -183,6 +204,7 @@
   let avatarDataUrl = ''
   let previewSentImages = true
   let previewReceivedImages = false
+  let nudgeSound = true
   let connectOpen = false
   let detailsOpen = false
   let emojiOpen = false
@@ -194,6 +216,9 @@
   let pendingEmoticonAction = ''
   let fileSending = false
   let pendingFileCount = 0
+  let transferFilename = ''
+  let transferProgress = 0
+  let incomingAttachmentOffers: IncomingAttachmentOffer[] = []
   let contactName = ''
   let contactNamePeer = ''
   let chatGroups: GroupChat[] = []
@@ -205,7 +230,7 @@
   let contextX = 0
   let contextY = 0
   let fileDropActive = false
-  let imagePreview = ''
+  let mediaPreview = ''
   let pendingSentPreviews: Record<string, string[]> = {}
   const automaticPreviewIds = new Set<string>()
   let rosterOpen = false
@@ -225,8 +250,15 @@
   $: onlineContacts = visibleContacts.filter((contact) => contact.online)
   $: offlineContacts = visibleContacts.filter((contact) => !contact.online)
   $: sortedContacts = [...visibleContacts].sort((a, b) => Number(b.online) - Number(a.online) || a.name.localeCompare(b.name))
-  $: groupOnline = activeGroup?.members.filter((id) => id !== peerId && contacts.some((contact) => contact.peerId === id && contact.secure)).length || 0
+  $: groupOnline = activeGroup?.members.filter((id) =>
+    id !== peerId
+    && !memberBan(activeGroup, id)
+    && contacts.some((contact) => contact.peerId === id && contact.secure)
+  ).length || 0
   $: ready = activeGroup ? groupOnline > 0 : Boolean(activeContact?.online && activeContact?.secure)
+  $: groupCanSend = !activeGroup
+    || (!activeGroup.silenced.includes(peerId) && !memberBan(activeGroup, peerId))
+  $: canSend = ready && groupCanSend
 
   onMount(() => {
     const media = window.matchMedia('(prefers-color-scheme: dark)')
@@ -275,6 +307,7 @@
       avatarDataUrl = profile.avatarDataUrl || ''
       previewSentImages = profile.previewSentImages
       previewReceivedImages = profile.previewReceivedImages
+      nudgeSound = profile.nudgeSound
       const isRunning = await invoke<boolean>('node_status')
       running = isRunning
       setupOpen = false
@@ -303,6 +336,7 @@
   function handleEvent(event: ClientEvent) {
     if (event.type === 'started') {
       peerId = event.peerId
+      ownFingerprint = event.fingerprint
       displayName = event.displayName
       running = true
       setupOpen = false
@@ -346,11 +380,11 @@
     if (event.type === 'contactLink') {
       ownContactLink = event.link
       linkRequested = false
-      void QRCode.toDataURL(event.link, {
+      void QRCode.toDataURL(event.qrLink, {
         width: 220,
         margin: 1,
         color: { dark: '#10284a', light: '#ffffff' },
-      }).then((qr) => ownContactQr = qr)
+      }).then((qr) => ownContactQr = qr).catch((error) => showToast(`QR non generabile: ${error}`))
       return
     }
     if (event.type === 'attachmentReceived') {
@@ -374,6 +408,25 @@
       pendingFileCount = Math.max(0, pendingFileCount - 1)
       fileSending = pendingFileCount > 0
       showToast(`File inviato: ${event.filename}`)
+      return
+    }
+    if (event.type === 'attachmentProgress') {
+      transferFilename = event.filename
+      transferProgress = event.totalChunks
+        ? Math.round(event.completedChunks * 100 / event.totalChunks)
+        : 100
+      return
+    }
+    if (event.type === 'attachmentTransfersCancelled') {
+      pendingFileCount = 0
+      fileSending = false
+      transferFilename = ''
+      transferProgress = 0
+      showToast('Invio annullato')
+      return
+    }
+    if (event.type === 'incomingAttachmentOffered') {
+      incomingAttachmentOffers = [...incomingAttachmentOffers, event]
       return
     }
     if (event.type === 'emoticonRemoved') {
@@ -473,7 +526,7 @@
         }
       }
       if (automaticPreviewIds.has(event.id)) automaticPreviewIds.delete(event.id)
-      else imagePreview = event.dataUrl
+      else mediaPreview = event.dataUrl
       return
     }
     if (event.type === 'attachmentExported') {
@@ -575,7 +628,10 @@
           : contact
       )
     }
-    if (message.kind === 'nudge') shakeWindow()
+    if (message.kind === 'nudge' && !next.mine) {
+      void shakeWindow()
+      playNudgeSound()
+    }
     scrollMessages()
   }
 
@@ -618,6 +674,40 @@
   function memberName(memberId: string) {
     if (memberId === peerId) return `${displayName} (tu)`
     return contacts.find((contact) => contact.peerId === memberId)?.name || `${memberId.slice(0, 8)}…`
+  }
+
+  function memberBan(group: GroupChat, memberId: string) {
+    return group.bans.find((ban) => ban.peerId === memberId
+      && (ban.expiresAtMs === null || ban.expiresAtMs > Date.now()))
+  }
+
+  function memberRole(group: GroupChat, memberId: string) {
+    if (memberId === group.ownerPeerId) return 'Proprietario'
+    if (group.admins.includes(memberId)) return 'Amministratore'
+    return 'Membro'
+  }
+
+  function canModerateMember(group: GroupChat, memberId: string) {
+    if (memberId === peerId || memberId === group.ownerPeerId) return false
+    if (peerId === group.ownerPeerId) return true
+    return group.admins.includes(peerId) && !group.admins.includes(memberId)
+  }
+
+  function banLabel(ban: GroupBan) {
+    if (ban.expiresAtMs === null) return 'Ban permanente'
+    return `Ban fino al ${new Date(ban.expiresAtMs).toLocaleString()}`
+  }
+
+  async function moderateGroup(memberId: string, value: string) {
+    if (!selectedGroupId || !value) return
+    const [action, duration] = value.split(':')
+    if (action === 'permaBan' && !confirm(`Bannare definitivamente ${memberName(memberId)}?`)) return
+    await invoke('node_moderate_group', {
+      groupId: selectedGroupId,
+      peerId: memberId,
+      action,
+      durationMs: duration ? Number(duration) : null,
+    }).catch((error) => showToast(String(error)))
   }
 
   function openConversationDetails() {
@@ -752,7 +842,7 @@
   }
 
   function insertDraftTrigger(trigger: string) {
-    if (!ready) return
+    if (!canSend) return
     insertAtDraftCaret(`${messageText && !messageText.endsWith(' ') ? ' ' : ''}${trigger}`)
     decorateDraftAtCaret()
     insertAtDraftCaret(' ')
@@ -787,7 +877,7 @@
       if (saveProfile) {
         const profile = await invoke<Profile>('profile_save', {
           name: displayName.trim(), avatarPath: null, clearAvatar: false,
-          previewSentImages, previewReceivedImages,
+          previewSentImages, previewReceivedImages, nudgeSound,
         })
         avatarDataUrl = profile.avatarDataUrl || ''
       }
@@ -814,7 +904,7 @@
 
   async function sendMessage() {
     const text = messageText.trim().replace(/\s*\n+\s*/g, ' ')
-    if (!text || !ready || (!selectedPeerId && !selectedGroupId)) return
+    if (!text || !canSend || (!selectedPeerId && !selectedGroupId)) return
     try {
       if (selectedGroupId) await invoke('node_send_group_text', { groupId: selectedGroupId, text })
       else await invoke('node_send_text', { peerId: selectedPeerId, text })
@@ -836,14 +926,36 @@
   }
 
   async function chooseFile() {
-    if (!ready || (!selectedPeerId && !selectedGroupId)) return
+    if (!canSend || (!selectedPeerId && !selectedGroupId)) return
     const selected = await open({ multiple: false, directory: false })
     if (!selected || Array.isArray(selected)) return
     await sendFiles([selected])
   }
 
+  async function cancelFileTransfers() {
+    await invoke('node_cancel_file_transfers').catch((error) => showToast(String(error)))
+  }
+
+  async function answerAttachmentOffer(offer: IncomingAttachmentOffer, accept: boolean) {
+    try {
+      await invoke(accept ? 'node_accept_attachment' : 'node_reject_attachment', {
+        offerId: offer.offerId,
+      })
+      incomingAttachmentOffers = incomingAttachmentOffers.filter((item) => item.offerId !== offer.offerId)
+    } catch (error) {
+      showToast(String(error))
+    }
+  }
+
+  function formatBytes(bytes: number) {
+    if (bytes < 1024) return `${bytes} B`
+    if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`
+    if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`
+    return `${(bytes / 1024 ** 3).toFixed(2)} GB`
+  }
+
   async function sendFiles(paths: string[]) {
-    if (!ready || (!selectedPeerId && !selectedGroupId) || !paths.length) return
+    if (!canSend || (!selectedPeerId && !selectedGroupId) || !paths.length) return
     const targetPeer = selectedPeerId
     const targetGroup = selectedGroupId
     const targetConversation = targetGroup ? `group:${targetGroup}` : targetPeer
@@ -937,7 +1049,7 @@
       showToast('Il file appartiene a una vecchia cronologia e non ha un riferimento all’archivio')
       return
     }
-    if (message.attachmentMime.startsWith('image/')) {
+    if (message.attachmentMime.startsWith('image/') || message.attachmentMime.startsWith('video/')) {
       await invoke('node_read_attachment', {
         id: message.attachmentId, mime: message.attachmentMime,
       }).catch((error) => showToast(String(error)))
@@ -1011,7 +1123,7 @@
     try {
       const profile = await invoke<Profile>('profile_save', {
         name: displayName.trim(), avatarPath, clearAvatar,
-        previewSentImages, previewReceivedImages,
+        previewSentImages, previewReceivedImages, nudgeSound,
       })
       displayName = profile.name
       avatarDataUrl = profile.avatarDataUrl || ''
@@ -1102,10 +1214,42 @@
     showToast('Link contatto copiato')
   }
 
-  function shakeWindow() {
+  async function shakeWindow() {
+    if (appWindow) {
+      try {
+        const origin = await appWindow.outerPosition()
+        for (const offset of [-14, 14, -11, 11, -7, 7, 0]) {
+          await appWindow.setPosition(new PhysicalPosition(origin.x + offset, origin.y))
+          await new Promise((resolve) => window.setTimeout(resolve, 45))
+        }
+        return
+      } catch {
+        // La webview resta il fallback quando il window manager vieta lo spostamento.
+      }
+    }
     const frame = document.querySelector('.app-frame')
     frame?.classList.add('shake')
     window.setTimeout(() => frame?.classList.remove('shake'), 700)
+  }
+
+  function playNudgeSound() {
+    if (!nudgeSound) return
+    try {
+      const context = new AudioContext()
+      const oscillator = context.createOscillator()
+      const gain = context.createGain()
+      oscillator.type = 'square'
+      oscillator.frequency.setValueAtTime(880, context.currentTime)
+      oscillator.frequency.setValueAtTime(660, context.currentTime + 0.09)
+      gain.gain.setValueAtTime(0.05, context.currentTime)
+      gain.gain.exponentialRampToValueAtTime(0.001, context.currentTime + 0.18)
+      oscillator.connect(gain).connect(context.destination)
+      oscillator.start()
+      oscillator.stop(context.currentTime + 0.18)
+      oscillator.onended = () => void context.close()
+    } catch {
+      // Il trillo visivo resta disponibile se l'audio non può partire.
+    }
   }
 
   function showToast(text: string) {
@@ -1330,7 +1474,7 @@
               <h3>Sicurezza</h3>
               <div class="detail-row">
                 <span><ShieldCheck size={18} /></span>
-                <p><strong>Conversazione protetta</strong><small>{ready ? 'Chiavi verificate per questa sessione' : 'Disponibile quando il contatto è online'}</small></p>
+                <p><strong>Conversazione protetta</strong><small>{ready ? 'Canale cifrato; confronta il codice identità' : 'Disponibile quando il contatto è online'}</small></p>
                 <i class:active={ready}></i>
               </div>
               <div class="detail-row">
@@ -1344,8 +1488,9 @@
               </details>
             </section>
             <section class="detail-section identity-detail">
-              <h3>La tua identità</h3>
-              <code>{peerId || 'Disponibile dopo l’avvio'}</code>
+              <h3>{activeContact ? 'Codice identità del contatto' : 'La tua identità'}</h3>
+              <code>{activeContact?.fingerprint || ownFingerprint || 'Disponibile dopo l’avvio'}</code>
+              <small>Confrontalo a voce o tramite il QR prima di considerare verificata l’identità.</small>
               <button disabled={!running || linkRequested} onclick={openContacts}><QrCode size={15} /> Mostra QR e link</button>
             </section>
             {#if activeContact}
@@ -1360,7 +1505,40 @@
             {#if activeGroup}
               <section class="detail-section group-management">
                 <h3>Partecipanti</h3>
-                <ul>{#each activeGroup.members as member}<li>{memberName(member)}</li>{/each}</ul>
+                <ul>
+                  {#each activeGroup.members as member}
+                    {@const ban = memberBan(activeGroup, member)}
+                    <li class="group-member-row">
+                      <span class="group-member-copy">
+                        <strong>{memberName(member)}</strong>
+                        <small>
+                          <b>{memberRole(activeGroup, member)}</b>
+                          {#if activeGroup.silenced.includes(member)}<i>Silenziato</i>{/if}
+                          {#if ban}<i class="ban-status">{banLabel(ban)}</i>{/if}
+                        </small>
+                      </span>
+                      {#if canModerateMember(activeGroup, member)}
+                        <select aria-label={`Gestisci ${memberName(member)}`} value="" onchange={(event) => moderateGroup(member, event.currentTarget.value)}>
+                          <option value="">Gestisci…</option>
+                          {#if peerId === activeGroup.ownerPeerId}
+                            <option value={activeGroup.admins.includes(member) ? 'member' : 'admin'}>{activeGroup.admins.includes(member) ? 'Rendi membro' : 'Rendi amministratore'}</option>
+                          {/if}
+                          {#if !activeGroup.admins.includes(member)}
+                            {#if ban}
+                              <option value="unban">Rimuovi ban</option>
+                            {:else}
+                              <option value={activeGroup.silenced.includes(member) ? 'unsilence' : 'silence'}>{activeGroup.silenced.includes(member) ? 'Rimuovi silence' : 'Silenzia'}</option>
+                              <option value="tempBan:3600000">Ban per 1 ora</option>
+                              <option value="tempBan:86400000">Ban per 24 ore</option>
+                              <option value="tempBan:604800000">Ban per 7 giorni</option>
+                              <option value="permaBan">Ban permanente</option>
+                            {/if}
+                          {/if}
+                        </select>
+                      {/if}
+                    </li>
+                  {/each}
+                </ul>
                 <button onclick={clearGroupConversation}><Trash2 size={14} /> Elimina cronologia</button>
                 <button class="danger-button" onclick={deleteChatGroup}><Trash2 size={14} /> Rimuovi chat dal dispositivo</button>
               </section>
@@ -1414,22 +1592,26 @@
         {/if}
 
         <div class="chat-toolbar" aria-label="Strumenti conversazione">
-          <button class:active={emojiOpen} disabled={!ready} onclick={() => emojiOpen = !emojiOpen}><Smile size={18} /><span>Emoticon</span></button>
+          <button class:active={emojiOpen} disabled={!canSend} onclick={() => emojiOpen = !emojiOpen}><Smile size={18} /><span>Emoticon</span></button>
           <button class="nudge-tool" disabled={!ready || !!activeGroup} onclick={sendNudge}><Zap size={18} /><span>Trillo</span></button>
-          <button disabled={!ready || fileSending} onclick={chooseFile}><Paperclip size={18} /><span>{fileSending ? 'Invio…' : 'Invia file'}</span></button>
+          <button disabled={!canSend || fileSending} onclick={chooseFile}><Paperclip size={18} /><span>{fileSending ? 'Invio…' : 'Invia file'}</span></button>
+          {#if fileSending}<button class="danger-item" onclick={cancelFileTransfers}><X size={18} /><span>Annulla</span></button>{/if}
         </div>
+        {#if fileSending && transferFilename}
+          <div class="transfer-progress"><span>{transferFilename}</span><progress max="100" value={transferProgress}></progress><strong>{transferProgress}%</strong></div>
+        {/if}
         <form class="composer" onsubmit={(event) => { event.preventDefault(); void sendMessage() }}>
           <div
             bind:this={messageEditor}
             class="message-editor"
-            class:disabled={!ready}
-            contenteditable={ready}
+            class:disabled={!canSend}
+            contenteditable={canSend}
             role="textbox"
-            tabindex={ready ? 0 : -1}
+            tabindex={canSend ? 0 : -1}
             aria-label="Messaggio"
             aria-multiline="true"
-            aria-disabled={!ready}
-            data-placeholder={ready ? `Scrivi a ${activeGroup?.name || activeContact?.name}…` : activeGroup ? 'Nessun partecipante è disponibile.' : activeContact ? 'Il contatto non è disponibile.' : 'Scegli una conversazione per scrivere.'}
+            aria-disabled={!canSend}
+            data-placeholder={!groupCanSend ? 'Non puoi scrivere: sei silenziato o bannato.' : ready ? `Scrivi a ${activeGroup?.name || activeContact?.name}…` : activeGroup ? 'Nessun partecipante è disponibile.' : activeContact ? 'Il contatto non è disponibile.' : 'Scegli una conversazione per scrivere.'}
             oninput={syncDraft}
             onpaste={pasteDraft}
             ondrop={(event) => event.preventDefault()}
@@ -1443,11 +1625,11 @@
               }
             }}
           ></div>
-          <button type="submit" class="send-button" disabled={!ready || !messageText.trim()}><Send size={17} /> Invia</button>
+          <button type="submit" class="send-button" disabled={!canSend || !messageText.trim()}><Send size={17} /> Invia</button>
         </form>
         <small class="composer-hint">Invio per spedire · Maiusc+Invio per andare a capo</small>
       </footer>
-      {#if fileDropActive && ready}
+      {#if fileDropActive && canSend}
         <div class="file-drop-overlay"><Paperclip size={28} /><strong>Rilascia per inviare</strong><small>File e immagini, massimo 5 GB ciascuno</small></div>
       {/if}
     </section>
@@ -1464,10 +1646,30 @@
   </div>
 {/if}
 
-{#if imagePreview}
-  <div class="modal-backdrop image-viewer" role="dialog" aria-modal="true" aria-label="Anteprima immagine" tabindex="-1">
-    <button aria-label="Chiudi anteprima" onclick={() => imagePreview = ''}><X size={20} /></button>
-    <img src={imagePreview} alt="Immagine ricevuta" />
+{#if mediaPreview}
+  <div class="modal-backdrop image-viewer" role="dialog" aria-modal="true" aria-label="Anteprima allegato" tabindex="-1">
+    <button aria-label="Chiudi anteprima" onclick={() => mediaPreview = ''}><X size={20} /></button>
+    {#if mediaPreview.startsWith('data:video/')}
+      <!-- svelte-ignore a11y_media_has_caption i file ricevuti non includono una traccia sottotitoli separata -->
+      <video src={mediaPreview} controls autoplay aria-label="Video ricevuto"></video>
+    {:else}
+      <img src={mediaPreview} alt="Immagine ricevuta" />
+    {/if}
+  </div>
+{/if}
+
+{#if incomingAttachmentOffers[0]}
+  {@const offer = incomingAttachmentOffers[0]}
+  <div class="modal-backdrop">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="attachment-offer-title">
+      <p class="step-label">File in arrivo</p>
+      <h2 id="attachment-offer-title">Vuoi ricevere {offer.filename}?</h2>
+      <p>{contacts.find((contact) => contact.peerId === offer.peerId)?.name || 'Un contatto'} vuole inviarti un file da {formatBytes(offer.size)}.</p>
+      <div class="modal-actions">
+        <button class="secondary-button" onclick={() => answerAttachmentOffer(offer, false)}>Rifiuta</button>
+        <button class="primary-button" onclick={() => answerAttachmentOffer(offer, true)}>Accetta</button>
+      </div>
+    </div>
   </div>
 {/if}
 
@@ -1607,9 +1809,10 @@
         {#if avatarDataUrl}<button class="secondary-button" onclick={() => saveProfile(null, true)}>Rimuovi</button>{/if}
       </div>
       <fieldset class="preview-settings">
-        <legend>Anteprime immagini</legend>
+        <legend>Media e trilli</legend>
         <label><span><strong>Immagini inviate</strong><small>Mostrale appena premi invio</small></span><input type="checkbox" bind:checked={previewSentImages} /></label>
         <label><span><strong>Immagini ricevute</strong><small>Mostrale senza doverle aprire</small></span><input type="checkbox" bind:checked={previewReceivedImages} /></label>
+        <label><span><strong>Suono del trillo</strong><small>Riproduci un avviso quando ricevi un trillo</small></span><input type="checkbox" bind:checked={nudgeSound} /></label>
       </fieldset>
       <button class="primary-button wide" disabled={!displayName.trim()} onclick={() => saveProfile()}>Salva profilo</button>
     </div>

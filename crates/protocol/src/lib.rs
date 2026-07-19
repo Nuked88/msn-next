@@ -35,7 +35,20 @@ pub struct GroupDefinition {
     pub name: String,
     pub owner_peer: String,
     pub members: Vec<String>,
+    #[serde(default)]
+    pub admins: Vec<String>,
+    #[serde(default)]
+    pub silenced: Vec<String>,
+    #[serde(default)]
+    pub bans: Vec<GroupBan>,
     pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupBan {
+    pub peer_id: String,
+    /// `None` indica un ban permanente.
+    pub expires_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

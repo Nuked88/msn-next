@@ -2,6 +2,7 @@ use chacha20poly1305::{
     aead::{rand_core::RngCore, Aead, OsRng},
     KeyInit, XChaCha20Poly1305, XNonce,
 };
+use msnnext_protocol::GroupBan;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fs, path::Path};
@@ -31,6 +32,12 @@ pub struct GroupChatEntry {
     pub name: String,
     pub owner_peer: String,
     pub members: Vec<String>,
+    #[serde(default)]
+    pub admins: Vec<String>,
+    #[serde(default)]
+    pub silenced: Vec<String>,
+    #[serde(default)]
+    pub bans: Vec<GroupBan>,
     pub revision: u64,
 }
 
@@ -414,6 +421,9 @@ mod tests {
             name: "Segreto gruppo".into(),
             owner_peer: "owner".into(),
             members: vec!["owner".into(), "alice".into(), "bob".into()],
+            admins: Vec::new(),
+            silenced: Vec::new(),
+            bans: Vec::new(),
             revision: 1,
         };
         {
