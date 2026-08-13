@@ -1,0 +1,8 @@
+.git
+.msnnext
+target
+target-smoke
+apps/desktop/node_modules
+apps/desktop/dist
+output
+
