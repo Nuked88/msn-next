@@ -70,7 +70,7 @@ jobs:
           APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && '-' || '' }}
         with:
           projectPath: apps/desktop
-          tauriScript: npm run tauri --
+          tauriScript: npm run tauri
           args: ${{ matrix.bundles }}
 
       - name: Upload bundle
