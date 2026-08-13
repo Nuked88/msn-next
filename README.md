@@ -183,6 +183,12 @@ Produce il binario release, un pacchetto DEB e un'AppImage. Va eseguito direttam
 
 Le release Windows e Linux vanno costruite sui rispettivi sistemi operativi. Android non è ancora incluso: richiede l'inizializzazione del progetto mobile Tauri e l'adattamento delle funzionalità desktop native.
 
+### Build multipiattaforma su GitHub
+
+Il workflow `Build release bundles` compila NSIS su Windows, DEB/AppImage su Linux e un DMG universale Intel/Apple Silicon su macOS. Parte sulle pull request oppure manualmente dalla scheda **Actions** e conserva i pacchetti come artifact della run, senza pubblicare una GitHub Release.
+
+La versione dell'app segue SemVer ed è definita una sola volta in `apps/desktop/package.json`; Tauri la legge da quel file. Finché il progetto è alpha: `0.x.0` per nuove funzionalità o cambi incompatibili e `0.x.y` per correzioni compatibili. Le release future useranno tag Git `v0.x.y`.
+
 ## Definizione di “usabile”
 
 msnnext non sarà considerato usabile finché due persone non potranno, senza riavvii manuali:
