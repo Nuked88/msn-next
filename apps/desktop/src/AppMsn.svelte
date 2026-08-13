@@ -167,6 +167,7 @@
   ]
 
   const appWindow = isTauri() ? getCurrentWindow() : null
+  const securityIntroKey = 'msnnext-security-intro-v1'
 
   function dragWindow(event: MouseEvent) {
     if (event.button === 0 && !(event.target as HTMLElement).closest('button')) void appWindow?.startDragging()
@@ -201,6 +202,8 @@
   let starting = false
   let setupOpen = true
   let profileOpen = false
+  let securityIntroOpen = typeof localStorage !== 'undefined'
+    && localStorage.getItem(securityIntroKey) !== 'seen'
   let avatarDataUrl = ''
   let previewSentImages = true
   let previewReceivedImages = false
@@ -331,6 +334,11 @@
     theme = next
     localStorage.setItem('msnnext-theme', next)
     applyTheme()
+  }
+
+  function closeSecurityIntro() {
+    localStorage.setItem(securityIntroKey, 'seen')
+    securityIntroOpen = false
   }
 
   function handleEvent(event: ClientEvent) {
@@ -750,7 +758,7 @@
     return index
   }
 
-  function messageParts(message: ChatMessage): MessagePart[] {
+  function messageParts(message: ChatMessage, availableEmoticons: ClientEmoticon[]): MessagePart[] {
     if (!message.emoticons.length) return builtinMessageParts(message.body)
     const parts: MessagePart[] = []
     let cursor = 0
@@ -759,8 +767,7 @@
       const end = textIndexAtByteOffset(message.body, span.end)
       if (start < cursor || end <= start) continue
       parts.push(...builtinMessageParts(message.body.slice(cursor, start)))
-      const custom = [...customEmoticons, ...offeredEmoticons]
-        .find((item) => item.assetId === span.assetId)
+      const custom = availableEmoticons.find((item) => item.assetId === span.assetId)
       parts.push(custom
         ? { text: message.body.slice(start, end), custom }
         : { text: message.body.slice(start, end) })
@@ -1445,7 +1452,7 @@
                     </button>
                   {:else}
                     <p>
-                      {#each messageParts(message) as part}
+                      {#each messageParts(message, [...customEmoticons, ...offeredEmoticons]) as part}
                         {#if part.custom}
                           <img class="custom-inline-emoticon" src={part.custom.dataUrl} alt={part.custom.name} title={`${part.custom.name} (${part.custom.trigger})`} />
                         {:else if part.emoticon}
@@ -1814,7 +1821,52 @@
         <label><span><strong>Immagini ricevute</strong><small>Mostrale senza doverle aprire</small></span><input type="checkbox" bind:checked={previewReceivedImages} /></label>
         <label><span><strong>Suono del trillo</strong><small>Riproduci un avviso quando ricevi un trillo</small></span><input type="checkbox" bind:checked={nudgeSound} /></label>
       </fieldset>
+      <section class="settings-emoticons">
+        <header>
+          <span><strong>Emoticon personali</strong><small>Disponibili anche quando i contatti sono offline</small></span>
+          <button class="secondary-button" onclick={chooseEmoticonFile}><Plus size={14} /> Crea</button>
+        </header>
+        {#if customEmoticons.length}
+          <div class="emoji-grid custom-emoji-grid">
+            {#each customEmoticons as item (item.assetId)}
+              <button aria-label={`Modifica ${item.name}`} title="Modifica o elimina" onclick={() => openSaveEmoticon(item)}>
+                <img src={item.dataUrl} alt="" /><small>{item.trigger}</small>
+              </button>
+            {/each}
+          </div>
+        {:else}
+          <p>Non hai ancora creato emoticon.</p>
+        {/if}
+        {#if offeredEmoticons.length}
+          <small class="emoji-section-label">Ricevute da salvare</small>
+          <div class="received-emoji-list">
+            {#each offeredEmoticons as item (item.assetId)}
+              <div><img src={item.dataUrl} alt={item.name} /><span><strong>{item.name}</strong><small>{item.trigger}</small></span><button onclick={() => openSaveEmoticon(item)}>Salva</button></div>
+            {/each}
+          </div>
+        {/if}
+      </section>
+      <button class="security-reopen" onclick={() => securityIntroOpen = true}><ShieldCheck size={15} /> Come msnnext protegge i tuoi dati</button>
       <button class="primary-button wide" disabled={!displayName.trim()} onclick={() => saveProfile()}>Salva profilo</button>
+    </div>
+  </div>
+{/if}
+
+{#if securityIntroOpen}
+  <div class="modal-backdrop security-intro-backdrop">
+    <div class="modal security-intro-modal" role="dialog" aria-modal="true" aria-labelledby="security-intro-title">
+      <div class="modal-heading">
+        <span><ShieldCheck size={24} /></span>
+        <div><p class="step-label">Prima di iniziare</p><h2 id="security-intro-title">Quanto è sicuro msnnext?</h2></div>
+      </div>
+      <p class="security-intro-lead">È progettato per proteggere conversazioni e file senza affidarli a un server centrale.</p>
+      <ul class="security-intro-list">
+        <li><LockKeyhole size={18} /><span><strong>Cifratura tra dispositivi</strong><small>Messaggi, trilli e file sono cifrati con XChaCha20-Poly1305; eventuali nodi di inoltro non possono leggerne il contenuto.</small></span></li>
+        <li><Sparkles size={18} /><span><strong>Protezione ibrida post-quantum</strong><small>Lo scambio delle chiavi combina X25519 e ML-KEM-768: se una delle due protezioni resta sicura, la sessione resta protetta.</small></span></li>
+        <li><ShieldCheck size={18} /><span><strong>Dati locali protetti</strong><small>Cronologia e allegati ricevuti sono cifrati sul dispositivo; la chiave d’identità è custodita dal sistema operativo.</small></span></li>
+      </ul>
+      <div class="security-caveat"><Info size={16} /><p><strong>Nessun software è sicuro al 100%.</strong> L’indirizzo IP e gli orari delle connessioni possono essere visibili ai partecipanti; questa versione è ancora in sviluppo e non ha ricevuto un audit indipendente.</p></div>
+      <button class="primary-button wide" onclick={closeSecurityIntro}>Ho capito, iniziamo</button>
     </div>
   </div>
 {/if}
