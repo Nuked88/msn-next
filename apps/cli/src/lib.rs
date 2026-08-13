@@ -60,6 +60,8 @@ const MAX_PENDING_INBOUND_OFFERS: usize = 8;
 const ATTACHMENT_DECISION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const RELAY_MAX_CIRCUIT_BYTES: u64 = attachments::MAX_FILE_BYTES + 64 * 1024 * 1024;
 const RELAY_MAX_CIRCUIT_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
+const DEFAULT_RELAY_ADDRESS: &str =
+    "/ip4/173.212.233.151/tcp/4001/p2p/12D3KooWCQBCLXYhjkhay3hXTrhrNF8ZjRLd8qHL2nD2iufais4k";
 
 #[derive(Debug)]
 pub enum ClientCommand {
@@ -140,6 +142,11 @@ pub enum ClientCommand {
     RejectAttachment {
         offer_id: u64,
     },
+    SetNotificationMute {
+        conversation: String,
+        muted: bool,
+        until_ms: Option<u64>,
+    },
     RequestContactLink,
     UpdateDisplayName {
         name: String,
@@ -171,6 +178,7 @@ impl ClientCommand {
             | Self::CancelFileTransfers
             | Self::AcceptAttachment { .. }
             | Self::RejectAttachment { .. }
+            | Self::SetNotificationMute { .. }
             | Self::ImportContactLink { .. }
             | Self::RequestContactLink
             | Self::UpdateDisplayName { .. }
@@ -422,6 +430,7 @@ struct Incoming<'a> {
     attachments: &'a mut Receiver,
     history: &'a History,
     notifications: bool,
+    notification_mutes: &'a HashMap<String, Option<u64>>,
     peer_names: &'a mut HashMap<PeerId, String>,
     local_peer_id: PeerId,
     incoming_attachments: &'a mut HashMap<(PeerId, [u8; 32]), HashSet<Option<String>>>,
@@ -608,6 +617,7 @@ pub async fn run(
     let mut triggers = load_triggers(&args.emotes)?;
     let mut nudge_limits = HashMap::<PeerId, NudgeRateLimit>::new();
     let mut incoming_nudge_limits = HashMap::<PeerId, NudgeRateLimit>::new();
+    let mut notification_mutes = HashMap::<String, Option<u64>>::new();
     let mut sent_numbers = HashMap::<PeerId, u64>::new();
     let mut pending_offers = HashMap::<request_response::OutboundRequestId, PendingOffer>::new();
     let mut pending_transfers =
@@ -949,6 +959,13 @@ pub async fn run(
                             &mut sent_numbers,
                             ChatEvent::Presence(PresenceUpdate { display_name: display_name.clone(), online: true }),
                         );
+                    }
+                }
+                Some(ClientCommand::SetNotificationMute { conversation, muted, until_ms }) => {
+                    if muted {
+                        notification_mutes.insert(conversation, until_ms);
+                    } else {
+                        notification_mutes.remove(&conversation);
                     }
                 }
                 Some(ClientCommand::ImportContactLink { link }) => {
@@ -1529,6 +1546,7 @@ pub async fn run(
                         attachments: &mut attachment_receiver,
                         history: &history,
                         notifications: args.notifications,
+                        notification_mutes: &notification_mutes,
                         peer_names: &mut peer_names,
                         local_peer_id,
                         incoming_attachments: &mut incoming_attachments,
@@ -1678,6 +1696,7 @@ pub async fn run(
                                     attachments: &mut attachment_receiver,
                                     history: &history,
                                     notifications: args.notifications,
+                                    notification_mutes: &notification_mutes,
                                     peer_names: &mut peer_names,
                                     local_peer_id,
                                     incoming_attachments: &mut incoming_attachments,
@@ -1806,6 +1825,7 @@ pub async fn run(
                                         attachments: &mut attachment_receiver,
                                         history: &history,
                                         notifications: args.notifications,
+                                        notification_mutes: &notification_mutes,
                                         peer_names: &mut peer_names,
                                         local_peer_id,
                                         incoming_attachments: &mut incoming_attachments,
@@ -2674,7 +2694,11 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                 message.emoticons.len()
             );
             record_text(context.history, &peer, "in", message);
-            notify(context.notifications, "Nuovo messaggio", &message.text);
+            notify(
+                notification_allowed(context, &format!("peer:{peer}")),
+                "Nuovo messaggio",
+                &message.text,
+            );
             ProtocolResponse::Ack
         }
         ChatEvent::GroupDefinition(definition) => {
@@ -2736,7 +2760,7 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
             }
             if existing.is_none() {
                 let _ = context.events.send(ClientEvent::GroupConversationLoaded {
-                    group_id: id,
+                    group_id: id.clone(),
                     messages: Vec::new(),
                 });
             }
@@ -2770,7 +2794,7 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
             }
             let _ = context.events.send(ClientEvent::GroupMessage {
                 message: ClientGroupMessage {
-                    group_id: id,
+                    group_id: id.clone(),
                     sender_peer_id: peer.to_string(),
                     direction: "in".into(),
                     kind: "text".into(),
@@ -2791,7 +2815,7 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                 },
             });
             notify(
-                context.notifications,
+                notification_allowed(context, &format!("group:{id}")),
                 &group.name,
                 &group_message.message.text,
             );
@@ -2857,7 +2881,11 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
             Ok(()) => {
                 println!("{peer}: *** TRILLO ***");
                 record(context.history, &peer, "in", "nudge", "trillo");
-                notify(context.notifications, "Trillo", "Hai ricevuto un trillo");
+                notify(
+                    notification_allowed(context, &format!("peer:{peer}")),
+                    "Trillo",
+                    "Hai ricevuto un trillo",
+                );
                 ProtocolResponse::Ack
             }
             Err(_) => {
@@ -2900,7 +2928,11 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                     );
                     if let Some(completed) = completed {
                         println!("{peer}: file già presente nell'archivio cifrato");
-                        notify(context.notifications, "File ricevuto", &manifest.filename);
+                        notify(
+                            notification_allowed(context, &format!("peer:{peer}")),
+                            "File ricevuto",
+                            &manifest.filename,
+                        );
                         emit_attachment_received(context.events, peer, None, &completed);
                     } else {
                         context
@@ -2917,11 +2949,17 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
         ChatEvent::AttachmentChunk(chunk) => match context.attachments.accept_chunk(chunk) {
             Ok(Some(completed)) => {
                 println!("{peer}: file ricevuto nell'archivio cifrato");
-                notify(context.notifications, "File ricevuto", &completed.filename);
                 let destinations = context
                     .incoming_attachments
                     .remove(&(peer, completed.id))
                     .unwrap_or_else(|| HashSet::from([None]));
+                let should_notify = destinations.iter().any(|group_id| {
+                    let conversation = group_id
+                        .as_ref()
+                        .map_or_else(|| format!("peer:{peer}"), |id| format!("group:{id}"));
+                    notification_allowed(context, &conversation)
+                });
+                notify(should_notify, "File ricevuto", &completed.filename);
                 for group_id in destinations {
                     emit_attachment_received(context.events, peer, group_id, &completed);
                 }
@@ -2942,6 +2980,23 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
             );
             ProtocolResponse::Ack
         }
+    }
+}
+
+fn notification_allowed(context: &Incoming<'_>, conversation: &str) -> bool {
+    context.notifications
+        && notification_mute_allows(context.notification_mutes, conversation, now_ms())
+}
+
+fn notification_mute_allows(
+    mutes: &HashMap<String, Option<u64>>,
+    conversation: &str,
+    timestamp_ms: u64,
+) -> bool {
+    match mutes.get(conversation) {
+        None => true,
+        Some(None) => false,
+        Some(Some(until_ms)) => timestamp_ms >= *until_ms,
     }
 }
 
@@ -3640,16 +3695,12 @@ impl ClientConfig {
         if name.trim().is_empty() || name.len() > 64 {
             return Err("nome non valido".into());
         }
-        let relays = relay
+        let relay = relay
             .filter(|address| !address.trim().is_empty())
-            .map(|address| address.parse::<Multiaddr>())
-            .transpose()?
-            .into_iter()
-            .map(|address| {
-                split_peer_address(&address)?;
-                Ok(address)
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+            .unwrap_or_else(|| DEFAULT_RELAY_ADDRESS.to_owned())
+            .parse::<Multiaddr>()?;
+        split_peer_address(&relay)?;
+        let relays = vec![relay];
         Ok(Self {
             listen: "/ip4/0.0.0.0/udp/0/quic-v1".parse()?,
             listen_tcp: "/ip4/0.0.0.0/tcp/0".parse()?,
@@ -4411,6 +4462,8 @@ mod tests {
 
     #[test]
     fn desktop_relay_is_used_for_bootstrap_and_fallback() {
+        let default =
+            ClientConfig::desktop("Alice".into(), std::env::temp_dir(), None, None).unwrap();
         let relay_peer = PeerId::from(Keypair::generate_ed25519().public());
         let relay = format!("/dns4/relay.example.com/tcp/4001/p2p/{relay_peer}");
         let config = ClientConfig::desktop(
@@ -4421,6 +4474,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(default.relays, vec![DEFAULT_RELAY_ADDRESS.parse().unwrap()]);
         assert_eq!(config.bootstrap, vec![relay.parse().unwrap()]);
         assert_eq!(config.relays, config.bootstrap);
         assert!(ClientConfig::desktop(
@@ -4446,5 +4500,18 @@ mod tests {
             contact_addresses(&swarm, &[relay], *swarm.local_peer_id()).first(),
             Some(&expected_route)
         );
+    }
+
+    #[test]
+    fn notification_mutes_expire_or_remain_permanent() {
+        let mutes = HashMap::from([
+            ("peer:temporary".to_owned(), Some(200)),
+            ("group:permanent".to_owned(), None),
+        ]);
+
+        assert!(!notification_mute_allows(&mutes, "peer:temporary", 199));
+        assert!(notification_mute_allows(&mutes, "peer:temporary", 200));
+        assert!(!notification_mute_allows(&mutes, "group:permanent", 999));
+        assert!(notification_mute_allows(&mutes, "peer:other", 0));
     }
 }

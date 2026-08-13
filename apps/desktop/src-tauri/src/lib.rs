@@ -47,6 +47,8 @@ struct StoredProfile {
     nudge_sound: bool,
     #[serde(default)]
     relay_address: String,
+    #[serde(default = "default_font_scale")]
+    font_scale: u16,
 }
 
 #[derive(Serialize)]
@@ -58,6 +60,7 @@ struct ProfileView {
     preview_received_images: bool,
     nudge_sound: bool,
     relay_address: String,
+    font_scale: u16,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -69,6 +72,14 @@ struct StoredIdentity {
 
 fn enabled_by_default() -> bool {
     true
+}
+
+fn default_font_scale() -> u16 {
+    125
+}
+
+fn valid_font_scale(value: u16) -> bool {
+    matches!(value, 100 | 115 | 125 | 140)
 }
 
 fn profile_view(data_dir: &Path, profile: StoredProfile) -> Result<ProfileView, String> {
@@ -88,6 +99,7 @@ fn profile_view(data_dir: &Path, profile: StoredProfile) -> Result<ProfileView, 
         preview_received_images: profile.preview_received_images,
         nudge_sound: profile.nudge_sound,
         relay_address: profile.relay_address,
+        font_scale: profile.font_scale,
     })
 }
 
@@ -349,6 +361,32 @@ fn node_send_nudge(state: State<'_, NodeState>, peer_id: String) -> Result<(), S
         &state,
         ClientCommand::SendNudge {
             peer: parse_peer(&peer_id)?,
+        },
+    )
+}
+
+#[tauri::command]
+fn node_set_notification_mute(
+    state: State<'_, NodeState>,
+    conversation: String,
+    muted: bool,
+    until_ms: Option<u64>,
+) -> Result<(), String> {
+    let valid = conversation
+        .strip_prefix("peer:")
+        .is_some_and(|peer| parse_peer(peer).is_ok())
+        || conversation.strip_prefix("group:").is_some_and(|group| {
+            group.len() == 32 && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+    if !valid {
+        return Err("conversazione non valida".into());
+    }
+    send_command(
+        &state,
+        ClientCommand::SetNotificationMute {
+            conversation,
+            muted,
+            until_ms,
         },
     )
 }
@@ -640,6 +678,7 @@ fn profile_save(
     preview_received_images: Option<bool>,
     nudge_sound: Option<bool>,
     relay_address: Option<String>,
+    font_scale: Option<u16>,
 ) -> Result<ProfileView, String> {
     let name = name.trim();
     if name.is_empty() || name.len() > 64 {
@@ -667,6 +706,12 @@ fn profile_save(
     let nudge_sound = nudge_sound
         .or_else(|| previous.as_ref().map(|profile| profile.nudge_sound))
         .unwrap_or(true);
+    let font_scale = font_scale
+        .or_else(|| previous.as_ref().map(|profile| profile.font_scale))
+        .unwrap_or_else(default_font_scale);
+    if !valid_font_scale(font_scale) {
+        return Err("dimensione testo non valida".into());
+    }
     let relay_address = relay_address
         .or_else(|| {
             previous
@@ -713,6 +758,7 @@ fn profile_save(
         preview_received_images: received_previews,
         nudge_sound,
         relay_address,
+        font_scale,
     };
     std::fs::write(
         &profile_path,
@@ -780,6 +826,7 @@ pub fn run() {
             node_start,
             node_send_text,
             node_send_nudge,
+            node_set_notification_mute,
             node_send_file,
             node_cancel_file_transfers,
             node_accept_attachment,
@@ -820,6 +867,13 @@ mod tests {
     #[test]
     fn typed_commands_reject_invalid_peer_ids() {
         assert!(parse_peer("non-un-peer-id").is_err());
+    }
+
+    #[test]
+    fn font_scale_accepts_only_ui_choices() {
+        assert!(valid_font_scale(100));
+        assert!(valid_font_scale(140));
+        assert!(!valid_font_scale(99));
     }
 
     #[test]

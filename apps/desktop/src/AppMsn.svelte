@@ -2,13 +2,15 @@
   import { invoke, isTauri } from '@tauri-apps/api/core'
   import { listen, type UnlistenFn } from '@tauri-apps/api/event'
   import { getCurrentWebview } from '@tauri-apps/api/webview'
-  import { getCurrentWindow } from '@tauri-apps/api/window'
+  import { getCurrentWindow, UserAttentionType } from '@tauri-apps/api/window'
+  import { Image } from '@tauri-apps/api/image'
   import { PhysicalPosition } from '@tauri-apps/api/dpi'
   import { open, save } from '@tauri-apps/plugin-dialog'
   import QRCode from 'qrcode'
   import { onMount, tick } from 'svelte'
   import {
     Activity,
+    BellOff,
     Copy,
     ExternalLink,
     Info,
@@ -154,6 +156,7 @@
     previewReceivedImages: boolean
     nudgeSound: boolean
     relayAddress: string
+    fontScale: number
   }
 
   const emoticons: Emoticon[] = [
@@ -169,6 +172,19 @@
 
   const appWindow = isTauri() ? getCurrentWindow() : null
   const securityIntroKey = 'msnnext-security-intro-v1'
+  const notificationMutesKey = 'msnnext-notification-mutes-v1'
+
+  function loadNotificationMutes() {
+    if (typeof localStorage === 'undefined') return {} as Record<string, number>
+    try {
+      const parsed = JSON.parse(localStorage.getItem(notificationMutesKey) || '{}') as Record<string, unknown>
+      return Object.fromEntries(Object.entries(parsed).filter(([, until]) =>
+        typeof until === 'number' && (until === -1 || until > Date.now())
+      )) as Record<string, number>
+    } catch {
+      return {} as Record<string, number>
+    }
+  }
 
   function dragWindow(event: MouseEvent) {
     if (event.button === 0 && !(event.target as HTMLElement).closest('button')) void appWindow?.startDragging()
@@ -210,6 +226,7 @@
   let previewSentImages = true
   let previewReceivedImages = false
   let nudgeSound = true
+  let fontScale = 125
   let connectOpen = false
   let detailsOpen = false
   let emojiOpen = false
@@ -232,6 +249,7 @@
   let groupName = ''
   let groupMemberIds: string[] = []
   let contextPeerId = ''
+  let contextGroupId = ''
   let contextX = 0
   let contextY = 0
   let fileDropActive = false
@@ -244,6 +262,10 @@
   let toastTimer: ReturnType<typeof setTimeout>
   let messageList: HTMLDivElement
   let messageEditor: HTMLDivElement
+  let windowFocused = true
+  let notificationMutes = loadNotificationMutes()
+  let overlayIcon: Image | undefined
+  let taskbarUpdate = 0
 
   $: activeContact = contacts.find((contact) => contact.peerId === selectedPeerId)
   $: activeGroup = chatGroups.find((group) => group.id === selectedGroupId)
@@ -264,6 +286,10 @@
   $: groupCanSend = !activeGroup
     || (!activeGroup.silenced.includes(peerId) && !memberBan(activeGroup, peerId))
   $: canSend = ready && groupCanSend
+  $: totalUnread = contacts.reduce((total, contact) => total + contact.unread, 0)
+    + chatGroups.reduce((total, group) => total + group.unread, 0)
+  $: void updateTaskbarBadge(totalUnread)
+  $: if (typeof document !== 'undefined') document.documentElement.dataset.fontScale = String(fontScale)
 
   onMount(() => {
     const media = window.matchMedia('(prefers-color-scheme: dark)')
@@ -275,9 +301,20 @@
 
     let unlisten: UnlistenFn | undefined
     let unlistenDrop: UnlistenFn | undefined
+    let unlistenFocus: UnlistenFn | undefined
     const blockNativeMenu = (event: MouseEvent) => event.preventDefault()
     window.addEventListener('contextmenu', blockNativeMenu)
     if (isTauri()) void initializeApp().then((stop) => unlisten = stop)
+    if (appWindow) {
+      void appWindow.isFocused().then((focused) => windowFocused = focused)
+      void appWindow.onFocusChanged(({ payload: focused }) => {
+        windowFocused = focused
+        if (focused) {
+          markActiveConversationRead()
+          void appWindow.requestUserAttention(null)
+        }
+      }).then((stop) => unlistenFocus = stop)
+    }
     if (isTauri()) void getCurrentWebview().onDragDropEvent((event) => {
       fileDropActive = event.payload.type === 'enter' || event.payload.type === 'over'
       if (event.payload.type === 'drop') void sendFiles(event.payload.paths)
@@ -287,6 +324,7 @@
     return () => {
       unlisten?.()
       unlistenDrop?.()
+      unlistenFocus?.()
       window.removeEventListener('contextmenu', blockNativeMenu)
       media.removeEventListener('change', syncSystemTheme)
     }
@@ -314,6 +352,7 @@
       previewReceivedImages = profile.previewReceivedImages
       nudgeSound = profile.nudgeSound
       relayAddress = profile.relayAddress
+      fontScale = profile.fontScale
       const isRunning = await invoke<boolean>('node_status')
       running = isRunning
       setupOpen = false
@@ -337,6 +376,108 @@
     theme = next
     localStorage.setItem('msnnext-theme', next)
     applyTheme()
+  }
+
+  function peerConversationKey(peer: string) {
+    return `peer:${peer}`
+  }
+
+  function groupConversationKey(group: string) {
+    return `group:${group}`
+  }
+
+  function isConversationMuted(conversation: string) {
+    const until = notificationMutes[conversation]
+    return until === -1 || until > Date.now()
+  }
+
+  function markActiveConversationRead() {
+    if (selectedPeerId) {
+      contacts = contacts.map((contact) =>
+        contact.peerId === selectedPeerId ? { ...contact, unread: 0 } : contact
+      )
+    } else if (selectedGroupId) {
+      chatGroups = chatGroups.map((group) =>
+        group.id === selectedGroupId ? { ...group, unread: 0 } : group
+      )
+    }
+  }
+
+  async function muteConversation(conversation: string, durationMs: number | null) {
+    const until = durationMs === null ? -1 : Date.now() + durationMs
+    notificationMutes = { ...notificationMutes, [conversation]: until }
+    localStorage.setItem(notificationMutesKey, JSON.stringify(notificationMutes))
+    closeContextMenu()
+    if (running) await invoke('node_set_notification_mute', {
+      conversation,
+      muted: true,
+      untilMs: until === -1 ? null : until,
+    }).catch((error) => showToast(String(error)))
+    showToast(durationMs === null ? 'Chat silenziata' : 'Chat silenziata temporaneamente')
+  }
+
+  async function unmuteConversation(conversation: string) {
+    const { [conversation]: _removed, ...remaining } = notificationMutes
+    notificationMutes = remaining
+    localStorage.setItem(notificationMutesKey, JSON.stringify(notificationMutes))
+    closeContextMenu()
+    if (running) await invoke('node_set_notification_mute', {
+      conversation, muted: false, untilMs: null,
+    }).catch((error) => showToast(String(error)))
+    showToast('Notifiche riattivate')
+  }
+
+  async function syncNotificationMutes() {
+    for (const [conversation, until] of Object.entries(notificationMutes)) {
+      await invoke('node_set_notification_mute', {
+        conversation,
+        muted: true,
+        untilMs: until === -1 ? null : until,
+      })
+    }
+  }
+
+  function notifyTaskbar(conversation: string) {
+    if (windowFocused || isConversationMuted(conversation)) return
+    void appWindow?.requestUserAttention(UserAttentionType.Informational)
+  }
+
+  function unreadOverlayPixels(count: number) {
+    const canvas = document.createElement('canvas')
+    canvas.width = 32
+    canvas.height = 32
+    const context = canvas.getContext('2d')!
+    context.fillStyle = '#0872b3'
+    context.beginPath()
+    context.arc(16, 16, 15, 0, Math.PI * 2)
+    context.fill()
+    context.fillStyle = '#ffffff'
+    context.font = `700 ${count > 99 ? 12 : count > 9 ? 15 : 20}px "Segoe UI"`
+    context.textAlign = 'center'
+    context.textBaseline = 'middle'
+    context.fillText(count > 99 ? '99+' : String(count), 16, 16)
+    return new Uint8Array(context.getImageData(0, 0, 32, 32).data)
+  }
+
+  async function updateTaskbarBadge(count: number) {
+    if (!appWindow) return
+    const update = ++taskbarUpdate
+    try {
+      if (/Windows/i.test(navigator.userAgent)) {
+        const nextIcon = count ? await Image.new(unreadOverlayPixels(count), 32, 32) : undefined
+        if (update !== taskbarUpdate) {
+          await nextIcon?.close()
+          return
+        }
+        await appWindow.setOverlayIcon(nextIcon)
+        await overlayIcon?.close()
+        overlayIcon = nextIcon
+      } else {
+        await appWindow.setBadgeCount(count || undefined)
+      }
+    } catch (error) {
+      console.warn('Badge taskbar non aggiornabile', error)
+    }
   }
 
   function closeSecurityIntro() {
@@ -496,10 +637,11 @@
         ...conversations,
         [key]: [...(conversations[key] || []), next],
       }
-      if (event.message.direction === 'in' && selectedGroupId !== event.message.groupId) {
+      if (event.message.direction === 'in' && (!windowFocused || selectedGroupId !== event.message.groupId)) {
         chatGroups = chatGroups.map((group) => group.id === event.message.groupId
           ? { ...group, unread: group.unread + 1 }
           : group)
+        notifyTaskbar(groupConversationKey(event.message.groupId))
       }
       scrollMessages()
       return
@@ -632,14 +774,16 @@
       ...conversations,
       [message.peerId]: [...conversation, next],
     }
-    if (message.direction === 'in' && selectedPeerId !== message.peerId) {
+    const conversationKey = peerConversationKey(message.peerId)
+    if (message.direction === 'in' && (!windowFocused || selectedPeerId !== message.peerId)) {
       contacts = contacts.map((contact) =>
         contact.peerId === message.peerId
           ? { ...contact, unread: contact.unread + 1 }
           : contact
       )
+      notifyTaskbar(conversationKey)
     }
-    if (message.kind === 'nudge' && !next.mine) {
+    if (message.kind === 'nudge' && !next.mine && !isConversationMuted(conversationKey)) {
       void shakeWindow()
       playNudgeSound()
     }
@@ -887,7 +1031,7 @@
       if (saveProfile) {
         const profile = await invoke<Profile>('profile_save', {
           name: displayName.trim(), avatarPath: null, clearAvatar: false,
-          previewSentImages, previewReceivedImages, nudgeSound,
+          previewSentImages, previewReceivedImages, nudgeSound, fontScale,
           relayAddress,
         })
         avatarDataUrl = profile.avatarDataUrl || ''
@@ -899,6 +1043,7 @@
           relay: relayAddress.trim() || null,
         },
       })
+      await syncNotificationMutes()
       localStorage.setItem('msnnext-name', displayName.trim())
     } catch (error) {
       showToast(String(error))
@@ -1006,12 +1151,22 @@
   function showContactMenu(event: MouseEvent, contact: Contact) {
     event.preventDefault()
     contextPeerId = contact.peerId
-    contextX = Math.min(event.clientX, window.innerWidth - 220)
-    contextY = Math.min(event.clientY, window.innerHeight - 150)
+    contextGroupId = ''
+    contextX = Math.min(event.clientX, window.innerWidth - 230)
+    contextY = Math.min(event.clientY, window.innerHeight - 285)
+  }
+
+  function showGroupMenu(event: MouseEvent, group: GroupChat) {
+    event.preventDefault()
+    contextGroupId = group.id
+    contextPeerId = ''
+    contextX = Math.min(event.clientX, window.innerWidth - 230)
+    contextY = Math.min(event.clientY, window.innerHeight - 255)
   }
 
   function closeContextMenu() {
     contextPeerId = ''
+    contextGroupId = ''
   }
 
   function manageContact(peerId: string) {
@@ -1138,7 +1293,7 @@
     try {
       const profile = await invoke<Profile>('profile_save', {
         name: displayName.trim(), avatarPath, clearAvatar,
-        previewSentImages, previewReceivedImages, nudgeSound,
+        previewSentImages, previewReceivedImages, nudgeSound, fontScale,
         relayAddress,
       })
       displayName = profile.name
@@ -1350,10 +1505,10 @@
         {#if chatGroups.length}
           <div class="roster-section-label">Chat di gruppo</div>
           {#each chatGroups as group (group.id)}
-            <button class:active={group.id === selectedGroupId} class="contact-row group-chat-row" onclick={() => selectGroup(group.id)}>
+            <button class:active={group.id === selectedGroupId} class="contact-row group-chat-row" oncontextmenu={(event) => showGroupMenu(event, group)} onclick={() => selectGroup(group.id)}>
               <span class="group-chat-avatar"><UsersRound size={18} /></span>
               <span class="contact-copy"><strong>{group.name}</strong><small>{group.members.length} partecipanti</small></span>
-              {#if group.unread}<b class="unread">{group.unread}</b>{/if}
+              <span class="roster-indicators">{#if isConversationMuted(groupConversationKey(group.id))}<BellOff class="muted-conversation" size={13} />{/if}{#if group.unread}<b class="unread">{group.unread}</b>{/if}</span>
             </button>
           {/each}
         {/if}
@@ -1371,7 +1526,7 @@
                 <i class:online={contact.online}></i>
               </span>
               <span class="contact-copy"><strong>{contact.name}</strong><small>{contactSubtitle(contact)}</small></span>
-              {#if contact.unread}<b class="unread">{contact.unread}</b>{/if}
+              <span class="roster-indicators">{#if isConversationMuted(peerConversationKey(contact.peerId))}<BellOff class="muted-conversation" size={13} />{/if}{#if contact.unread}<b class="unread">{contact.unread}</b>{/if}</span>
             </button>
           {/each}
         {:else if contacts.length && !chatGroups.length}
@@ -1524,10 +1679,14 @@
             {#if activeContact}
               <section class="detail-section contact-management">
                 <h3>Gestione contatto</h3>
-                <label>Nome personale<input bind:value={contactName} maxlength="64" placeholder={activeContact.name} /></label>
-                <button onclick={renameContact}><Pencil size={14} /> Salva nome</button>
-                <button onclick={clearConversation}><Trash2 size={14} /> Elimina solo la chat</button>
-                <button class="danger-button" onclick={deleteContact}><Trash2 size={14} /> Elimina contatto e chat</button>
+                <div class="contact-name-editor">
+                  <label for="contact-display-name">Nome visualizzato</label>
+                  <div class="contact-name-row"><input id="contact-display-name" bind:value={contactName} maxlength="64" placeholder={activeContact.name} /><button onclick={renameContact}><Pencil size={14} /> Salva</button></div>
+                </div>
+                <div class="contact-danger-zone">
+                  <button onclick={clearConversation}><Trash2 size={14} /><span><strong>Cancella cronologia</strong><small>Il contatto rimane nella lista</small></span></button>
+                  <button class="danger-button" onclick={deleteContact}><Trash2 size={14} /><span><strong>Rimuovi contatto</strong><small>Elimina anche la conversazione</small></span></button>
+                </div>
               </section>
             {/if}
             {#if activeGroup}
@@ -1664,13 +1823,25 @@
   </div>
 </main>
 
-{#if contextPeerId}
+{#if contextPeerId || contextGroupId}
+  {@const contextConversation = contextGroupId ? groupConversationKey(contextGroupId) : peerConversationKey(contextPeerId)}
   <button class="context-scrim" aria-label="Chiudi menu" onclick={closeContextMenu}></button>
   <div class="contact-context-menu" style={`left:${contextX}px;top:${contextY}px`} role="menu">
-    <button onclick={() => { selectContact(contextPeerId); closeContextMenu() }}>Apri conversazione</button>
-    <button onclick={() => manageContact(contextPeerId)}>Rinomina e gestisci</button>
+    <button onclick={() => { contextGroupId ? selectGroup(contextGroupId) : selectContact(contextPeerId); closeContextMenu() }}>Apri conversazione</button>
+    {#if contextPeerId}<button onclick={() => manageContact(contextPeerId)}>Rinomina e gestisci</button>{/if}
+    <div class="context-separator"></div>
+    <small>Notifiche</small>
+    {#if isConversationMuted(contextConversation)}
+      <button onclick={() => unmuteConversation(contextConversation)}>Riattiva notifiche</button>
+    {:else}
+      <button onclick={() => muteConversation(contextConversation, 60 * 60 * 1000)}>Silenzia per 1 ora</button>
+      <button onclick={() => muteConversation(contextConversation, 8 * 60 * 60 * 1000)}>Silenzia per 8 ore</button>
+      <button onclick={() => muteConversation(contextConversation, null)}>Silenzia sempre</button>
+    {/if}
+    {#if contextPeerId}
     <div class="context-separator"></div>
     <button class="danger-item" onclick={() => { selectContact(contextPeerId); closeContextMenu(); void deleteContact() }}>Elimina contatto</button>
+    {/if}
   </div>
 {/if}
 
@@ -1722,7 +1893,7 @@
         <details>
           <summary>Collegamento diretto avanzato</summary>
           <label>Indirizzo peer <small>facoltativo</small><input bind:value={directAddress} placeholder="/ip4/…/udp/…/quic-v1/p2p/…" /></label>
-          <label>Relay di emergenza <small>facoltativo</small><input bind:value={relayAddress} maxlength="512" placeholder="/dns4/relay.example.com/tcp/4001/p2p/…" /></label>
+          <label>Relay personalizzato <small>facoltativo</small><input bind:value={relayAddress} maxlength="512" placeholder="Usa il mininodo MSN Next" /></label>
         </details>
         <button class="primary-button wide" disabled={starting || !displayName.trim()} onclick={() => startNode()}>
           {starting ? 'Connessione in corso…' : 'Vai online'}
@@ -1830,27 +2001,29 @@
   <div class="modal-backdrop">
     <div class="modal profile-modal" role="dialog" aria-modal="true" aria-labelledby="profile-title">
       <button class="modal-close" aria-label="Chiudi" onclick={() => profileOpen = false}><X size={18} /></button>
-      <div class="profile-editor-avatar avatar-shell">
-        {#if avatarDataUrl}<img src={avatarDataUrl} alt="Avatar personale" />{:else}<span>{displayName.slice(0, 1).toUpperCase()}</span>{/if}
+      <div class="profile-identity-header">
+        <div class="profile-editor-avatar avatar-shell">
+          {#if avatarDataUrl}<img src={avatarDataUrl} alt="Avatar personale" />{:else}<span>{displayName.slice(0, 1).toUpperCase()}</span>{/if}
+        </div>
+        <div>
+          <p class="step-label">Il tuo profilo</p>
+          <h2 id="profile-title">Come appari agli amici</h2>
+        </div>
       </div>
-      <p class="step-label">Il tuo profilo</p>
-      <h2 id="profile-title">Come appari agli amici</h2>
       <label>Nome<input bind:value={displayName} maxlength="64" /></label>
       <div class="profile-avatar-actions">
         <button class="secondary-button" onclick={chooseAvatar}>Scegli avatar</button>
         {#if avatarDataUrl}<button class="secondary-button" onclick={() => saveProfile(null, true)}>Rimuovi</button>{/if}
       </div>
-      <fieldset class="preview-settings">
-        <legend>Media e trilli</legend>
-        <label><span><strong>Immagini inviate</strong><small>Mostrale appena premi invio</small></span><input type="checkbox" bind:checked={previewSentImages} /></label>
-        <label><span><strong>Immagini ricevute</strong><small>Mostrale senza doverle aprire</small></span><input type="checkbox" bind:checked={previewReceivedImages} /></label>
-        <label><span><strong>Suono del trillo</strong><small>Riproduci un avviso quando ricevi un trillo</small></span><input type="checkbox" bind:checked={nudgeSound} /></label>
-      </fieldset>
-      <details class="network-settings">
-        <summary>Rete avanzata</summary>
-        <label>Relay di emergenza<input bind:value={relayAddress} maxlength="512" placeholder="/dns4/relay.example.com/tcp/4001/p2p/…" /></label>
-        <small>Usato solo se la connessione diretta fallisce. Riconnettiti dopo averlo cambiato.</small>
-      </details>
+      <section class="preference-settings" aria-labelledby="preferences-title">
+        <h3 id="preferences-title">Aspetto e comportamento</h3>
+        <div class="preference-list">
+          <label class="preference-row"><span><strong>Dimensione testo</strong><small>L'anteprima è immediata</small></span><select bind:value={fontScale} aria-label="Dimensione testo"><option value={100}>Originale</option><option value={115}>Comoda</option><option value={125}>Grande</option><option value={140}>Molto grande</option></select></label>
+          <label class="preference-row"><span><strong>Immagini inviate</strong><small>Mostrale appena premi invio</small></span><input type="checkbox" bind:checked={previewSentImages} /></label>
+          <label class="preference-row"><span><strong>Immagini ricevute</strong><small>Mostrale senza doverle aprire</small></span><input type="checkbox" bind:checked={previewReceivedImages} /></label>
+          <label class="preference-row"><span><strong>Suono del trillo</strong><small>Riproduci un avviso quando ricevi un trillo</small></span><input type="checkbox" bind:checked={nudgeSound} /></label>
+        </div>
+      </section>
       <section class="settings-emoticons">
         <header>
           <span><strong>Emoticon personali</strong><small>Disponibili anche quando i contatti sono offline</small></span>
@@ -1876,6 +2049,11 @@
           </div>
         {/if}
       </section>
+      <details class="network-settings">
+        <summary>Rete avanzata</summary>
+        <label>Relay personalizzato<input bind:value={relayAddress} maxlength="512" placeholder="Usa il mininodo MSN Next" /></label>
+        <small>Lascia vuoto per usare automaticamente il mininodo pubblico. Riconnettiti dopo averlo cambiato.</small>
+      </details>
       <button class="security-reopen" onclick={() => securityIntroOpen = true}><ShieldCheck size={15} /> Come msnnext protegge i tuoi dati</button>
       <button class="primary-button wide" disabled={!displayName.trim()} onclick={() => saveProfile()}>Salva profilo</button>
     </div>
