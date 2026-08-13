@@ -31,6 +31,7 @@ struct NodeState {
 struct NodeConfig {
     name: String,
     connect: Option<String>,
+    relay: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -44,6 +45,8 @@ struct StoredProfile {
     preview_received_images: bool,
     #[serde(default = "enabled_by_default")]
     nudge_sound: bool,
+    #[serde(default)]
+    relay_address: String,
 }
 
 #[derive(Serialize)]
@@ -54,6 +57,7 @@ struct ProfileView {
     preview_sent_images: bool,
     preview_received_images: bool,
     nudge_sound: bool,
+    relay_address: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -83,6 +87,7 @@ fn profile_view(data_dir: &Path, profile: StoredProfile) -> Result<ProfileView, 
         preview_sent_images: profile.preview_sent_images,
         preview_received_images: profile.preview_received_images,
         nudge_sound: profile.nudge_sound,
+        relay_address: profile.relay_address,
     })
 }
 
@@ -223,7 +228,7 @@ fn node_start(
         .map_err(|error| error.to_string())?;
     std::fs::create_dir_all(&data_dir).map_err(|error| error.to_string())?;
     let identity = desktop_identity(&data_dir)?;
-    let client_config = ClientConfig::desktop(config.name, data_dir, config.connect)
+    let client_config = ClientConfig::desktop(config.name, data_dir, config.connect, config.relay)
         .and_then(|config| config.with_identity_bytes(identity.classic, identity.ml_dsa_seed))
         .map_err(|error| error.to_string())?;
     let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -568,6 +573,23 @@ fn scan_contact_qr(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn save_contact_qr(path: PathBuf, data_url: String) -> Result<(), String> {
+    const MAX_QR_BYTES: usize = 5 * 1024 * 1024;
+    let encoded = data_url
+        .strip_prefix("data:image/png;base64,")
+        .ok_or_else(|| "QR non valido".to_owned())?;
+    let bytes = BASE64
+        .decode(encoded)
+        .map_err(|_| "QR non valido".to_owned())?;
+    if bytes.len() > MAX_QR_BYTES
+        || image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).is_err()
+    {
+        return Err("QR non valido".into());
+    }
+    std::fs::write(path, bytes).map_err(|error| format!("QR non salvato: {error}"))
+}
+
+#[tauri::command]
 fn image_preview(path: String) -> Result<String, String> {
     const MAX_PREVIEW_SOURCE_BYTES: u64 = 100 * 1024 * 1024;
     let path = Path::new(&path);
@@ -617,6 +639,7 @@ fn profile_save(
     preview_sent_images: Option<bool>,
     preview_received_images: Option<bool>,
     nudge_sound: Option<bool>,
+    relay_address: Option<String>,
 ) -> Result<ProfileView, String> {
     let name = name.trim();
     if name.is_empty() || name.len() > 64 {
@@ -644,6 +667,26 @@ fn profile_save(
     let nudge_sound = nudge_sound
         .or_else(|| previous.as_ref().map(|profile| profile.nudge_sound))
         .unwrap_or(true);
+    let relay_address = relay_address
+        .or_else(|| {
+            previous
+                .as_ref()
+                .map(|profile| profile.relay_address.clone())
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    if relay_address.len() > 512
+        || ClientConfig::desktop(
+            name.to_owned(),
+            data_dir.clone(),
+            None,
+            (!relay_address.is_empty()).then_some(relay_address.clone()),
+        )
+        .is_err()
+    {
+        return Err("indirizzo relay non valido".into());
+    }
     let avatar_file = if clear_avatar {
         if let Some(file) = previous
             .as_ref()
@@ -669,6 +712,7 @@ fn profile_save(
         preview_sent_images: sent_previews,
         preview_received_images: received_previews,
         nudge_sound,
+        relay_address,
     };
     std::fs::write(
         &profile_path,
@@ -758,6 +802,7 @@ pub fn run() {
             node_import_contact,
             node_request_contact_link,
             scan_contact_qr,
+            save_contact_qr,
             image_preview,
             profile_load,
             profile_save,
@@ -799,13 +844,22 @@ mod tests {
     #[test]
     fn qr_images_yield_contact_links() {
         let payload = "msnnext://add/test-contact";
-        let path = std::env::temp_dir().join("msnnext-contact-qr.png");
+        let path =
+            std::env::temp_dir().join(format!("msnnext-contact-qr-{}.png", std::process::id()));
         let image = qrcode::QrCode::new(payload)
             .unwrap()
             .render::<image::Luma<u8>>()
-            .min_dimensions(240, 240)
+            .min_dimensions(1024, 1024)
             .build();
-        image.save(&path).unwrap();
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::ImageLuma8(image)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        save_contact_qr(
+            path.clone(),
+            format!("data:image/png;base64,{}", BASE64.encode(png.into_inner())),
+        )
+        .unwrap();
 
         assert_eq!(decode_qr_image(&path).unwrap(), payload);
 

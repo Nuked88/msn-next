@@ -1,0 +1,15 @@
+services:
+  mininode:
+    build:
+      context: ../..
+      dockerfile: services/mininode/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "4001:4001/tcp"
+      - "4001:4001/udp"
+    volumes:
+      - mininode-data:/data
+
+volumes:
+  mininode-data:
+

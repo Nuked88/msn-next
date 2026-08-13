@@ -7,7 +7,7 @@ mod history;
 use attachments::{build_manifest, read_chunk, validate_manifest, CompletedAttachment, Receiver};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chacha20poly1305::aead::rand_core::{OsRng, RngCore};
-use connectivity::{split_peer_address, FallbackPlanner, Recovery};
+use connectivity::{relay_route, split_peer_address, FallbackPlanner, Recovery};
 use crypto::{
     accepts_inbound, needs_outbound_handshake, respond as respond_hybrid, HybridInitiator,
     HybridResponse, RatchetMessage, RatchetSession, SessionKey,
@@ -58,6 +58,8 @@ const CHAT_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const TEXT_HISTORY_PREFIX: &str = "msnnext-text-v1:";
 const MAX_PENDING_INBOUND_OFFERS: usize = 8;
 const ATTACHMENT_DECISION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const RELAY_MAX_CIRCUIT_BYTES: u64 = attachments::MAX_FILE_BYTES + 64 * 1024 * 1024;
+const RELAY_MAX_CIRCUIT_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug)]
 pub enum ClientCommand {
@@ -442,11 +444,14 @@ fn build_swarm(
         .with_quic()
         .with_relay_client(noise::Config::new, yamux::Config::default)?
         .with_behaviour(move |key, relay_client| {
-            let kad = kad::Behaviour::with_config(
+            let mut kad = kad::Behaviour::with_config(
                 local_peer_id,
                 kad::store::MemoryStore::new(local_peer_id),
                 kad::Config::new(StreamProtocol::new("/msnnext/kad/1")),
             );
+            if relay_server_enabled {
+                kad.set_mode(Some(kad::Mode::Server));
+            }
             Behaviour {
                 chat: request_response::cbor::Behaviour::new(
                     [(
@@ -478,10 +483,16 @@ fn build_swarm(
                 kad,
                 autonat: autonat::Behaviour::new(local_peer_id, autonat::Config::default()),
                 relay_client,
-                relay_server: Toggle::from(
-                    relay_server_enabled
-                        .then(|| relay::Behaviour::new(local_peer_id, relay::Config::default())),
-                ),
+                relay_server: Toggle::from(relay_server_enabled.then(|| {
+                    relay::Behaviour::new(
+                        local_peer_id,
+                        relay::Config {
+                            max_circuit_bytes: RELAY_MAX_CIRCUIT_BYTES,
+                            max_circuit_duration: RELAY_MAX_CIRCUIT_DURATION,
+                            ..relay::Config::default()
+                        },
+                    )
+                })),
                 dcutr: dcutr::Behaviour::new(local_peer_id),
                 ping: ping::Behaviour::new(ping::Config::new()),
             }
@@ -792,7 +803,7 @@ pub async fn run(
                         local_peer_id,
                         &contact_identity,
                         &ml_dsa_identity,
-                        contact_addresses(&swarm).into_iter(),
+                        contact_addresses(&swarm, &args.relays, local_peer_id).into_iter(),
                     ) {
                         Ok(()) => println!("scheda contatto salvata in {}", path.display()),
                         Err(error) => eprintln!("esportazione contatto fallita: {error}"),
@@ -804,7 +815,7 @@ pub async fn run(
                         local_peer_id,
                         &contact_identity,
                         &ml_dsa_identity,
-                        contact_addresses(&swarm),
+                        contact_addresses(&swarm, &args.relays, local_peer_id),
                     )
                     .and_then(|(link, qr_link)| {
                         let qr = contacts::render_qr(&qr_link)?;
@@ -904,7 +915,7 @@ pub async fn run(
                 Some(ClientCommand::Shutdown) => break,
                 Some(ClientCommand::RequestContactLink) => {
                     contact_link_requested = true;
-                    let addresses = contact_addresses(&swarm);
+                    let addresses = contact_addresses(&swarm, &args.relays, local_peer_id);
                     if !addresses.is_empty() {
                         let links = contacts::share_links(
                             &display_name,
@@ -1549,7 +1560,7 @@ pub async fn run(
                     };
                     println!("ascolto: {address}");
                     if contact_link_requested {
-                        let addresses = contact_addresses(&swarm);
+                        let addresses = contact_addresses(&swarm, &args.relays, local_peer_id);
                         if !addresses.is_empty() {
                             let links = contacts::share_links(
                                 &display_name,
@@ -2298,16 +2309,24 @@ fn maybe_start_hybrid_handshake(
     }
 }
 
-fn contact_addresses(swarm: &Swarm<Behaviour>) -> Vec<Multiaddr> {
-    swarm
-        .listeners()
-        .cloned()
+fn contact_addresses(
+    swarm: &Swarm<Behaviour>,
+    relays: &[Multiaddr],
+    local_peer: PeerId,
+) -> Vec<Multiaddr> {
+    let mut addresses = relays
+        .iter()
+        .filter_map(|relay| relay_route(relay, local_peer).ok())
+        .chain(swarm.external_addresses().cloned())
+        .chain(swarm.listeners().cloned())
         .map(|address| {
             split_peer_address(&address)
                 .map(|(_, base)| base)
                 .unwrap_or(address)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    addresses.dedup();
+    addresses
 }
 
 fn connect_contact(
@@ -3616,10 +3635,21 @@ impl ClientConfig {
         name: String,
         data_dir: PathBuf,
         connect: Option<String>,
+        relay: Option<String>,
     ) -> Result<Self, Box<dyn Error>> {
         if name.trim().is_empty() || name.len() > 64 {
             return Err("nome non valido".into());
         }
+        let relays = relay
+            .filter(|address| !address.trim().is_empty())
+            .map(|address| address.parse::<Multiaddr>())
+            .transpose()?
+            .into_iter()
+            .map(|address| {
+                split_peer_address(&address)?;
+                Ok(address)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         Ok(Self {
             listen: "/ip4/0.0.0.0/udp/0/quic-v1".parse()?,
             listen_tcp: "/ip4/0.0.0.0/tcp/0".parse()?,
@@ -3627,8 +3657,8 @@ impl ClientConfig {
                 .filter(|address| !address.trim().is_empty())
                 .map(|address| address.parse())
                 .transpose()?,
-            bootstrap: Vec::new(),
-            relays: Vec::new(),
+            bootstrap: relays.clone(),
+            relays,
             relay_server: false,
             identity: data_dir.join("identity.key"),
             identity_bytes: None,
@@ -4142,7 +4172,7 @@ mod tests {
         local
             .run_until(async {
                 let mut alice_config =
-                    ClientConfig::desktop("Alice".into(), alice_dir.clone(), None).unwrap();
+                    ClientConfig::desktop("Alice".into(), alice_dir.clone(), None, None).unwrap();
                 alice_config.listen = alice_listen.clone();
                 alice_config.notifications = false;
                 let (alice_commands, alice_command_rx) = mpsc::unbounded_channel();
@@ -4166,7 +4196,7 @@ mod tests {
                 };
 
                 let mut bob_config =
-                    ClientConfig::desktop("Bob".into(), bob_dir.clone(), None).unwrap();
+                    ClientConfig::desktop("Bob".into(), bob_dir.clone(), None, None).unwrap();
                 bob_config.notifications = false;
                 let (bob_commands, bob_command_rx) = mpsc::unbounded_channel();
                 let (bob_event_tx, mut bob_events) = mpsc::unbounded_channel();
@@ -4242,7 +4272,7 @@ mod tests {
                 }
 
                 let mut restarted_config =
-                    ClientConfig::desktop("Alice".into(), alice_dir.clone(), None).unwrap();
+                    ClientConfig::desktop("Alice".into(), alice_dir.clone(), None, None).unwrap();
                 restarted_config.listen = alice_listen;
                 restarted_config.notifications = false;
                 let (restarted_commands, restarted_command_rx) = mpsc::unbounded_channel();
@@ -4353,7 +4383,8 @@ mod tests {
             std::env::temp_dir().join(format!("msnnext-integrated-{}", std::process::id()));
         fs::remove_dir_all(&data_dir).ok();
         runtime.block_on(async {
-            let config = ClientConfig::desktop("Alice".into(), data_dir.clone(), None).unwrap();
+            let config =
+                ClientConfig::desktop("Alice".into(), data_dir.clone(), None, None).unwrap();
             let (command_tx, command_rx) = mpsc::unbounded_channel();
             let (event_tx, mut event_rx) = mpsc::unbounded_channel();
             let client = run(config, command_rx, event_tx);
@@ -4376,5 +4407,44 @@ mod tests {
         });
         runtime.shutdown_background();
         fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn desktop_relay_is_used_for_bootstrap_and_fallback() {
+        let relay_peer = PeerId::from(Keypair::generate_ed25519().public());
+        let relay = format!("/dns4/relay.example.com/tcp/4001/p2p/{relay_peer}");
+        let config = ClientConfig::desktop(
+            "Alice".into(),
+            std::env::temp_dir(),
+            None,
+            Some(relay.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(config.bootstrap, vec![relay.parse().unwrap()]);
+        assert_eq!(config.relays, config.bootstrap);
+        assert!(ClientConfig::desktop(
+            "Alice".into(),
+            std::env::temp_dir(),
+            None,
+            Some("/dns4/relay.example.com/tcp/4001".into()),
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn mininode_serves_the_dht() {
+        let swarm = build_swarm(Keypair::generate_ed25519(), true).unwrap();
+        let relay_peer = PeerId::from(Keypair::generate_ed25519().public());
+        let relay = format!("/dns4/relay.example.com/tcp/4001/p2p/{relay_peer}")
+            .parse::<Multiaddr>()
+            .unwrap();
+        let expected_route = format!("{relay}/p2p-circuit").parse::<Multiaddr>().unwrap();
+
+        assert_eq!(swarm.behaviour().kad.mode(), kad::Mode::Server);
+        assert_eq!(
+            contact_addresses(&swarm, &[relay], *swarm.local_peer_id()).first(),
+            Some(&expected_route)
+        );
     }
 }

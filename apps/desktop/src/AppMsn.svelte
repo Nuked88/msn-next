@@ -153,6 +153,7 @@
     previewSentImages: boolean
     previewReceivedImages: boolean
     nudgeSound: boolean
+    relayAddress: string
   }
 
   const emoticons: Emoticon[] = [
@@ -185,6 +186,7 @@
     ? 'Amico'
     : localStorage.getItem('msnnext-name') || 'Amico'
   let directAddress = ''
+  let relayAddress = ''
   let searchQuery = ''
   let messageText = ''
   let contactLink = ''
@@ -311,6 +313,7 @@
       previewSentImages = profile.previewSentImages
       previewReceivedImages = profile.previewReceivedImages
       nudgeSound = profile.nudgeSound
+      relayAddress = profile.relayAddress
       const isRunning = await invoke<boolean>('node_status')
       running = isRunning
       setupOpen = false
@@ -389,8 +392,8 @@
       ownContactLink = event.link
       linkRequested = false
       void QRCode.toDataURL(event.qrLink, {
-        width: 220,
-        margin: 1,
+        width: 1024,
+        margin: 4,
         color: { dark: '#10284a', light: '#ffffff' },
       }).then((qr) => ownContactQr = qr).catch((error) => showToast(`QR non generabile: ${error}`))
       return
@@ -885,11 +888,16 @@
         const profile = await invoke<Profile>('profile_save', {
           name: displayName.trim(), avatarPath: null, clearAvatar: false,
           previewSentImages, previewReceivedImages, nudgeSound,
+          relayAddress,
         })
         avatarDataUrl = profile.avatarDataUrl || ''
       }
       await invoke('node_start', {
-        config: { name: displayName.trim(), connect: directAddress.trim() || null },
+        config: {
+          name: displayName.trim(),
+          connect: directAddress.trim() || null,
+          relay: relayAddress.trim() || null,
+        },
       })
       localStorage.setItem('msnnext-name', displayName.trim())
     } catch (error) {
@@ -1131,6 +1139,7 @@
       const profile = await invoke<Profile>('profile_save', {
         name: displayName.trim(), avatarPath, clearAvatar,
         previewSentImages, previewReceivedImages, nudgeSound,
+        relayAddress,
       })
       displayName = profile.name
       avatarDataUrl = profile.avatarDataUrl || ''
@@ -1219,6 +1228,18 @@
     if (!ownContactLink) return
     await navigator.clipboard.writeText(ownContactLink)
     showToast('Link contatto copiato')
+  }
+
+  async function saveContactQr() {
+    if (!ownContactQr) return
+    const path = await save({
+      defaultPath: 'msnnext-contatto.png',
+      filters: [{ name: 'Immagine PNG', extensions: ['png'] }],
+    })
+    if (!path) return
+    await invoke('save_contact_qr', { path, dataUrl: ownContactQr })
+      .then(() => showToast('QR salvato in alta qualità'))
+      .catch((error) => showToast(String(error)))
   }
 
   async function shakeWindow() {
@@ -1701,6 +1722,7 @@
         <details>
           <summary>Collegamento diretto avanzato</summary>
           <label>Indirizzo peer <small>facoltativo</small><input bind:value={directAddress} placeholder="/ip4/…/udp/…/quic-v1/p2p/…" /></label>
+          <label>Relay di emergenza <small>facoltativo</small><input bind:value={relayAddress} maxlength="512" placeholder="/dns4/relay.example.com/tcp/4001/p2p/…" /></label>
         </details>
         <button class="primary-button wide" disabled={starting || !displayName.trim()} onclick={() => startNode()}>
           {starting ? 'Connessione in corso…' : 'Vai online'}
@@ -1734,7 +1756,10 @@
           <button class="secondary-button" disabled={linkRequested} onclick={createContactLink}>{linkRequested ? 'Preparo il QR…' : 'Crea il mio QR'}</button>
         {/if}
         {#if ownContactLink}
-          <button class="copy-link" onclick={copyOwnLink}><Copy size={15} /> Copia il link</button>
+          <div class="contact-share-actions">
+            <button class="copy-link" onclick={copyOwnLink}><Copy size={15} /> Copia il link</button>
+            <button class="copy-link" onclick={saveContactQr}><QrCode size={15} /> Salva QR grande</button>
+          </div>
         {/if}
       </section>
 
@@ -1821,6 +1846,11 @@
         <label><span><strong>Immagini ricevute</strong><small>Mostrale senza doverle aprire</small></span><input type="checkbox" bind:checked={previewReceivedImages} /></label>
         <label><span><strong>Suono del trillo</strong><small>Riproduci un avviso quando ricevi un trillo</small></span><input type="checkbox" bind:checked={nudgeSound} /></label>
       </fieldset>
+      <details class="network-settings">
+        <summary>Rete avanzata</summary>
+        <label>Relay di emergenza<input bind:value={relayAddress} maxlength="512" placeholder="/dns4/relay.example.com/tcp/4001/p2p/…" /></label>
+        <small>Usato solo se la connessione diretta fallisce. Riconnettiti dopo averlo cambiato.</small>
+      </details>
       <section class="settings-emoticons">
         <header>
           <span><strong>Emoticon personali</strong><small>Disponibili anche quando i contatti sono offline</small></span>
