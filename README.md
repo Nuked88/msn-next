@@ -45,7 +45,7 @@ Messenger desktop P2P ispirato a MSN Messenger. L'obiettivo è mantenere testo, 
 - identità desktop nel keystore del sistema operativo, con migrazione automatica del precedente `identity.key`;
 - link contatto v2 firmati Ed25519 e ML-DSA-65; il QR usa una scheda v3 compatta firmata Ed25519 perché una firma ML-DSA-65 non entra in un singolo QR, mantenendo la lettura delle schede v1;
 - CSP restrittiva per la WebView e fingerprint mostrato nella GUI.
-- mininodo Docker configurabile come bootstrap e Circuit Relay v2 per i client dietro CGNAT; non memorizza messaggi.
+- mininodo pubblico preconfigurato come bootstrap e Circuit Relay v2 per i client dietro CGNAT; non memorizza messaggi.
 
 ## Cosa funziona oggi
 
@@ -95,7 +95,7 @@ Il file originale inviato non viene copiato nell'archivio di msnnext: viene lett
 
 - la reconnessione automatica necessita ancora di test prolungati su due PC e reti differenti;
 - hole punching e fallback relay non sono stati collaudati su due NAT reali;
-- il relay di emergenza è configurabile nelle impostazioni; il container è in `services/mininode`, ma non esiste un indirizzo pubblico preconfigurato;
+- esiste un solo relay pubblico preconfigurato, quindi per ora non c'è ridondanza se la VPS non è disponibile;
 - non esistono messaggi offline: almeno uno dei dispositivi deve essere raggiungibile;
 - avatar, nome personale, gruppi, rinomina e rimozione dei contatti sono disponibili; stato personale e blocco restano incompleti.
 
