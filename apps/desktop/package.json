@@ -1,17 +1,19 @@
 {
   "name": "desktop",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.app.json && tsc -p tsconfig.node.json",
+    "tauri": "tauri",
     "desktop": "tauri dev",
     "release:windows": "tauri build --bundles nsis",
     "release:windows:msi": "tauri build --bundles msi",
-    "release:linux": "tauri build --bundles deb,appimage"
+    "release:linux": "tauri build --bundles deb,appimage",
+    "release:macos": "tauri build --bundles dmg"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.1.2",
