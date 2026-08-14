@@ -185,7 +185,7 @@ Le release Windows e Linux vanno costruite sui rispettivi sistemi operativi. And
 
 ### Build multipiattaforma su GitHub
 
-Il workflow `Build release bundles` compila NSIS su Windows, DEB/AppImage su Linux e un DMG universale Intel/Apple Silicon su macOS. Parte sulle pull request oppure manualmente dalla scheda **Actions** e conserva i pacchetti come artifact della run, senza pubblicare una GitHub Release.
+Il workflow `Build release bundles` compila NSIS su Windows, DEB/AppImage su Linux e un DMG universale Intel/Apple Silicon su macOS. Sulle pull request conserva i pacchetti come artifact della run; avviato manualmente dalla scheda **Actions**, dopo tre build riuscite pubblica i quattro installer in una GitHub prerelease.
 
 La versione dell'app segue SemVer ed è definita una sola volta in `apps/desktop/package.json`; Tauri la legge da quel file. Finché il progetto è alpha: `0.x.0` per nuove funzionalità o cambi incompatibili e `0.x.y` per correzioni compatibili. Le release future useranno tag Git `v0.x.y`.
 
