@@ -118,6 +118,7 @@ jobs:
             exit 1
           fi
           gh release create "v$RELEASE_VERSION" "${files[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "msnnext v$RELEASE_VERSION" \
             --notes "Build automatica di sviluppo: installer non ancora firmati per l'aggiornamento automatico sicuro." \
