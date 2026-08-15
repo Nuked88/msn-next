@@ -7,10 +7,15 @@ use std::{
         Arc, Condvar, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use argon2::Argon2;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use chacha20poly1305::{
+    aead::{rand_core::RngCore, Aead, OsRng},
+    KeyInit, XChaCha20Poly1305, XNonce,
+};
 use msnnext_core::{ClientCommand, ClientConfig, ClientEvent, GroupModeration};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -18,6 +23,10 @@ use tokio::sync::mpsc;
 
 type CommandSender = mpsc::UnboundedSender<ClientCommand>;
 type RunningNode = (u64, CommandSender);
+
+const MAX_ACCOUNT_HISTORY_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_ACCOUNT_BACKUP_BYTES: u64 = 256 * 1024 * 1024;
+const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 
 #[derive(Clone, Default)]
 struct NodeState {
@@ -70,6 +79,24 @@ struct StoredIdentity {
     ml_dsa_seed: [u8; 32],
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountBackup {
+    version: u8,
+    kdf: String,
+    cipher: String,
+    salt: String,
+    nonce: String,
+    ciphertext: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountBackupPayload {
+    identity: StoredIdentity,
+    history: Option<String>,
+}
+
 fn enabled_by_default() -> bool {
     true
 }
@@ -108,8 +135,7 @@ fn parse_peer(value: &str) -> Result<libp2p_identity::PeerId, String> {
 }
 
 fn desktop_identity(data_dir: &Path) -> Result<StoredIdentity, String> {
-    let entry = keyring::Entry::new("app.msnnext.desktop", "identity-v1")
-        .map_err(|error| format!("keystore non disponibile: {error}"))?;
+    let entry = identity_entry()?;
     let legacy_path = data_dir.join("identity.key");
     let identity = match entry.get_secret() {
         Ok(bytes) => match serde_json::from_slice::<StoredIdentity>(&bytes) {
@@ -164,6 +190,201 @@ fn desktop_identity(data_dir: &Path) -> Result<StoredIdentity, String> {
         std::fs::remove_file(legacy_path).map_err(|error| error.to_string())?;
     }
     Ok(identity)
+}
+
+fn identity_entry() -> Result<keyring::Entry, String> {
+    keyring::Entry::new("app.msnnext.desktop", "identity-v1")
+        .map_err(|error| format!("keystore non disponibile: {error}"))
+}
+
+fn derive_backup_key(password: &str, salt: &[u8; 16]) -> Result<[u8; 32], String> {
+    if password.chars().count() < 12 {
+        return Err("usa una password di almeno 12 caratteri".into());
+    }
+    let mut key = [0u8; 32];
+    Argon2::default()
+        .hash_password_into(password.as_bytes(), salt, &mut key)
+        .map_err(|_| "password non elaborabile".to_owned())?;
+    Ok(key)
+}
+
+fn encrypt_account_backup(
+    payload: &AccountBackupPayload,
+    password: &str,
+) -> Result<String, String> {
+    let mut salt = [0u8; 16];
+    let mut nonce = [0u8; 24];
+    OsRng.fill_bytes(&mut salt);
+    OsRng.fill_bytes(&mut nonce);
+    let key = derive_backup_key(password, &salt)?;
+    let cipher = XChaCha20Poly1305::new((&key).into());
+    let plaintext = serde_json::to_vec(payload).map_err(|error| error.to_string())?;
+    let ciphertext = cipher
+        .encrypt(XNonce::from_slice(&nonce), plaintext.as_slice())
+        .map_err(|_| "backup non creato".to_owned())?;
+    serde_json::to_string_pretty(&AccountBackup {
+        version: 2,
+        kdf: "argon2id-v1".into(),
+        cipher: "xchacha20poly1305".into(),
+        salt: BASE64.encode(salt),
+        nonce: BASE64.encode(nonce),
+        ciphertext: BASE64.encode(ciphertext),
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn decrypt_account_backup(contents: &str, password: &str) -> Result<AccountBackupPayload, String> {
+    let backup: AccountBackup =
+        serde_json::from_str(contents).map_err(|_| "backup account non valido".to_owned())?;
+    if !matches!(backup.version, 1 | 2)
+        || backup.kdf != "argon2id-v1"
+        || backup.cipher != "xchacha20poly1305"
+    {
+        return Err("formato backup account non supportato".into());
+    }
+    let salt: [u8; 16] = BASE64
+        .decode(backup.salt)
+        .map_err(|_| "backup account non valido".to_owned())?
+        .try_into()
+        .map_err(|_| "backup account non valido".to_owned())?;
+    let nonce: [u8; 24] = BASE64
+        .decode(backup.nonce)
+        .map_err(|_| "backup account non valido".to_owned())?
+        .try_into()
+        .map_err(|_| "backup account non valido".to_owned())?;
+    let ciphertext = BASE64
+        .decode(backup.ciphertext)
+        .map_err(|_| "backup account non valido".to_owned())?;
+    let key = derive_backup_key(password, &salt)?;
+    let cipher = XChaCha20Poly1305::new((&key).into());
+    let plaintext = cipher
+        .decrypt(XNonce::from_slice(&nonce), ciphertext.as_slice())
+        .map_err(|_| "password errata o backup corrotto".to_owned())?;
+    let payload = if backup.version == 1 {
+        AccountBackupPayload {
+            identity: serde_json::from_slice(&plaintext)
+                .map_err(|_| "identità nel backup non valida".to_owned())?,
+            history: None,
+        }
+    } else {
+        serde_json::from_slice(&plaintext)
+            .map_err(|_| "contenuto del backup non valido".to_owned())?
+    };
+    if payload.identity.version != 1
+        || libp2p_identity::Keypair::from_protobuf_encoding(&payload.identity.classic).is_err()
+    {
+        return Err("identità nel backup non valida".into());
+    }
+    if let Some(history) = payload.history.as_deref() {
+        decode_backup_history(history)?;
+    }
+    Ok(payload)
+}
+
+fn read_backup_history(data_dir: &Path) -> Result<Option<String>, String> {
+    let path = data_dir.join("history.db");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let metadata = std::fs::metadata(&path).map_err(|error| error.to_string())?;
+    if metadata.len() > MAX_ACCOUNT_HISTORY_BYTES {
+        return Err("cronologia troppo grande per il backup account".into());
+    }
+    let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+    if !bytes.starts_with(SQLITE_HEADER) {
+        return Err("database della cronologia non valido".into());
+    }
+    Ok(Some(BASE64.encode(bytes)))
+}
+
+fn decode_backup_history(encoded: &str) -> Result<Vec<u8>, String> {
+    let bytes = BASE64
+        .decode(encoded)
+        .map_err(|_| "cronologia nel backup non valida".to_owned())?;
+    if bytes.len() as u64 > MAX_ACCOUNT_HISTORY_BYTES || !bytes.starts_with(SQLITE_HEADER) {
+        return Err("cronologia nel backup non valida".into());
+    }
+    Ok(bytes)
+}
+
+fn archive_identity_data(
+    data_dir: &Path,
+    include_downloads: bool,
+) -> Result<Option<PathBuf>, String> {
+    let history_names = [
+        "history.db",
+        "history.db-journal",
+        "history.db-shm",
+        "history.db-wal",
+    ];
+    let all_names = [
+        "history.db",
+        "history.db-journal",
+        "history.db-shm",
+        "history.db-wal",
+        "downloads",
+    ];
+    let names = if include_downloads {
+        all_names.as_slice()
+    } else {
+        history_names.as_slice()
+    };
+    if !names.iter().any(|name| data_dir.join(name).exists()) {
+        return Ok(None);
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_millis();
+    let archive = data_dir.join(format!(
+        "account-data-before-restore-{timestamp}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&archive).map_err(|error| error.to_string())?;
+    let mut moved = Vec::new();
+    for &name in names {
+        let source = data_dir.join(name);
+        if !source.exists() {
+            continue;
+        }
+        let destination = archive.join(name);
+        if let Err(error) = std::fs::rename(&source, &destination) {
+            for (original, archived) in moved.iter().rev() {
+                let _ = std::fs::rename(archived, original);
+            }
+            let _ = std::fs::remove_dir(&archive);
+            return Err(format!("archiviazione dei dati locali fallita: {error}"));
+        }
+        moved.push((source, destination));
+    }
+    Ok(Some(archive))
+}
+
+fn write_backup_history(data_dir: &Path, bytes: &[u8]) -> Result<(), String> {
+    let temporary = data_dir.join(format!(".history-restore-{}.db", std::process::id()));
+    std::fs::write(&temporary, bytes)
+        .map_err(|error| format!("cronologia non ripristinata: {error}"))?;
+    if let Err(error) = std::fs::rename(&temporary, data_dir.join("history.db")) {
+        let _ = std::fs::remove_file(temporary);
+        return Err(format!("cronologia non ripristinata: {error}"));
+    }
+    Ok(())
+}
+
+fn restore_archived_identity_data(archive: &Path, data_dir: &Path) {
+    for name in [
+        "history.db",
+        "history.db-journal",
+        "history.db-shm",
+        "history.db-wal",
+        "downloads",
+    ] {
+        let archived = archive.join(name);
+        if archived.exists() {
+            let _ = std::fs::rename(archived, data_dir.join(name));
+        }
+    }
+    let _ = std::fs::remove_dir(archive);
 }
 
 fn worker_is_current(current_generation: Option<u64>, worker_generation: u64) -> bool {
@@ -777,6 +998,118 @@ fn profile_save(
 }
 
 #[tauri::command]
+fn account_backup_export(
+    app: AppHandle,
+    state: State<'_, NodeState>,
+    password: String,
+    path: PathBuf,
+) -> Result<(), String> {
+    if node_status(state)? {
+        return Err("vai offline prima di creare un backup account".into());
+    }
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(&data_dir).map_err(|error| error.to_string())?;
+    let payload = AccountBackupPayload {
+        identity: desktop_identity(&data_dir)?,
+        history: read_backup_history(&data_dir)?,
+    };
+    let backup = encrypt_account_backup(&payload, &password)?;
+    std::fs::write(path, backup).map_err(|error| format!("backup non salvato: {error}"))
+}
+
+#[tauri::command]
+fn account_backup_import(
+    app: AppHandle,
+    state: State<'_, NodeState>,
+    password: String,
+    path: PathBuf,
+) -> Result<(), String> {
+    if node_status(state)? {
+        return Err("vai offline prima di ripristinare un account".into());
+    }
+    let metadata = std::fs::metadata(&path)
+        .map_err(|error| format!("backup account non leggibile: {error}"))?;
+    if metadata.len() > MAX_ACCOUNT_BACKUP_BYTES {
+        return Err("backup account troppo grande".into());
+    }
+    let contents = std::fs::read_to_string(path)
+        .map_err(|error| format!("backup account non leggibile: {error}"))?;
+    let imported = decrypt_account_backup(&contents, &password)?;
+    let imported_history = imported
+        .history
+        .as_deref()
+        .map(decode_backup_history)
+        .transpose()?;
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(&data_dir).map_err(|error| error.to_string())?;
+    let current = desktop_identity(&data_dir)?;
+    let identity_changed = current.classic != imported.identity.classic
+        || current.ml_dsa_seed != imported.identity.ml_dsa_seed;
+    if !identity_changed && imported_history.is_none() {
+        return Ok(());
+    }
+
+    let entry = identity_changed.then(identity_entry).transpose()?;
+    let current_encoded = identity_changed
+        .then(|| serde_json::to_vec(&current).map_err(|error| error.to_string()))
+        .transpose()?;
+    let imported_encoded = identity_changed
+        .then(|| serde_json::to_vec(&imported.identity).map_err(|error| error.to_string()))
+        .transpose()?;
+    let archived = archive_identity_data(&data_dir, identity_changed)?;
+
+    let update_result = if let (Some(entry), Some(imported_encoded)) =
+        (entry.as_ref(), imported_encoded.as_ref())
+    {
+        entry
+            .set_secret(imported_encoded)
+            .map_err(|error| format!("ripristino nel keystore fallito: {error}"))
+            .and_then(|_| {
+                entry
+                    .get_secret()
+                    .map_err(|error| format!("verifica del keystore fallita: {error}"))
+            })
+            .and_then(|stored| {
+                (stored.as_slice() == imported_encoded.as_slice())
+                    .then_some(())
+                    .ok_or_else(|| "verifica del keystore fallita".to_owned())
+            })
+    } else {
+        Ok(())
+    }
+    .and_then(|_| {
+        imported_history
+            .as_deref()
+            .map(|history| write_backup_history(&data_dir, history))
+            .transpose()
+            .map(|_| ())
+    });
+
+    if let Err(error) = update_result {
+        let rollback_error = entry
+            .as_ref()
+            .zip(current_encoded.as_ref())
+            .and_then(|(entry, current)| entry.set_secret(current).err());
+        if let Some(archive) = archived.as_deref() {
+            restore_archived_identity_data(archive, &data_dir);
+        }
+        return match rollback_error {
+            Some(rollback) => Err(format!(
+                "{error}; anche il ripristino dell'identità precedente è fallito: {rollback}"
+            )),
+            None => Err(error),
+        };
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn node_status(state: State<'_, NodeState>) -> Result<bool, String> {
     let mut command_slot = state
         .commands
@@ -853,6 +1186,8 @@ pub fn run() {
             image_preview,
             profile_load,
             profile_save,
+            account_backup_export,
+            account_backup_import,
             node_status,
             node_stop
         ])
@@ -874,6 +1209,57 @@ mod tests {
         assert!(valid_font_scale(100));
         assert!(valid_font_scale(140));
         assert!(!valid_font_scale(99));
+    }
+
+    #[test]
+    fn encrypted_account_backup_round_trips_and_rejects_wrong_password() {
+        let identity = StoredIdentity {
+            version: 1,
+            classic: libp2p_identity::Keypair::generate_ed25519()
+                .to_protobuf_encoding()
+                .unwrap(),
+            ml_dsa_seed: [7; 32],
+        };
+        let history = [SQLITE_HEADER, b"test-history"].concat();
+        let payload = AccountBackupPayload {
+            identity,
+            history: Some(BASE64.encode(&history)),
+        };
+        let backup = encrypt_account_backup(&payload, "password lunga 123").unwrap();
+        let restored = decrypt_account_backup(&backup, "password lunga 123").unwrap();
+
+        assert_eq!(restored.identity.classic, payload.identity.classic);
+        assert_eq!(restored.identity.ml_dsa_seed, payload.identity.ml_dsa_seed);
+        assert_eq!(
+            decode_backup_history(restored.history.as_deref().unwrap()).unwrap(),
+            history
+        );
+        assert!(decrypt_account_backup(&backup, "password errata 123").is_err());
+        assert!(encrypt_account_backup(&payload, "corta").is_err());
+    }
+
+    #[test]
+    fn account_history_is_archived_and_restored() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "msnnext-account-history-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let history = [SQLITE_HEADER, b"test-history"].concat();
+        std::fs::write(data_dir.join("history.db"), &history).unwrap();
+
+        let encoded = read_backup_history(&data_dir).unwrap().unwrap();
+        let archive = archive_identity_data(&data_dir, false).unwrap().unwrap();
+        assert!(!data_dir.join("history.db").exists());
+        write_backup_history(&data_dir, &decode_backup_history(&encoded).unwrap()).unwrap();
+
+        assert_eq!(std::fs::read(data_dir.join("history.db")).unwrap(), history);
+        std::fs::remove_dir_all(archive).ok();
+        std::fs::remove_dir_all(data_dir).ok();
     }
 
     #[test]

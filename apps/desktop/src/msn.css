@@ -2049,6 +2049,46 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
 .settings-emoticons > p { margin: 0; padding: 12px; text-align: center; }
 .settings-emoticons .emoji-grid { grid-template-columns: repeat(5, 1fr); }
 
+.settings-account-backup {
+  margin: 16px 0 10px;
+  padding: 10px 11px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-soft);
+}
+
+.settings-account-backup > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-account-backup > header span,
+.settings-account-backup > header strong,
+.settings-account-backup > header small { display: block; }
+.settings-account-backup > header strong { font-size: 0.84rem; }
+.settings-account-backup > header small,
+.settings-account-backup > p { color: var(--muted); font-size: 0.72rem; }
+.settings-account-backup > header small { margin-top: 2px; }
+.settings-account-backup > p { margin: 8px 0 0; }
+
+.account-backup-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.account-backup-actions .secondary-button {
+  width: 100%;
+  margin: 0;
+}
+
+.account-backup-modal { width: min(420px, calc(100vw - 32px)); }
+.account-backup-modal > form { margin: 0; }
+.account-backup-modal > form > small { display: block; margin: 5px 0 14px; color: var(--muted); font-size: 0.72rem; }
+
 .security-reopen {
   width: 100%;
   min-height: 34px;
