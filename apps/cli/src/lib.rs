@@ -2,6 +2,7 @@ mod attachments;
 mod connectivity;
 mod contacts;
 mod crypto;
+mod devices;
 mod history;
 
 use attachments::{build_manifest, read_chunk, validate_manifest, CompletedAttachment, Receiver};
@@ -12,8 +13,9 @@ use crypto::{
     accepts_inbound, needs_outbound_handshake, respond as respond_hybrid, HybridInitiator,
     HybridResponse, RatchetMessage, RatchetSession, SessionKey,
 };
+use devices::{DeviceDescriptor, DeviceRequest, DeviceResponse, PairingLink, SealedDeviceMessage};
 use futures::StreamExt;
-use history::{GroupChatEntry, History};
+use history::{DeviceEntry, GroupChatEntry, History};
 use libp2p::{
     autonat, dcutr, identify,
     identity::Keypair,
@@ -41,6 +43,7 @@ use std::{
     fs,
     future::pending,
     path::{Path, PathBuf},
+    sync::Arc,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -62,6 +65,7 @@ const RELAY_MAX_CIRCUIT_BYTES: u64 = attachments::MAX_FILE_BYTES + 64 * 1024 * 1
 const RELAY_MAX_CIRCUIT_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 const DEFAULT_RELAY_ADDRESS: &str =
     "/ip4/173.212.233.151/tcp/4001/p2p/12D3KooWCQBCLXYhjkhay3hXTrhrNF8ZjRLd8qHL2nD2iufais4k";
+type AccountKeyStore = Arc<dyn Fn([u8; 32]) -> Result<(), String> + Send + Sync>;
 
 #[derive(Debug)]
 pub enum ClientCommand {
@@ -148,6 +152,10 @@ pub enum ClientCommand {
         until_ms: Option<u64>,
     },
     RequestContactLink,
+    RequestDeviceLink,
+    ImportDeviceLink {
+        link: String,
+    },
     UpdateDisplayName {
         name: String,
     },
@@ -181,6 +189,8 @@ impl ClientCommand {
             | Self::SetNotificationMute { .. }
             | Self::ImportContactLink { .. }
             | Self::RequestContactLink
+            | Self::RequestDeviceLink
+            | Self::ImportDeviceLink { .. }
             | Self::UpdateDisplayName { .. }
             | Self::Shutdown => None,
         }
@@ -207,6 +217,16 @@ pub fn generate_secret() -> [u8; 32] {
     secret
 }
 
+pub fn rekey_history_database(
+    path: &Path,
+    old_identity: &[u8],
+    new_identity: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    let old_key = blake3::derive_key("msnnext local history v1", old_identity);
+    let new_key = blake3::derive_key("msnnext local history v1", new_identity);
+    history::rekey_database(path, old_key, new_key)
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientContact {
@@ -215,6 +235,15 @@ pub struct ClientContact {
     pub online: bool,
     pub secure: bool,
     pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientDevice {
+    pub peer_id: String,
+    pub name: String,
+    pub online: bool,
+    pub last_seen_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -319,6 +348,19 @@ pub enum ClientEvent {
         link: String,
         qr_link: String,
     },
+    DeviceLink {
+        link: String,
+        qr_link: String,
+        expires_at_ms: u64,
+    },
+    DevicesUpdated {
+        devices: Vec<ClientDevice>,
+    },
+    DeviceSynchronized {
+        peer_id: String,
+        applied: usize,
+        paired: bool,
+    },
     AttachmentReceived {
         peer_id: String,
         id: String,
@@ -387,6 +429,7 @@ struct Behaviour {
     chat: request_response::cbor::Behaviour<Envelope, ProtocolResponse>,
     secure_chat: request_response::cbor::Behaviour<RatchetMessage, ProtocolResponse>,
     handshake: request_response::cbor::Behaviour<crypto::HybridClientHello, HybridResponse>,
+    devices: request_response::cbor::Behaviour<SealedDeviceMessage, SealedDeviceMessage>,
     mdns: mdns::tokio::Behaviour,
     identify: identify::Behaviour,
     kad: kad::Behaviour<kad::store::MemoryStore>,
@@ -423,6 +466,16 @@ struct PendingInboundOffer {
     channel: request_response::ResponseChannel<ProtocolResponse>,
 }
 
+enum PendingDeviceRequest {
+    Pair { peer: PeerId, key: [u8; 32] },
+    Sync { peer: PeerId },
+}
+
+struct PendingPairing {
+    secret: [u8; 32],
+    expires_at_ms: u64,
+}
+
 struct Incoming<'a> {
     pending_emoticons: &'a mut HashMap<[u8; 32], EmoticonOffer>,
     events: &'a mpsc::UnboundedSender<ClientEvent>,
@@ -434,6 +487,16 @@ struct Incoming<'a> {
     peer_names: &'a mut HashMap<PeerId, String>,
     local_peer_id: PeerId,
     incoming_attachments: &'a mut HashMap<(PeerId, [u8; 32]), HashSet<Option<String>>>,
+}
+
+struct SyncConnections<'a> {
+    swarm: &'a mut Swarm<Behaviour>,
+    online_contacts: &'a HashSet<PeerId>,
+    online_devices: &'a HashSet<PeerId>,
+    dialing: &'a mut HashSet<PeerId>,
+    bootstrap_fallbacks: &'a mut HashMap<PeerId, VecDeque<Multiaddr>>,
+    fallback_planner: &'a mut FallbackPlanner,
+    pending_dht: &'a mut HashMap<kad::QueryId, PeerId>,
 }
 
 fn build_swarm(
@@ -480,6 +543,13 @@ fn build_swarm(
                 handshake: request_response::cbor::Behaviour::new(
                     [(
                         StreamProtocol::new("/msnnext/handshake/1"),
+                        ProtocolSupport::Full,
+                    )],
+                    request_response::Config::default(),
+                ),
+                devices: request_response::cbor::Behaviour::new(
+                    [(
+                        StreamProtocol::new("/msnnext/devices/1"),
                         ProtocolSupport::Full,
                     )],
                     request_response::Config::default(),
@@ -534,6 +604,9 @@ pub async fn run(
     let ml_dsa_identity = crypto::MlDsaIdentity::from_seed(&ml_dsa_seed)?;
     let contact_identity = identity.clone();
     let identity_bytes = identity.to_protobuf_encoding()?;
+    let mut account_key = args
+        .account_key
+        .unwrap_or_else(|| blake3::derive_key("msnnext account root v1", &identity_bytes));
     let history_key = blake3::derive_key("msnnext local history v1", &identity_bytes);
     let attachment_key = blake3::derive_key("msnnext attachment vault v1", &identity_bytes);
     let history = History::open(&args.history, history_key)?;
@@ -638,6 +711,25 @@ pub async fn run(
     let mut stdin_open = true;
     let mut commands_open = true;
     let mut contact_link_requested = false;
+    let mut device_link_requested = false;
+    let mut pending_pairings = HashMap::<[u8; 16], PendingPairing>::new();
+    let mut pending_pair_targets = HashMap::<PeerId, PairingLink>::new();
+    let mut pending_device_requests =
+        HashMap::<request_response::OutboundRequestId, PendingDeviceRequest>::new();
+    let mut online_devices = HashSet::<PeerId>::new();
+    let mut known_devices = history
+        .devices()?
+        .into_iter()
+        .filter_map(|device| {
+            device
+                .peer
+                .parse::<PeerId>()
+                .ok()
+                .map(|peer| (peer, device))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut device_sync_tick = tokio::time::interval(Duration::from_secs(2));
+    device_sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     for contact in persisted_contacts {
         let restored = if contact.link.is_empty() {
@@ -658,6 +750,10 @@ pub async fn run(
                 continue;
             }
         };
+        if known_devices.contains_key(&peer_id) {
+            history.delete_contact(&peer_id.to_string())?;
+            continue;
+        }
         peer_names.insert(peer_id, name.clone());
         known_contacts.insert(peer_id);
         let _ = events.send(ClientEvent::ContactUpdated {
@@ -712,6 +808,23 @@ pub async fn run(
                 &mut pending_dht,
             );
         }
+    }
+    send_devices(&known_devices, &online_devices, &events);
+    for (peer, device) in &known_devices {
+        let addresses = device
+            .addresses
+            .iter()
+            .filter_map(|address| address.parse::<Multiaddr>().ok())
+            .collect();
+        connect_contact(
+            &mut swarm,
+            *peer,
+            addresses,
+            &mut dialing,
+            &mut bootstrap_fallbacks,
+            &mut fallback_planner,
+            &mut pending_dht,
+        );
     }
     let group_chats = history.group_chats()?;
     send_group_chats(&group_chats, &events);
@@ -777,13 +890,46 @@ pub async fn run(
             .min_by_key(|(_, deadline)| **deadline)
             .map(|(peer, deadline)| (*peer, *deadline));
         tokio::select! {
+            _ = device_sync_tick.tick(), if !online_devices.is_empty() => {
+                let latest_seq = history.latest_sync_seq()?;
+                let available = online_devices
+                    .iter()
+                    .copied()
+                    .filter(|peer| {
+                        history
+                            .sync_cursors(&peer.to_string())
+                            .map(|(_, sent_seq)| latest_seq > sent_seq)
+                            .unwrap_or(true)
+                    })
+                    .filter(|peer| !pending_device_requests.values().any(|pending| match pending {
+                        PendingDeviceRequest::Pair { peer: pending_peer, .. }
+                        | PendingDeviceRequest::Sync { peer: pending_peer } => pending_peer == peer,
+                    }))
+                    .collect::<Vec<_>>();
+                for peer in available {
+                    let descriptor = local_device_descriptor(
+                        local_peer_id,
+                        &display_name,
+                        contact_addresses(&swarm, &args.relays, local_peer_id),
+                    );
+                    send_device_sync(
+                        &mut swarm,
+                        &history,
+                        &account_key,
+                        &mut pending_device_requests,
+                        peer,
+                        descriptor,
+                    )?;
+                }
+            }
             _ = wait_for_reconnect(next_reconnect.map(|(_, deadline)| deadline)) => {
                 let Some((peer, _)) = next_reconnect else {
                     continue;
                 };
                 reconnect_at.remove(&peer);
-                if known_contacts.contains(&peer)
+                if (known_contacts.contains(&peer) || known_devices.contains_key(&peer))
                     && !peers.contains(&peer)
+                    && !online_devices.contains(&peer)
                     && dialing.insert(peer)
                 {
                     if let Err(error) = swarm.dial(DialOpts::peer_id(peer).build()) {
@@ -942,6 +1088,91 @@ pub async fn run(
                             Err(error) => {
                                 let _ = events.send(ClientEvent::Error { message: error.to_string() });
                             }
+                        }
+                    }
+                }
+                Some(ClientCommand::RequestDeviceLink) => {
+                    device_link_requested = true;
+                    let addresses = contact_addresses(&swarm, &args.relays, local_peer_id);
+                    if !addresses.is_empty() {
+                        let descriptor = local_device_descriptor(
+                            local_peer_id,
+                            &display_name,
+                            addresses,
+                        );
+                        match devices::create_pairing_link(descriptor, now_ms()) {
+                            Ok((link, pairing)) => {
+                                device_link_requested = false;
+                                pending_pairings.insert(
+                                    devices::key_id(&pairing.secret),
+                                    PendingPairing {
+                                        secret: pairing.secret,
+                                        expires_at_ms: pairing.expires_at_ms,
+                                    },
+                                );
+                                let _ = events.send(ClientEvent::DeviceLink {
+                                    qr_link: link.clone(),
+                                    link,
+                                    expires_at_ms: pairing.expires_at_ms,
+                                });
+                            }
+                            Err(error) => {
+                                let _ = events.send(ClientEvent::Error { message: error.to_string() });
+                            }
+                        }
+                    }
+                }
+                Some(ClientCommand::ImportDeviceLink { link }) => {
+                    match devices::parse_pairing_link(&link, now_ms()) {
+                        Ok(pairing) => {
+                            let peer = pairing.inviter.peer_id.parse::<PeerId>()?;
+                            if peer == local_peer_id {
+                                let _ = events.send(ClientEvent::Error { message: "non puoi collegare il dispositivo a se stesso".into() });
+                                continue;
+                            }
+                            let addresses = pairing
+                                .inviter
+                                .addresses
+                                .iter()
+                                .map(|address| address.parse::<Multiaddr>())
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let secret = pairing.secret;
+                            pending_pair_targets.insert(peer, pairing);
+                            if swarm.is_connected(&peer) {
+                                let descriptor = local_device_descriptor(
+                                    local_peer_id,
+                                    &display_name,
+                                    contact_addresses(&swarm, &args.relays, local_peer_id),
+                                );
+                                let records = history
+                                    .sync_records_since(0, devices::MAX_SYNC_RECORDS)?;
+                                let request = DeviceRequest::Pair {
+                                    device: descriptor,
+                                    records,
+                                };
+                                let sealed = devices::seal(&secret, &request)?;
+                                let request_id = swarm
+                                    .behaviour_mut()
+                                    .devices
+                                    .send_request(&peer, sealed);
+                                pending_device_requests.insert(
+                                    request_id,
+                                    PendingDeviceRequest::Pair { peer, key: secret },
+                                );
+                            } else {
+                                connect_contact(
+                                    &mut swarm,
+                                    peer,
+                                    addresses,
+                                    &mut dialing,
+                                    &mut bootstrap_fallbacks,
+                                    &mut fallback_planner,
+                                    &mut pending_dht,
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            let _ = events.send(ClientEvent::Error { message: error.to_string() });
                         }
                     }
                 }
@@ -1600,6 +1831,36 @@ pub async fn run(
                             }
                         }
                     }
+                    if device_link_requested {
+                        let addresses = contact_addresses(&swarm, &args.relays, local_peer_id);
+                        if !addresses.is_empty() {
+                            let descriptor = local_device_descriptor(
+                                local_peer_id,
+                                &display_name,
+                                addresses,
+                            );
+                            match devices::create_pairing_link(descriptor, now_ms()) {
+                                Ok((link, pairing)) => {
+                                    device_link_requested = false;
+                                    pending_pairings.insert(
+                                        devices::key_id(&pairing.secret),
+                                        PendingPairing {
+                                            secret: pairing.secret,
+                                            expires_at_ms: pairing.expires_at_ms,
+                                        },
+                                    );
+                                    let _ = events.send(ClientEvent::DeviceLink {
+                                        qr_link: link.clone(),
+                                        link,
+                                        expires_at_ms: pairing.expires_at_ms,
+                                    });
+                                }
+                                Err(error) => {
+                                    let _ = events.send(ClientEvent::Error { message: error.to_string() });
+                                }
+                            }
+                        }
+                    }
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                     dialing.remove(&peer_id);
@@ -1616,6 +1877,50 @@ pub async fn run(
                                 eprintln!("prenotazione relay fallita: {error}");
                             }
                         }
+                    }
+                    let device_request_pending = pending_device_requests.values().any(|pending| {
+                        match pending {
+                            PendingDeviceRequest::Pair { peer, .. }
+                            | PendingDeviceRequest::Sync { peer } => *peer == peer_id,
+                        }
+                    });
+                    if let Some(pairing) = pending_pair_targets
+                        .get(&peer_id)
+                        .filter(|_| !device_request_pending)
+                    {
+                        let descriptor = local_device_descriptor(
+                            local_peer_id,
+                            &display_name,
+                            contact_addresses(&swarm, &args.relays, local_peer_id),
+                        );
+                        let records = history.sync_records_since(0, devices::MAX_SYNC_RECORDS)?;
+                        let request = DeviceRequest::Pair { device: descriptor, records };
+                        let sealed = devices::seal(&pairing.secret, &request)?;
+                        let request_id = swarm.behaviour_mut().devices.send_request(&peer_id, sealed);
+                        pending_device_requests.insert(
+                            request_id,
+                            PendingDeviceRequest::Pair { peer: peer_id, key: pairing.secret },
+                        );
+                    } else if known_devices.contains_key(&peer_id) && !device_request_pending {
+                        online_devices.insert(peer_id);
+                        if let Some(device) = known_devices.get_mut(&peer_id) {
+                            device.last_seen_ms = now_ms();
+                            history.save_device(device)?;
+                        }
+                        send_devices(&known_devices, &online_devices, &events);
+                        let descriptor = local_device_descriptor(
+                            local_peer_id,
+                            &display_name,
+                            contact_addresses(&swarm, &args.relays, local_peer_id),
+                        );
+                        send_device_sync(
+                            &mut swarm,
+                            &history,
+                            &account_key,
+                            &mut pending_device_requests,
+                            peer_id,
+                            descriptor,
+                        )?;
                     }
                     let is_manual = accept_unclassified_manual && !infrastructure_peers.contains(&peer_id);
                     if is_manual {
@@ -1641,6 +1946,9 @@ pub async fn run(
                 }
                 SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
                     if num_established == 0 {
+                        if online_devices.remove(&peer_id) {
+                            send_devices(&known_devices, &online_devices, &events);
+                        }
                         let was_application_peer = peers.remove(&peer_id);
                         sessions.remove(&peer_id);
                         shared_emoticons.retain(|(peer, _)| *peer != peer_id);
@@ -1666,7 +1974,7 @@ pub async fn run(
                             });
                         }
                         if should_reconnect_closed_peer(
-                            known_contacts.contains(&peer_id),
+                            known_contacts.contains(&peer_id) || known_devices.contains_key(&peer_id),
                             num_established,
                         ) {
                             dialing.remove(&peer_id);
@@ -1754,13 +2062,17 @@ pub async fn run(
                 },
                 SwarmEvent::Behaviour(BehaviourEvent::SecureChat(request_response::Event::Message { peer, message, .. })) => match message {
                     request_response::Message::Request { request_id, request, channel } => {
-                        let envelope = sessions
-                            .get_mut(&peer)
-                            .ok_or("sessione sicura non disponibile")
-                            .and_then(|session| {
-                                decrypt_envelope(session, peer, local_peer_id, &request)
-                                    .map_err(|_| "messaggio cifrato non valido")
-                            });
+                        let envelope = if ignored_contacts.contains(&peer) {
+                            Err("contatto rimosso")
+                        } else {
+                            sessions
+                                .get_mut(&peer)
+                                .ok_or("sessione sicura non disponibile")
+                                .and_then(|session| {
+                                    decrypt_envelope(session, peer, local_peer_id, &request)
+                                        .map_err(|_| "messaggio cifrato non valido")
+                                })
+                        };
                         let response = match envelope {
                             Ok(envelope) => match validate_envelope(peer, local_peer_id, &envelope) {
                                 Ok(()) => {
@@ -2087,6 +2399,199 @@ pub async fn run(
                         }
                     }
                 }
+                SwarmEvent::Behaviour(BehaviourEvent::Devices(request_response::Event::Message { peer, message, .. })) => match message {
+                    request_response::Message::Request { request, channel, .. } => {
+                        pending_pairings.retain(|_, pairing| pairing.expires_at_ms >= now_ms());
+                        let pairing_key = pending_pairings
+                            .get(&request.key_id)
+                            .map(|pairing| pairing.secret);
+                        let selected_key = if request.key_id == devices::key_id(&account_key) {
+                            Some(account_key)
+                        } else {
+                            pairing_key
+                        };
+                        let response = match selected_key {
+                            Some(key) => match devices::open::<DeviceRequest>(&key, &request) {
+                                Ok(DeviceRequest::Pair { device, records })
+                                    if pairing_key.is_some() && device.peer_id == peer.to_string() =>
+                                {
+                                    let applied = history.apply_sync_records(&records)?;
+                                    let entry = device_entry(&device, now_ms());
+                                    history.save_device(&entry)?;
+                                    known_devices.insert(peer, entry);
+                                    peers.remove(&peer);
+                                    sessions.remove(&peer);
+                                    known_contacts.remove(&peer);
+                                    peer_names.remove(&peer);
+                                    if history.contacts()?.iter().any(|contact| contact.peer == peer.to_string()) {
+                                        history.delete_contact(&peer.to_string())?;
+                                    }
+                                    online_devices.insert(peer);
+                                    pending_pairings.remove(&request.key_id);
+                                    let mut linked = known_devices
+                                        .values()
+                                        .map(device_descriptor)
+                                        .collect::<Vec<_>>();
+                                    linked.push(local_device_descriptor(
+                                        local_peer_id,
+                                        &display_name,
+                                        contact_addresses(&swarm, &args.relays, local_peer_id),
+                                    ));
+                                    let outgoing = history.sync_records_since(0, devices::MAX_SYNC_RECORDS)?;
+                                    let accepted_through = records.last().map_or(0, |record| record.seq);
+                                    let payload = DeviceResponse::Paired {
+                                        account_key,
+                                        devices: linked,
+                                        records: outgoing,
+                                        latest_seq: history.latest_sync_seq()?,
+                                        accepted_through,
+                                    };
+                                    refresh_synced_state(
+                                        &history,
+                                        &mut known_contacts,
+                                        &mut ignored_contacts,
+                                        &mut peer_names,
+                                        &peers,
+                                        &sessions,
+                                        &events,
+                                    )?;
+                                    send_group_chats(&history.group_chats()?, &events);
+                                    send_devices(&known_devices, &online_devices, &events);
+                                    connect_synced_peers(&history, &known_devices, local_peer_id, &mut SyncConnections { swarm: &mut swarm, online_contacts: &peers, online_devices: &online_devices, dialing: &mut dialing, bootstrap_fallbacks: &mut bootstrap_fallbacks, fallback_planner: &mut fallback_planner, pending_dht: &mut pending_dht })?;
+                                    let _ = events.send(ClientEvent::DeviceSynchronized {
+                                        peer_id: peer.to_string(),
+                                        applied: applied.applied,
+                                        paired: true,
+                                    });
+                                    devices::seal(&key, &payload)?
+                                }
+                                Ok(DeviceRequest::Sync { device, after_seq, records })
+                                    if pairing_key.is_none() && device.peer_id == peer.to_string() =>
+                                {
+                                    let applied = history.apply_sync_records(&records)?;
+                                    let entry = device_entry(&device, now_ms());
+                                    history.save_device(&entry)?;
+                                    known_devices.insert(peer, entry);
+                                    online_devices.insert(peer);
+                                    let outgoing = history.sync_records_since(
+                                        after_seq,
+                                        devices::MAX_SYNC_RECORDS,
+                                    )?;
+                                    let payload = DeviceResponse::Synced {
+                                        records: outgoing,
+                                        latest_seq: history.latest_sync_seq()?,
+                                        accepted_through: records.last().map_or(0, |record| record.seq),
+                                    };
+                                    refresh_synced_state(
+                                        &history,
+                                        &mut known_contacts,
+                                        &mut ignored_contacts,
+                                        &mut peer_names,
+                                        &peers,
+                                        &sessions,
+                                        &events,
+                                    )?;
+                                    send_group_chats(&history.group_chats()?, &events);
+                                    send_devices(&known_devices, &online_devices, &events);
+                                    connect_synced_peers(&history, &known_devices, local_peer_id, &mut SyncConnections { swarm: &mut swarm, online_contacts: &peers, online_devices: &online_devices, dialing: &mut dialing, bootstrap_fallbacks: &mut bootstrap_fallbacks, fallback_planner: &mut fallback_planner, pending_dht: &mut pending_dht })?;
+                                    let _ = events.send(ClientEvent::DeviceSynchronized {
+                                        peer_id: peer.to_string(),
+                                        applied: applied.applied,
+                                        paired: false,
+                                    });
+                                    devices::seal(&key, &payload)?
+                                }
+                                _ => devices::seal(&key, &DeviceResponse::Rejected("richiesta dispositivo non valida".into()))?,
+                            },
+                            None => devices::seal(&[0u8; 32], &DeviceResponse::Rejected("codice non riconosciuto".into()))?,
+                        };
+                        swarm.behaviour_mut().devices.send_response(channel, response).ok();
+                    }
+                    request_response::Message::Response { request_id, response } => {
+                        let Some(pending) = pending_device_requests.remove(&request_id) else {
+                            continue;
+                        };
+                        let (expected_peer, key, pairing) = match pending {
+                            PendingDeviceRequest::Pair { peer, key } => (peer, key, true),
+                            PendingDeviceRequest::Sync { peer } => (peer, account_key, false),
+                        };
+                        if expected_peer != peer {
+                            continue;
+                        }
+                        match devices::open::<DeviceResponse>(&key, &response) {
+                            Ok(DeviceResponse::Paired { account_key: linked_key, devices: linked, records, latest_seq, accepted_through }) if pairing => {
+                                if let Some(store) = &args.account_key_store {
+                                    store(linked_key).map_err(|error| format!("account collegato ma non salvabile: {error}"))?;
+                                }
+                                account_key = linked_key;
+                                pending_pair_targets.remove(&peer);
+                                if history.contacts()?.iter().any(|contact| contact.peer == local_peer_id.to_string()) {
+                                    history.delete_contact(&local_peer_id.to_string())?;
+                                }
+                                for device in linked {
+                                    if device.peer_id == local_peer_id.to_string() {
+                                        continue;
+                                    }
+                                    if let Ok(device_peer) = device.peer_id.parse::<PeerId>() {
+                                        let entry = device_entry(&device, now_ms());
+                                        history.save_device(&entry)?;
+                                        known_devices.insert(device_peer, entry);
+                                        peers.remove(&device_peer);
+                                        sessions.remove(&device_peer);
+                                        known_contacts.remove(&device_peer);
+                                        peer_names.remove(&device_peer);
+                                        if history.contacts()?.iter().any(|contact| contact.peer == device_peer.to_string()) {
+                                            history.delete_contact(&device_peer.to_string())?;
+                                        }
+                                    }
+                                }
+                                online_devices.insert(peer);
+                                let applied = history.apply_sync_records(&records)?;
+                                let received_through = records.last().map_or(0, |record| record.seq);
+                                history.update_sync_cursors(&peer.to_string(), received_through, accepted_through)?;
+                                refresh_synced_state(&history, &mut known_contacts, &mut ignored_contacts, &mut peer_names, &peers, &sessions, &events)?;
+                                send_group_chats(&history.group_chats()?, &events);
+                                send_devices(&known_devices, &online_devices, &events);
+                                connect_synced_peers(&history, &known_devices, local_peer_id, &mut SyncConnections { swarm: &mut swarm, online_contacts: &peers, online_devices: &online_devices, dialing: &mut dialing, bootstrap_fallbacks: &mut bootstrap_fallbacks, fallback_planner: &mut fallback_planner, pending_dht: &mut pending_dht })?;
+                                let _ = events.send(ClientEvent::DeviceSynchronized { peer_id: peer.to_string(), applied: applied.applied, paired: true });
+                                if received_through < latest_seq || accepted_through < history.latest_sync_seq()? {
+                                    let descriptor = local_device_descriptor(local_peer_id, &display_name, contact_addresses(&swarm, &args.relays, local_peer_id));
+                                    send_device_sync(&mut swarm, &history, &account_key, &mut pending_device_requests, peer, descriptor)?;
+                                }
+                            }
+                            Ok(DeviceResponse::Synced { records, latest_seq, accepted_through }) if !pairing => {
+                                let applied = history.apply_sync_records(&records)?;
+                                let received_through = records.last().map_or_else(
+                                    || history.sync_cursors(&peer.to_string()).map(|cursor| cursor.0).unwrap_or_default(),
+                                    |record| record.seq,
+                                );
+                                history.update_sync_cursors(&peer.to_string(), received_through, accepted_through)?;
+                                refresh_synced_state(&history, &mut known_contacts, &mut ignored_contacts, &mut peer_names, &peers, &sessions, &events)?;
+                                send_group_chats(&history.group_chats()?, &events);
+                                connect_synced_peers(&history, &known_devices, local_peer_id, &mut SyncConnections { swarm: &mut swarm, online_contacts: &peers, online_devices: &online_devices, dialing: &mut dialing, bootstrap_fallbacks: &mut bootstrap_fallbacks, fallback_planner: &mut fallback_planner, pending_dht: &mut pending_dht })?;
+                                let _ = events.send(ClientEvent::DeviceSynchronized { peer_id: peer.to_string(), applied: applied.applied, paired: false });
+                                if received_through < latest_seq || accepted_through < history.latest_sync_seq()? {
+                                    let descriptor = local_device_descriptor(local_peer_id, &display_name, contact_addresses(&swarm, &args.relays, local_peer_id));
+                                    send_device_sync(&mut swarm, &history, &account_key, &mut pending_device_requests, peer, descriptor)?;
+                                }
+                            }
+                            Ok(DeviceResponse::Rejected(message)) => {
+                                let _ = events.send(ClientEvent::Error { message });
+                            }
+                            _ => {
+                                let _ = events.send(ClientEvent::Error { message: "risposta dispositivo non valida".into() });
+                            }
+                        }
+                    }
+                },
+                SwarmEvent::Behaviour(BehaviourEvent::Devices(request_response::Event::OutboundFailure { peer, request_id, error, .. })) => {
+                    pending_device_requests.remove(&request_id);
+                    let _ = events.send(ClientEvent::Error { message: format!("sincronizzazione con {peer} fallita: {error}") });
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Devices(request_response::Event::InboundFailure { peer, error, .. })) => {
+                    eprintln!("sincronizzazione non ricevibile da {peer}: {error}");
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Devices(request_response::Event::ResponseSent { .. })) => {}
                 SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                     for address in info.listen_addrs {
                         let address = match split_peer_address(&address) {
@@ -2123,14 +2628,22 @@ pub async fn run(
                             .map(|(_, base)| base)
                             .unwrap_or(address);
                         swarm.behaviour_mut().kad.add_address(&peer_id, base.clone());
+                        let is_device = known_devices.contains_key(&peer_id)
+                            || pending_pair_targets.contains_key(&peer_id);
                         if !args.relay_server
                             && peer_id != local_peer_id
                             && !infrastructure_peers.contains(&peer_id)
-                            && !ignored_contacts.contains(&peer_id)
-                            && !peers.contains(&peer_id)
+                            && (is_device || !ignored_contacts.contains(&peer_id))
+                            && if is_device {
+                                !online_devices.contains(&peer_id)
+                            } else {
+                                !peers.contains(&peer_id)
+                            }
                             && mdns_dialing.insert(peer_id)
                         {
-                            known_contacts.insert(peer_id);
+                            if !is_device {
+                                known_contacts.insert(peer_id);
+                            }
                             dialing.insert(peer_id);
                             println!("peer LAN trovato: {peer_id}");
                             let address = base.with(Protocol::P2p(peer_id));
@@ -2148,7 +2661,7 @@ pub async fn run(
                 SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                     if let Some(peer_id) = peer_id {
                         mdns_dialing.remove(&peer_id);
-                        if peers.contains(&peer_id) {
+                        if peers.contains(&peer_id) || online_devices.contains(&peer_id) {
                             eprintln!("dial duplicato ignorato per peer già connesso: {peer_id}");
                         } else if let Some(address) = bootstrap_fallbacks.get_mut(&peer_id).and_then(VecDeque::pop_front) {
                             eprintln!("bootstrap fallito, provo il prossimo indirizzo: {error}");
@@ -2156,7 +2669,12 @@ pub async fn run(
                         } else {
                             dialing.remove(&peer_id);
                             eprintln!("connessione fallita: {error}");
-                            if known_contacts.contains(&peer_id) {
+                            if pending_pair_targets.contains_key(&peer_id) {
+                                let _ = events.send(ClientEvent::Error {
+                                    message: "l'altro dispositivo non è raggiungibile; verifica che sia online e che il codice non sia scaduto".into(),
+                                });
+                            }
+                            if known_contacts.contains(&peer_id) || known_devices.contains_key(&peer_id) {
                                 let recovery = fallback_planner.after_failure(peer_id);
                                 execute_recovery(&mut swarm, &mut pending_dht, recovery);
                                 schedule_reconnect(
@@ -3288,6 +3806,250 @@ fn group_definition(group: &GroupChatEntry) -> Result<GroupDefinition, String> {
     Ok(definition)
 }
 
+fn local_device_descriptor(
+    peer_id: PeerId,
+    name: &str,
+    addresses: Vec<Multiaddr>,
+) -> DeviceDescriptor {
+    DeviceDescriptor {
+        peer_id: peer_id.to_string(),
+        name: name.to_owned(),
+        addresses: addresses
+            .into_iter()
+            .map(|address| address.to_string())
+            .collect(),
+    }
+}
+
+fn device_entry(device: &DeviceDescriptor, last_seen_ms: u64) -> DeviceEntry {
+    DeviceEntry {
+        peer: device.peer_id.clone(),
+        name: device.name.clone(),
+        addresses: device.addresses.clone(),
+        last_seen_ms,
+    }
+}
+
+fn device_descriptor(device: &DeviceEntry) -> DeviceDescriptor {
+    DeviceDescriptor {
+        peer_id: device.peer.clone(),
+        name: device.name.clone(),
+        addresses: device.addresses.clone(),
+    }
+}
+
+fn send_devices(
+    devices: &HashMap<PeerId, DeviceEntry>,
+    online: &HashSet<PeerId>,
+    events: &mpsc::UnboundedSender<ClientEvent>,
+) {
+    let mut devices = devices
+        .iter()
+        .map(|(peer, device)| ClientDevice {
+            peer_id: peer.to_string(),
+            name: device.name.clone(),
+            online: online.contains(peer),
+            last_seen_ms: device.last_seen_ms,
+        })
+        .collect::<Vec<_>>();
+    devices.sort_by_key(|device| device.name.to_lowercase());
+    let _ = events.send(ClientEvent::DevicesUpdated { devices });
+}
+
+fn send_device_sync(
+    swarm: &mut Swarm<Behaviour>,
+    history: &History,
+    account_key: &[u8; 32],
+    pending: &mut HashMap<request_response::OutboundRequestId, PendingDeviceRequest>,
+    peer: PeerId,
+    device: DeviceDescriptor,
+) -> Result<(), Box<dyn Error>> {
+    let (remote_seq, sent_seq) = history.sync_cursors(&peer.to_string())?;
+    let records = history.sync_records_since(sent_seq, devices::MAX_SYNC_RECORDS)?;
+    let request = DeviceRequest::Sync {
+        device,
+        after_seq: remote_seq,
+        records,
+    };
+    let sealed = devices::seal(account_key, &request)?;
+    let request_id = swarm.behaviour_mut().devices.send_request(&peer, sealed);
+    pending.insert(request_id, PendingDeviceRequest::Sync { peer });
+    Ok(())
+}
+
+fn connect_synced_peers(
+    history: &History,
+    devices: &HashMap<PeerId, DeviceEntry>,
+    local_peer_id: PeerId,
+    connections: &mut SyncConnections<'_>,
+) -> Result<(), Box<dyn Error>> {
+    for contact in history.contacts()? {
+        if contact.link.is_empty() {
+            continue;
+        }
+        let Ok((_, peer, addresses)) = contacts::import_link(&contact.link) else {
+            continue;
+        };
+        if peer != local_peer_id && !connections.online_contacts.contains(&peer) {
+            connect_contact(
+                connections.swarm,
+                peer,
+                addresses,
+                connections.dialing,
+                connections.bootstrap_fallbacks,
+                connections.fallback_planner,
+                connections.pending_dht,
+            );
+        }
+    }
+    for (peer, device) in devices {
+        if *peer == local_peer_id || connections.online_devices.contains(peer) {
+            continue;
+        }
+        let addresses = device
+            .addresses
+            .iter()
+            .filter_map(|address| address.parse::<Multiaddr>().ok())
+            .collect();
+        connect_contact(
+            connections.swarm,
+            *peer,
+            addresses,
+            connections.dialing,
+            connections.bootstrap_fallbacks,
+            connections.fallback_planner,
+            connections.pending_dht,
+        );
+    }
+    Ok(())
+}
+
+fn refresh_synced_state(
+    history: &History,
+    known_contacts: &mut HashSet<PeerId>,
+    ignored_contacts: &mut HashSet<PeerId>,
+    peer_names: &mut HashMap<PeerId, String>,
+    online_contacts: &HashSet<PeerId>,
+    sessions: &HashMap<PeerId, RatchetSession>,
+    events: &mpsc::UnboundedSender<ClientEvent>,
+) -> Result<(), Box<dyn Error>> {
+    *ignored_contacts = history
+        .ignored_contacts()?
+        .into_iter()
+        .filter_map(|peer| peer.parse().ok())
+        .collect();
+    let contacts = history.contacts()?;
+    let persisted = contacts
+        .iter()
+        .filter_map(|contact| contact.peer.parse::<PeerId>().ok())
+        .collect::<HashSet<_>>();
+    let removed = known_contacts
+        .difference(&persisted)
+        .copied()
+        .collect::<Vec<_>>();
+    for peer in removed {
+        known_contacts.remove(&peer);
+        peer_names.remove(&peer);
+        let _ = events.send(ClientEvent::ContactRemoved {
+            peer_id: peer.to_string(),
+        });
+    }
+    for contact in contacts {
+        let Ok(peer) = contact.peer.parse::<PeerId>() else {
+            continue;
+        };
+        known_contacts.insert(peer);
+        peer_names.insert(peer, contact.name.clone());
+        let _ = events.send(ClientEvent::ContactUpdated {
+            contact: ClientContact {
+                peer_id: contact.peer.clone(),
+                name: contact.name,
+                online: online_contacts.contains(&peer),
+                secure: sessions.contains_key(&peer),
+                fingerprint: peer_fingerprint(peer),
+            },
+        });
+        let messages = history
+            .conversation(&contact.peer, 100)?
+            .into_iter()
+            .rev()
+            .map(|entry| {
+                let attachment = (entry.kind == "file")
+                    .then(|| decode_attachment(&entry.body))
+                    .flatten();
+                let text = (entry.kind == "text").then(|| decode_text_history(&entry.body));
+                ClientMessage {
+                    peer_id: entry.peer,
+                    direction: entry.direction,
+                    kind: entry.kind,
+                    body: text.as_ref().map_or_else(
+                        || {
+                            attachment
+                                .as_ref()
+                                .map_or(entry.body, |item| item.2.clone())
+                        },
+                        |message| message.text.clone(),
+                    ),
+                    timestamp_ms: entry.timestamp_ms,
+                    emoticons: text.as_ref().map(client_emoticon_spans).unwrap_or_default(),
+                    attachment_id: attachment.as_ref().map(|item| item.0.clone()),
+                    attachment_mime: attachment.map(|item| item.1),
+                }
+            })
+            .collect();
+        let _ = events.send(ClientEvent::ConversationLoaded {
+            peer_id: contact.peer,
+            messages,
+        });
+    }
+    for group in history.group_chats()? {
+        let messages = history
+            .conversation(&group_history_key(&group.id), 100)?
+            .into_iter()
+            .rev()
+            .filter_map(|entry| {
+                let (kind, sender_peer_id) = entry
+                    .kind
+                    .strip_prefix("group-text:")
+                    .map(|sender| ("text", sender.to_owned()))
+                    .or_else(|| {
+                        entry
+                            .kind
+                            .strip_prefix("group-file:")
+                            .map(|sender| ("file", sender.to_owned()))
+                    })?;
+                let attachment = (kind == "file")
+                    .then(|| decode_attachment(&entry.body))
+                    .flatten();
+                let text = (kind == "text").then(|| decode_text_history(&entry.body));
+                Some(ClientGroupMessage {
+                    group_id: group.id.clone(),
+                    sender_peer_id,
+                    direction: entry.direction,
+                    kind: kind.into(),
+                    body: text.as_ref().map_or_else(
+                        || {
+                            attachment
+                                .as_ref()
+                                .map_or(entry.body, |item| item.2.clone())
+                        },
+                        |message| message.text.clone(),
+                    ),
+                    timestamp_ms: entry.timestamp_ms,
+                    emoticons: text.as_ref().map(client_emoticon_spans).unwrap_or_default(),
+                    attachment_id: attachment.as_ref().map(|item| item.0.clone()),
+                    attachment_mime: attachment.map(|item| item.1),
+                })
+            })
+            .collect();
+        let _ = events.send(ClientEvent::GroupConversationLoaded {
+            group_id: group.id,
+            messages,
+        });
+    }
+    Ok(())
+}
+
 fn send_group_chats(groups: &[GroupChatEntry], events: &mpsc::UnboundedSender<ClientEvent>) {
     let groups = groups
         .iter()
@@ -3667,6 +4429,8 @@ pub struct ClientConfig {
     identity: PathBuf,
     identity_bytes: Option<Vec<u8>>,
     ml_dsa_seed: Option<[u8; 32]>,
+    account_key: Option<[u8; 32]>,
+    account_key_store: Option<AccountKeyStore>,
     emotes: PathBuf,
     downloads: PathBuf,
     history: PathBuf,
@@ -3684,6 +4448,15 @@ impl ClientConfig {
         self.identity_bytes = Some(bytes);
         self.ml_dsa_seed = Some(ml_dsa_seed);
         Ok(self)
+    }
+
+    pub fn with_account_key<F>(mut self, account_key: [u8; 32], store: F) -> Self
+    where
+        F: Fn([u8; 32]) -> Result<(), String> + Send + Sync + 'static,
+    {
+        self.account_key = Some(account_key);
+        self.account_key_store = Some(Arc::new(store));
+        self
     }
 
     pub fn desktop(
@@ -3714,6 +4487,8 @@ impl ClientConfig {
             identity: data_dir.join("identity.key"),
             identity_bytes: None,
             ml_dsa_seed: None,
+            account_key: None,
+            account_key_store: None,
             emotes: data_dir.join("emoticons"),
             downloads: data_dir.join("downloads"),
             history: data_dir.join("history.db"),
@@ -3780,6 +4555,8 @@ impl ClientConfig {
             identity,
             identity_bytes: None,
             ml_dsa_seed: None,
+            account_key: None,
+            account_key_store: None,
             emotes,
             downloads,
             history,
