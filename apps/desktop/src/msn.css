@@ -2057,6 +2057,58 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
   background: var(--surface-soft);
 }
 
+.settings-devices {
+  margin: 16px 0 10px;
+  padding: 10px 11px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-soft);
+}
+
+.settings-devices > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-devices > header span,
+.settings-devices > header strong,
+.settings-devices > header small,
+.linked-device-row span,
+.linked-device-row strong,
+.linked-device-row small { display: block; }
+.settings-devices > header strong,
+.linked-device-row strong { font-size: 0.84rem; }
+.settings-devices > header small,
+.settings-devices > p,
+.linked-device-row small { color: var(--muted); font-size: 0.72rem; }
+.settings-devices > header small,
+.linked-device-row small { margin-top: 2px; }
+.settings-devices > p { margin: 10px 0 0; }
+
+.linked-device-list {
+  margin-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.linked-device-row {
+  min-height: 44px;
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.device-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+.device-status-dot.online { background: #168447; }
+
 .settings-account-backup > header {
   display: flex;
   align-items: center;
@@ -2088,6 +2140,32 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
 .account-backup-modal { width: min(420px, calc(100vw - 32px)); }
 .account-backup-modal > form { margin: 0; }
 .account-backup-modal > form > small { display: block; margin: 5px 0 14px; color: var(--muted); font-size: 0.72rem; }
+
+.device-pairing-modal { width: min(430px, calc(100vw - 32px)); }
+.device-pairing-modal > small { display: block; margin-top: 10px; color: var(--muted); text-align: center; }
+.device-pairing-modal textarea { width: 100%; resize: vertical; overflow-wrap: anywhere; }
+
+.device-pairing-qr {
+  width: min(230px, 70vw);
+  aspect-ratio: 1;
+  display: block;
+  margin: 14px auto;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+}
+.device-pairing-qr img { width: 100%; height: 100%; display: block; }
+
+.device-pairing-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+.device-pairing-actions button { width: 100%; margin: 0; }
+.device-pairing-loading { min-height: 180px; display: grid; place-items: center; color: var(--muted); }
 
 .security-reopen {
   width: 100%;
