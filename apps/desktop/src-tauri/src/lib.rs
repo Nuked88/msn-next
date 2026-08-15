@@ -77,6 +77,8 @@ struct StoredIdentity {
     version: u8,
     classic: Vec<u8>,
     ml_dsa_seed: [u8; 32],
+    #[serde(default)]
+    account_key: Option<[u8; 32]>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -139,14 +141,24 @@ fn desktop_identity(data_dir: &Path) -> Result<StoredIdentity, String> {
     let legacy_path = data_dir.join("identity.key");
     let identity = match entry.get_secret() {
         Ok(bytes) => match serde_json::from_slice::<StoredIdentity>(&bytes) {
-            Ok(identity) if identity.version == 1 => identity,
+            Ok(identity) if matches!(identity.version, 1 | 2) => {
+                let migrated = normalize_identity(identity);
+                let encoded = serde_json::to_vec(&migrated).map_err(|error| error.to_string())?;
+                if encoded != bytes {
+                    entry
+                        .set_secret(&encoded)
+                        .map_err(|error| format!("aggiornamento del keystore fallito: {error}"))?;
+                }
+                migrated
+            }
             _ => {
                 libp2p_identity::Keypair::from_protobuf_encoding(&bytes)
                     .map_err(|error| format!("identità nel keystore non valida: {error}"))?;
                 let identity = StoredIdentity {
-                    version: 1,
+                    version: 2,
                     classic: bytes,
                     ml_dsa_seed: msnnext_core::generate_secret(),
+                    account_key: Some(msnnext_core::generate_secret()),
                 };
                 entry
                     .set_secret(&serde_json::to_vec(&identity).map_err(|error| error.to_string())?)
@@ -165,9 +177,10 @@ fn desktop_identity(data_dir: &Path) -> Result<StoredIdentity, String> {
             libp2p_identity::Keypair::from_protobuf_encoding(&bytes)
                 .map_err(|error| format!("identità locale non valida: {error}"))?;
             let identity = StoredIdentity {
-                version: 1,
+                version: 2,
                 classic: bytes,
                 ml_dsa_seed: msnnext_core::generate_secret(),
+                account_key: Some(msnnext_core::generate_secret()),
             };
             let encoded = serde_json::to_vec(&identity).map_err(|error| error.to_string())?;
             entry
@@ -190,6 +203,40 @@ fn desktop_identity(data_dir: &Path) -> Result<StoredIdentity, String> {
         std::fs::remove_file(legacy_path).map_err(|error| error.to_string())?;
     }
     Ok(identity)
+}
+
+fn normalize_identity(mut identity: StoredIdentity) -> StoredIdentity {
+    if identity.account_key.is_none() {
+        let mut legacy = identity.classic.clone();
+        legacy.extend_from_slice(&identity.ml_dsa_seed);
+        identity.account_key = Some(blake3::derive_key("msnnext account root v1", &legacy));
+    }
+    identity.version = 2;
+    identity
+}
+
+fn store_account_key(account_key: [u8; 32]) -> Result<(), String> {
+    let entry = identity_entry()?;
+    let encoded = entry
+        .get_secret()
+        .map_err(|error| format!("lettura del keystore fallita: {error}"))?;
+    let mut identity: StoredIdentity = serde_json::from_slice(&encoded)
+        .map(normalize_identity)
+        .map_err(|_| "identità nel keystore non valida".to_owned())?;
+    identity.account_key = Some(account_key);
+    identity.version = 2;
+    let encoded = serde_json::to_vec(&identity).map_err(|error| error.to_string())?;
+    entry
+        .set_secret(&encoded)
+        .map_err(|error| format!("salvataggio nel keystore fallito: {error}"))?;
+    if entry
+        .get_secret()
+        .map_err(|error| format!("verifica del keystore fallita: {error}"))?
+        != encoded
+    {
+        return Err("verifica del keystore fallita".into());
+    }
+    Ok(())
 }
 
 fn identity_entry() -> Result<keyring::Entry, String> {
@@ -223,7 +270,7 @@ fn encrypt_account_backup(
         .encrypt(XNonce::from_slice(&nonce), plaintext.as_slice())
         .map_err(|_| "backup non creato".to_owned())?;
     serde_json::to_string_pretty(&AccountBackup {
-        version: 2,
+        version: 3,
         kdf: "argon2id-v1".into(),
         cipher: "xchacha20poly1305".into(),
         salt: BASE64.encode(salt),
@@ -236,7 +283,7 @@ fn encrypt_account_backup(
 fn decrypt_account_backup(contents: &str, password: &str) -> Result<AccountBackupPayload, String> {
     let backup: AccountBackup =
         serde_json::from_str(contents).map_err(|_| "backup account non valido".to_owned())?;
-    if !matches!(backup.version, 1 | 2)
+    if !matches!(backup.version, 1..=3)
         || backup.kdf != "argon2id-v1"
         || backup.cipher != "xchacha20poly1305"
     {
@@ -260,7 +307,7 @@ fn decrypt_account_backup(contents: &str, password: &str) -> Result<AccountBacku
     let plaintext = cipher
         .decrypt(XNonce::from_slice(&nonce), ciphertext.as_slice())
         .map_err(|_| "password errata o backup corrotto".to_owned())?;
-    let payload = if backup.version == 1 {
+    let mut payload = if backup.version == 1 {
         AccountBackupPayload {
             identity: serde_json::from_slice(&plaintext)
                 .map_err(|_| "identità nel backup non valida".to_owned())?,
@@ -270,7 +317,8 @@ fn decrypt_account_backup(contents: &str, password: &str) -> Result<AccountBacku
         serde_json::from_slice(&plaintext)
             .map_err(|_| "contenuto del backup non valido".to_owned())?
     };
-    if payload.identity.version != 1
+    payload.identity = normalize_identity(payload.identity);
+    if payload.identity.version != 2
         || libp2p_identity::Keypair::from_protobuf_encoding(&payload.identity.classic).is_err()
     {
         return Err("identità nel backup non valida".into());
@@ -381,7 +429,13 @@ fn restore_archived_identity_data(archive: &Path, data_dir: &Path) {
     ] {
         let archived = archive.join(name);
         if archived.exists() {
-            let _ = std::fs::rename(archived, data_dir.join(name));
+            let destination = data_dir.join(name);
+            if destination.is_dir() {
+                let _ = std::fs::remove_dir_all(&destination);
+            } else {
+                let _ = std::fs::remove_file(&destination);
+            }
+            let _ = std::fs::rename(archived, destination);
         }
     }
     let _ = std::fs::remove_dir(archive);
@@ -417,12 +471,12 @@ fn decode_qr_image(path: &Path) -> Result<String, String> {
     let mut prepared = rqrr::PreparedImage::prepare(image);
     for grid in prepared.detect_grids() {
         if let Ok((_, content)) = grid.decode() {
-            if content.starts_with("msnnext://add/") {
+            if content.starts_with("msnnext://add/") || content.starts_with("msnnext://device/") {
                 return Ok(content);
             }
         }
     }
-    Err("nessun QR contatto msnnext trovato".into())
+    Err("nessun QR msnnext trovato".into())
 }
 
 fn send_command(state: &NodeState, command: ClientCommand) -> Result<(), String> {
@@ -461,8 +515,12 @@ fn node_start(
         .map_err(|error| error.to_string())?;
     std::fs::create_dir_all(&data_dir).map_err(|error| error.to_string())?;
     let identity = desktop_identity(&data_dir)?;
+    let account_key = identity
+        .account_key
+        .ok_or_else(|| "chiave account non disponibile".to_owned())?;
     let client_config = ClientConfig::desktop(config.name, data_dir, config.connect, config.relay)
         .and_then(|config| config.with_identity_bytes(identity.classic, identity.ml_dsa_seed))
+        .map(|config| config.with_account_key(account_key, store_account_key))
         .map_err(|error| error.to_string())?;
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -827,6 +885,16 @@ fn node_request_contact_link(state: State<'_, NodeState>) -> Result<(), String> 
 }
 
 #[tauri::command]
+fn node_request_device_link(state: State<'_, NodeState>) -> Result<(), String> {
+    send_command(&state, ClientCommand::RequestDeviceLink)
+}
+
+#[tauri::command]
+fn node_import_device_link(state: State<'_, NodeState>, link: String) -> Result<(), String> {
+    send_command(&state, ClientCommand::ImportDeviceLink { link })
+}
+
+#[tauri::command]
 fn scan_contact_qr(path: String) -> Result<String, String> {
     decode_qr_image(Path::new(&path))
 }
@@ -1049,8 +1117,13 @@ fn account_backup_import(
         .map_err(|error| error.to_string())?;
     std::fs::create_dir_all(&data_dir).map_err(|error| error.to_string())?;
     let current = desktop_identity(&data_dir)?;
-    let identity_changed = current.classic != imported.identity.classic
-        || current.ml_dsa_seed != imported.identity.ml_dsa_seed;
+    let restored_identity = StoredIdentity {
+        version: 2,
+        classic: current.classic.clone(),
+        ml_dsa_seed: current.ml_dsa_seed,
+        account_key: imported.identity.account_key,
+    };
+    let identity_changed = current.account_key != restored_identity.account_key;
     if !identity_changed && imported_history.is_none() {
         return Ok(());
     }
@@ -1060,7 +1133,7 @@ fn account_backup_import(
         .then(|| serde_json::to_vec(&current).map_err(|error| error.to_string()))
         .transpose()?;
     let imported_encoded = identity_changed
-        .then(|| serde_json::to_vec(&imported.identity).map_err(|error| error.to_string()))
+        .then(|| serde_json::to_vec(&restored_identity).map_err(|error| error.to_string()))
         .transpose()?;
     let archived = archive_identity_data(&data_dir, identity_changed)?;
 
@@ -1086,7 +1159,15 @@ fn account_backup_import(
     .and_then(|_| {
         imported_history
             .as_deref()
-            .map(|history| write_backup_history(&data_dir, history))
+            .map(|history| {
+                write_backup_history(&data_dir, history)?;
+                msnnext_core::rekey_history_database(
+                    &data_dir.join("history.db"),
+                    &imported.identity.classic,
+                    &current.classic,
+                )
+                .map_err(|error| format!("cronologia non ricifrata: {error}"))
+            })
             .transpose()
             .map(|_| ())
     });
@@ -1181,6 +1262,8 @@ pub fn run() {
             node_export_attachment,
             node_import_contact,
             node_request_contact_link,
+            node_request_device_link,
+            node_import_device_link,
             scan_contact_qr,
             save_contact_qr,
             image_preview,
@@ -1219,6 +1302,7 @@ mod tests {
                 .to_protobuf_encoding()
                 .unwrap(),
             ml_dsa_seed: [7; 32],
+            account_key: None,
         };
         let history = [SQLITE_HEADER, b"test-history"].concat();
         let payload = AccountBackupPayload {

@@ -52,6 +52,13 @@
     fingerprint: string
   }
 
+  type LinkedDevice = {
+    peerId: string
+    name: string
+    online: boolean
+    lastSeenMs: number
+  }
+
   type ClientMessage = {
     peerId: string
     direction: 'in' | 'out'
@@ -130,6 +137,9 @@
     | { type: 'emoticonOffered'; peerId: string; emoticon: ClientEmoticon }
     | { type: 'emoticonRemoved'; assetId: string }
     | { type: 'contactLink'; link: string; qrLink: string }
+    | { type: 'deviceLink'; link: string; qrLink: string; expiresAtMs: number }
+    | { type: 'devicesUpdated'; devices: LinkedDevice[] }
+    | { type: 'deviceSynchronized'; peerId: string; applied: number; paired: boolean }
     | { type: 'attachmentReceived'; peerId: string; id: string; filename: string; mime: string }
     | { type: 'groupAttachmentReceived'; groupId: string; id: string; filename: string; mime: string }
     | { type: 'attachmentSent'; peerId: string; filename: string }
@@ -227,6 +237,13 @@
   let accountBackupPath = ''
   let accountBackupPassword = ''
   let accountBackupBusy = false
+  let devicePairingOpen = false
+  let devicePairingMode: 'share' | 'join' = 'share'
+  let devicePairingLink = ''
+  let devicePairingQr = ''
+  let devicePairingExpiresAt = 0
+  let devicePairingBusy = false
+  let linkedDevices: LinkedDevice[] = []
   let securityIntroOpen = typeof localStorage !== 'undefined'
     && localStorage.getItem(securityIntroKey) !== 'seen'
   let avatarDataUrl = ''
@@ -546,6 +563,31 @@
       }).then((qr) => ownContactQr = qr).catch((error) => showToast(`QR non generabile: ${error}`))
       return
     }
+    if (event.type === 'deviceLink') {
+      devicePairingLink = event.link
+      devicePairingExpiresAt = event.expiresAtMs
+      devicePairingBusy = false
+      void QRCode.toDataURL(event.qrLink, {
+        width: 1024,
+        margin: 4,
+        color: { dark: '#10284a', light: '#ffffff' },
+      }).then((qr) => devicePairingQr = qr).catch((error) => showToast(`QR non generabile: ${error}`))
+      return
+    }
+    if (event.type === 'devicesUpdated') {
+      linkedDevices = event.devices
+      return
+    }
+    if (event.type === 'deviceSynchronized') {
+      devicePairingBusy = false
+      if (event.paired) {
+        devicePairingOpen = false
+        showToast('Dispositivo collegato')
+      } else if (event.applied) {
+        showToast(`${event.applied} modifiche sincronizzate`)
+      }
+      return
+    }
     if (event.type === 'attachmentReceived') {
       const conversation = [...(conversations[event.peerId] || [])]
       const index = conversation.findLastIndex((message) => !message.mine && message.kind === 'file' && message.body === event.filename)
@@ -699,6 +741,7 @@
       pendingFileCount = 0
       pendingEmoticonAction = ''
       pendingGroupCreation = false
+      devicePairingBusy = false
       showToast(event.message)
       return
     }
@@ -858,6 +901,12 @@
   function banLabel(ban: GroupBan) {
     if (ban.expiresAtMs === null) return 'Ban permanente'
     return `Ban fino al ${new Date(ban.expiresAtMs).toLocaleString()}`
+  }
+
+  function deviceStatus(device: LinkedDevice) {
+    if (device.online) return 'Online, sincronizzazione attiva'
+    if (!device.lastSeenMs) return 'Mai collegato'
+    return `Ultimo collegamento ${new Date(device.lastSeenMs).toLocaleString()}`
   }
 
   async function moderateGroup(memberId: string, value: string) {
@@ -1401,6 +1450,80 @@
     if (!path) return
     await invoke('save_contact_qr', { path, dataUrl: ownContactQr })
       .then(() => showToast('QR salvato in alta qualità'))
+      .catch((error) => showToast(String(error)))
+  }
+
+  async function shareDevicePairing() {
+    if (!running) {
+      showToast('Vai online per collegare un dispositivo')
+      return
+    }
+    devicePairingMode = 'share'
+    devicePairingOpen = true
+    devicePairingLink = ''
+    devicePairingQr = ''
+    devicePairingBusy = true
+    try {
+      await invoke('node_request_device_link')
+    } catch (error) {
+      devicePairingBusy = false
+      showToast(String(error))
+    }
+  }
+
+  function joinDevicePairing() {
+    if (!running) {
+      showToast('Vai online per collegare questo dispositivo')
+      return
+    }
+    devicePairingMode = 'join'
+    devicePairingLink = ''
+    devicePairingQr = ''
+    devicePairingBusy = false
+    devicePairingOpen = true
+  }
+
+  async function importDevicePairing() {
+    if (!devicePairingLink.trim() || devicePairingBusy) return
+    devicePairingBusy = true
+    try {
+      await invoke('node_import_device_link', { link: devicePairingLink.trim() })
+    } catch (error) {
+      devicePairingBusy = false
+      showToast(String(error))
+    }
+  }
+
+  async function scanDevicePairingQr() {
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      filters: [{ name: 'Immagini QR', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] }],
+    })
+    if (!selected || Array.isArray(selected)) return
+    try {
+      devicePairingLink = await invoke<string>('scan_contact_qr', { path: selected })
+      await importDevicePairing()
+    } catch (error) {
+      showToast(String(error))
+    }
+  }
+
+  async function copyDevicePairingLink() {
+    if (!devicePairingLink) return
+    await navigator.clipboard.writeText(devicePairingLink)
+    showToast('Codice dispositivo copiato')
+  }
+
+  async function saveDevicePairingQr() {
+    if (!devicePairingQr) return
+    const path = await save({
+      defaultPath: 'msnnext-dispositivo.png',
+      filters: [{ name: 'Immagine PNG', extensions: ['png'] }],
+    })
+    if (!path) return
+    await invoke('save_contact_qr', { path, dataUrl: devicePairingQr })
+      .then(() => showToast('QR dispositivo salvato'))
       .catch((error) => showToast(String(error)))
   }
 
@@ -2097,16 +2220,38 @@
           <label class="preference-row"><span><strong>Suono del trillo</strong><small>Riproduci un avviso quando ricevi un trillo</small></span><input type="checkbox" bind:checked={nudgeSound} /></label>
         </div>
       </section>
+      <section class="settings-devices" aria-labelledby="linked-devices-title">
+        <header>
+          <span><strong id="linked-devices-title">I tuoi dispositivi</strong><small>Contatti e cronologia passano direttamente tra client online</small></span>
+          <Monitor size={18} />
+        </header>
+        {#if linkedDevices.length}
+          <div class="linked-device-list">
+            {#each linkedDevices as device (device.peerId)}
+              <div class="linked-device-row">
+                <span class:online={device.online} class="device-status-dot"></span>
+                <span><strong>{device.name}</strong><small>{deviceStatus(device)}</small></span>
+              </div>
+            {/each}
+          </div>
+        {:else}
+          <p>Nessun altro dispositivo collegato.</p>
+        {/if}
+        <div class="account-backup-actions">
+          <button class="secondary-button" disabled={!running} onclick={shareDevicePairing}><QrCode size={14} /> Mostra codice</button>
+          <button class="secondary-button" disabled={!running} onclick={joinDevicePairing}><Link2 size={14} /> Usa codice</button>
+        </div>
+      </section>
       <section class="settings-account-backup">
         <header>
-          <span><strong>Account su un nuovo PC</strong><small>Conserva la stessa identità e lo stesso Peer ID</small></span>
+          <span><strong>Backup di emergenza</strong><small>Ripristina l'account con un nuovo Peer ID dispositivo</small></span>
           <ShieldCheck size={18} />
         </header>
         <div class="account-backup-actions">
           <button class="secondary-button" disabled={running} onclick={prepareAccountBackupExport}><Download size={14} /> Esporta</button>
           <button class="secondary-button" disabled={running} onclick={prepareAccountBackupImport}><Upload size={14} /> Importa</button>
         </div>
-        <p>Include contatti, messaggi e gruppi; non include i file allegati.{running ? ' Vai offline per usarlo.' : ''}</p>
+        <p>Include contatti, messaggi e gruppi; non include i file allegati. Per l'uso quotidiano su più PC collega invece i dispositivi.{running ? ' Vai offline per usarlo.' : ''}</p>
       </section>
       <section class="settings-emoticons">
         <header>
@@ -2140,6 +2285,38 @@
       </details>
       <button class="security-reopen" onclick={() => securityIntroOpen = true}><ShieldCheck size={15} /> Come msnnext protegge i tuoi dati</button>
       <button class="primary-button wide" disabled={!displayName.trim()} onclick={() => saveProfile()}>Salva profilo</button>
+    </div>
+  </div>
+{/if}
+
+{#if devicePairingOpen}
+  <div class="modal-backdrop">
+    <div class="modal device-pairing-modal" role="dialog" aria-modal="true" aria-labelledby="device-pairing-title">
+      <button type="button" class="modal-close" aria-label="Chiudi" onclick={() => devicePairingOpen = false}><X size={18} /></button>
+      <div class="modal-heading">
+        <span>{#if devicePairingMode === 'share'}<QrCode size={22} />{:else}<Link2 size={22} />{/if}</span>
+        <div><p class="step-label">Sincronizzazione privata</p><h2 id="device-pairing-title">{devicePairingMode === 'share' ? 'Collega un altro dispositivo' : 'Collega questo dispositivo'}</h2></div>
+      </div>
+      {#if devicePairingMode === 'share'}
+        <p>Apri msnnext sull'altro dispositivo e usa questo codice entro dieci minuti. Entrambi devono restare online.</p>
+        {#if devicePairingQr}
+          <button class="device-pairing-qr" aria-label="Salva QR dispositivo" title="Salva QR" onclick={saveDevicePairingQr}><img src={devicePairingQr} alt="QR per collegare il dispositivo" /></button>
+          <div class="device-pairing-actions">
+            <button class="secondary-button" onclick={copyDevicePairingLink}><Copy size={14} /> Copia codice</button>
+            <button class="secondary-button" onclick={saveDevicePairingQr}><Download size={14} /> Salva QR</button>
+          </div>
+          <small>Scade alle {new Date(devicePairingExpiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.</small>
+        {:else}
+          <div class="device-pairing-loading">Preparazione del collegamento…</div>
+        {/if}
+      {:else}
+        <p>Incolla il codice mostrato dal dispositivo già collegato, oppure apri un'immagine del QR.</p>
+        <label>Codice dispositivo<textarea bind:value={devicePairingLink} rows="4" spellcheck="false" placeholder="msnnext://device/…"></textarea></label>
+        <div class="device-pairing-actions">
+          <button class="secondary-button" disabled={devicePairingBusy} onclick={scanDevicePairingQr}><QrCode size={14} /> Apri QR</button>
+          <button class="primary-button" disabled={!devicePairingLink.trim() || devicePairingBusy} onclick={importDevicePairing}>{devicePairingBusy ? 'Collegamento…' : 'Collega'}</button>
+        </div>
+      {/if}
     </div>
   </div>
 {/if}

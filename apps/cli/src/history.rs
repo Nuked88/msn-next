@@ -3,7 +3,7 @@ use chacha20poly1305::{
     KeyInit, XChaCha20Poly1305, XNonce,
 };
 use msnnext_protocol::GroupBan;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fs, path::Path};
 
@@ -12,7 +12,9 @@ pub struct History {
     cipher: XChaCha20Poly1305,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Entry {
+    pub event_id: String,
     pub peer: String,
     pub direction: String,
     pub kind: String,
@@ -20,10 +22,59 @@ pub struct Entry {
     pub timestamp_ms: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ContactEntry {
     pub peer: String,
     pub name: String,
     pub link: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DeviceEntry {
+    pub peer: String,
+    pub name: String,
+    pub addresses: Vec<String>,
+    pub last_seen_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum SyncOperation {
+    RecordEvent(Entry),
+    UpsertContact {
+        contact: ContactEntry,
+        changed_at_ms: u64,
+    },
+    DeleteContact {
+        peer: String,
+        changed_at_ms: u64,
+    },
+    ClearConversation {
+        peer: String,
+        changed_at_ms: u64,
+    },
+    UpsertGroup {
+        group: GroupChatEntry,
+        changed_at_ms: u64,
+    },
+    DeleteGroup {
+        id: String,
+        changed_at_ms: u64,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SyncRecord {
+    pub seq: u64,
+    pub op_id: String,
+    pub operation: SyncOperation,
+}
+
+#[derive(Default)]
+pub struct SyncApplyResult {
+    pub applied: usize,
+    pub contacts_changed: bool,
+    pub conversations_changed: bool,
+    pub groups_changed: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -50,6 +101,7 @@ impl History {
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY,
+            event_id TEXT,
             peer TEXT NOT NULL,
             direction TEXT NOT NULL,
             kind TEXT NOT NULL,
@@ -68,12 +120,46 @@ impl History {
         CREATE TABLE IF NOT EXISTS group_chats (
             id TEXT PRIMARY KEY,
             definition BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS linked_devices (
+            peer TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            addresses BLOB NOT NULL,
+            last_seen_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sync_log (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            op_id TEXT NOT NULL UNIQUE,
+            payload BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sync_versions (
+            entity TEXT PRIMARY KEY,
+            changed_at_ms INTEGER NOT NULL,
+            op_id TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sync_cursors (
+            peer TEXT PRIMARY KEY,
+            remote_seq INTEGER NOT NULL DEFAULT 0,
+            sent_seq INTEGER NOT NULL DEFAULT 0
         );",
         )?;
-        Ok(Self {
+        if !column_exists(&connection, "events", "event_id")? {
+            connection.execute("ALTER TABLE events ADD COLUMN event_id TEXT", [])?;
+        }
+        connection.execute(
+            "UPDATE events SET event_id = lower(hex(randomblob(16))) WHERE event_id IS NULL OR event_id = ''",
+            [],
+        )?;
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS events_event_id ON events(event_id)",
+            [],
+        )?;
+        let history = Self {
             connection,
             cipher: XChaCha20Poly1305::new((&key).into()),
-        })
+        };
+        history.seed_sync_log()?;
+        Ok(history)
     }
 
     pub fn record(
@@ -84,37 +170,35 @@ impl History {
         body: &str,
         timestamp_ms: u64,
     ) -> Result<(), Box<dyn Error>> {
-        let mut nonce = [0; 24];
-        OsRng.fill_bytes(&mut nonce);
-        let ciphertext = self
-            .cipher
-            .encrypt(XNonce::from_slice(&nonce), body.as_bytes())
-            .map_err(|_| "cifratura cronologia fallita")?;
-        let mut encrypted = nonce.to_vec();
-        encrypted.extend(ciphertext);
-        self.connection.execute(
-            "INSERT INTO events (peer, direction, kind, body, timestamp_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![peer, direction, kind, encrypted, timestamp_ms],
-        )?;
+        let event = Entry {
+            event_id: random_id(),
+            peer: peer.to_owned(),
+            direction: direction.to_owned(),
+            kind: kind.to_owned(),
+            body: body.to_owned(),
+            timestamp_ms,
+        };
+        self.commit_local(SyncOperation::RecordEvent(event))?;
         Ok(())
     }
 
     pub fn latest(&self, limit: usize) -> Result<Vec<Entry>, Box<dyn Error>> {
         let mut statement = self.connection.prepare(
-            "SELECT peer, direction, kind, body, timestamp_ms FROM events ORDER BY id DESC LIMIT ?1"
+            "SELECT event_id, peer, direction, kind, body, timestamp_ms FROM events ORDER BY id DESC LIMIT ?1"
         )?;
         let rows = statement.query_map([limit as u64], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-                row.get::<_, u64>(4)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, u64>(5)?,
             ))
         })?;
         let mut entries = Vec::new();
         for row in rows {
-            let (peer, direction, kind, encrypted, timestamp_ms) = row?;
+            let (event_id, peer, direction, kind, encrypted, timestamp_ms) = row?;
             if encrypted.len() < 24 {
                 return Err("riga cronologia danneggiata".into());
             }
@@ -123,6 +207,7 @@ impl History {
                 .decrypt(XNonce::from_slice(&encrypted[..24]), &encrypted[24..])
                 .map_err(|_| "cronologia non decifrabile")?;
             entries.push(Entry {
+                event_id,
                 peer,
                 direction,
                 kind,
@@ -135,7 +220,7 @@ impl History {
 
     pub fn conversation(&self, peer: &str, limit: usize) -> Result<Vec<Entry>, Box<dyn Error>> {
         let mut statement = self.connection.prepare(
-            "SELECT peer, direction, kind, body, timestamp_ms
+            "SELECT event_id, peer, direction, kind, body, timestamp_ms
              FROM events WHERE peer = ?1 ORDER BY id DESC LIMIT ?2",
         )?;
         let rows = statement.query_map(params![peer, limit as u64], |row| {
@@ -143,13 +228,14 @@ impl History {
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-                row.get::<_, u64>(4)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, u64>(5)?,
             ))
         })?;
         let mut entries = Vec::new();
         for row in rows {
-            let (peer, direction, kind, encrypted, timestamp_ms) = row?;
+            let (event_id, peer, direction, kind, encrypted, timestamp_ms) = row?;
             if encrypted.len() < 24 {
                 return Err("riga cronologia danneggiata".into());
             }
@@ -158,6 +244,7 @@ impl History {
                 .decrypt(XNonce::from_slice(&encrypted[..24]), &encrypted[24..])
                 .map_err(|_| "cronologia non decifrabile")?;
             entries.push(Entry {
+                event_id,
                 peer,
                 direction,
                 kind,
@@ -175,13 +262,14 @@ impl History {
         link: &str,
         added_at_ms: u64,
     ) -> Result<(), Box<dyn Error>> {
-        self.connection.execute(
-            "INSERT INTO contacts (peer, name, link, added_at_ms) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(peer) DO UPDATE SET
-                name = excluded.name,
-                link = CASE WHEN excluded.link = '' THEN contacts.link ELSE excluded.link END",
-            params![peer, name, link, added_at_ms],
-        )?;
+        self.commit_local(SyncOperation::UpsertContact {
+            contact: ContactEntry {
+                peer: peer.to_owned(),
+                name: name.to_owned(),
+                link: link.to_owned(),
+            },
+            changed_at_ms: added_at_ms,
+        })?;
         Ok(())
     }
 
@@ -191,10 +279,14 @@ impl History {
         name: &str,
         added_at_ms: u64,
     ) -> Result<(), Box<dyn Error>> {
-        self.connection.execute(
-            "INSERT OR IGNORE INTO contacts (peer, name, link, added_at_ms) VALUES (?1, ?2, '', ?3)",
-            params![peer, name, added_at_ms],
-        )?;
+        let exists = self
+            .connection
+            .query_row("SELECT 1 FROM contacts WHERE peer = ?1", [peer], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            self.save_contact(peer, name, "", added_at_ms)?;
+        }
         Ok(())
     }
 
@@ -203,30 +295,28 @@ impl History {
         if name.is_empty() || name.len() > 64 {
             return Err("nome contatto non valido".into());
         }
-        if self.connection.execute(
-            "UPDATE contacts SET name = ?2 WHERE peer = ?1",
-            params![peer, name],
-        )? == 0
-        {
-            return Err("contatto non trovato".into());
-        }
+        let contact = self
+            .contacts()?
+            .into_iter()
+            .find(|contact| contact.peer == peer)
+            .ok_or("contatto non trovato")?;
+        self.save_contact(peer, name, &contact.link, now_ms())?;
         Ok(())
     }
 
     pub fn clear_conversation(&self, peer: &str) -> Result<(), Box<dyn Error>> {
-        self.connection
-            .execute("DELETE FROM events WHERE peer = ?1", [peer])?;
+        self.commit_local(SyncOperation::ClearConversation {
+            peer: peer.to_owned(),
+            changed_at_ms: now_ms(),
+        })?;
         Ok(())
     }
 
     pub fn delete_contact(&self, peer: &str) -> Result<(), Box<dyn Error>> {
-        self.clear_conversation(peer)?;
-        self.connection
-            .execute("DELETE FROM contacts WHERE peer = ?1", [peer])?;
-        self.connection.execute(
-            "INSERT OR IGNORE INTO ignored_contacts (peer) VALUES (?1)",
-            [peer],
-        )?;
+        self.commit_local(SyncOperation::DeleteContact {
+            peer: peer.to_owned(),
+            changed_at_ms: now_ms(),
+        })?;
         Ok(())
     }
 
@@ -262,13 +352,10 @@ impl History {
         if group.id.len() != 32 || !group.id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err("id chat di gruppo non valido".into());
         }
-        let encoded = cbor4ii::serde::to_vec(Vec::new(), group)?;
-        let encrypted = self.seal(&encoded)?;
-        self.connection.execute(
-            "INSERT INTO group_chats (id, definition) VALUES (?1, ?2)
-             ON CONFLICT(id) DO UPDATE SET definition = excluded.definition",
-            params![group.id, encrypted],
-        )?;
+        self.commit_local(SyncOperation::UpsertGroup {
+            group: group.clone(),
+            changed_at_ms: now_ms(),
+        })?;
         Ok(())
     }
 
@@ -300,9 +387,369 @@ impl History {
     }
 
     pub fn delete_group_chat(&self, id: &str) -> Result<(), Box<dyn Error>> {
-        self.clear_conversation(&format!("group:{id}"))?;
-        self.connection
-            .execute("DELETE FROM group_chats WHERE id = ?1", [id])?;
+        self.commit_local(SyncOperation::DeleteGroup {
+            id: id.to_owned(),
+            changed_at_ms: now_ms(),
+        })?;
+        Ok(())
+    }
+
+    pub fn save_device(&self, device: &DeviceEntry) -> Result<(), Box<dyn Error>> {
+        let addresses = cbor4ii::serde::to_vec(Vec::new(), &device.addresses)?;
+        self.connection.execute(
+            "INSERT INTO linked_devices (peer, name, addresses, last_seen_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(peer) DO UPDATE SET
+                name = excluded.name,
+                addresses = excluded.addresses,
+                last_seen_ms = excluded.last_seen_ms",
+            params![
+                device.peer,
+                device.name,
+                self.seal(&addresses)?,
+                device.last_seen_ms
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn devices(&self) -> Result<Vec<DeviceEntry>, Box<dyn Error>> {
+        let mut statement = self.connection.prepare(
+            "SELECT peer, name, addresses, last_seen_ms FROM linked_devices ORDER BY name COLLATE NOCASE",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, u64>(3)?,
+            ))
+        })?;
+        let mut devices = Vec::new();
+        for row in rows {
+            let (peer, name, addresses, last_seen_ms) = row?;
+            devices.push(DeviceEntry {
+                peer,
+                name,
+                addresses: cbor4ii::serde::from_slice(&self.unseal(&addresses)?)?,
+                last_seen_ms,
+            });
+        }
+        Ok(devices)
+    }
+
+    pub fn sync_cursors(&self, peer: &str) -> Result<(u64, u64), Box<dyn Error>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT remote_seq, sent_seq FROM sync_cursors WHERE peer = ?1",
+                [peer],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    pub fn update_sync_cursors(
+        &self,
+        peer: &str,
+        remote_seq: u64,
+        sent_seq: u64,
+    ) -> Result<(), Box<dyn Error>> {
+        self.connection.execute(
+            "INSERT INTO sync_cursors (peer, remote_seq, sent_seq) VALUES (?1, ?2, ?3)
+             ON CONFLICT(peer) DO UPDATE SET
+                remote_seq = max(sync_cursors.remote_seq, excluded.remote_seq),
+                sent_seq = max(sync_cursors.sent_seq, excluded.sent_seq)",
+            params![peer, remote_seq, sent_seq],
+        )?;
+        Ok(())
+    }
+
+    pub fn latest_sync_seq(&self) -> Result<u64, Box<dyn Error>> {
+        Ok(self
+            .connection
+            .query_row("SELECT coalesce(max(seq), 0) FROM sync_log", [], |row| {
+                row.get(0)
+            })?)
+    }
+
+    pub fn sync_records_since(
+        &self,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<SyncRecord>, Box<dyn Error>> {
+        let mut statement = self.connection.prepare(
+            "SELECT seq, op_id, payload FROM sync_log WHERE seq > ?1 ORDER BY seq LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![after_seq, limit as u64], |row| {
+            Ok((
+                row.get::<_, u64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (seq, op_id, payload) = row?;
+            records.push(SyncRecord {
+                seq,
+                op_id,
+                operation: cbor4ii::serde::from_slice(&self.unseal(&payload)?)?,
+            });
+        }
+        Ok(records)
+    }
+
+    pub fn apply_sync_records(
+        &self,
+        records: &[SyncRecord],
+    ) -> Result<SyncApplyResult, Box<dyn Error>> {
+        let mut result = SyncApplyResult::default();
+        for record in records {
+            let exists = self
+                .connection
+                .query_row(
+                    "SELECT 1 FROM sync_log WHERE op_id = ?1",
+                    [&record.op_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if exists {
+                continue;
+            }
+            if self.apply_operation(&record.op_id, &record.operation)? {
+                result.applied += 1;
+                match record.operation {
+                    SyncOperation::RecordEvent(_) | SyncOperation::ClearConversation { .. } => {
+                        result.conversations_changed = true;
+                    }
+                    SyncOperation::UpsertContact { .. } | SyncOperation::DeleteContact { .. } => {
+                        result.contacts_changed = true;
+                        result.conversations_changed = true;
+                    }
+                    SyncOperation::UpsertGroup { .. } | SyncOperation::DeleteGroup { .. } => {
+                        result.groups_changed = true;
+                        result.conversations_changed = true;
+                    }
+                }
+            }
+            self.append_sync_record(&record.op_id, &record.operation)?;
+        }
+        Ok(result)
+    }
+
+    fn commit_local(&self, operation: SyncOperation) -> Result<(), Box<dyn Error>> {
+        let op_id = random_id();
+        self.apply_operation(&op_id, &operation)?;
+        self.append_sync_record(&op_id, &operation)?;
+        Ok(())
+    }
+
+    fn append_sync_record(
+        &self,
+        op_id: &str,
+        operation: &SyncOperation,
+    ) -> Result<(), Box<dyn Error>> {
+        let payload = cbor4ii::serde::to_vec(Vec::new(), operation)?;
+        self.connection.execute(
+            "INSERT OR IGNORE INTO sync_log (op_id, payload) VALUES (?1, ?2)",
+            params![op_id, self.seal(&payload)?],
+        )?;
+        Ok(())
+    }
+
+    fn apply_operation(
+        &self,
+        op_id: &str,
+        operation: &SyncOperation,
+    ) -> Result<bool, Box<dyn Error>> {
+        let applied = match operation {
+            SyncOperation::RecordEvent(event) => {
+                let cleared_at = self.entity_version(&format!("conversation:{}", event.peer))?;
+                if cleared_at.is_some_and(|(timestamp, _)| timestamp >= event.timestamp_ms) {
+                    return Ok(false);
+                }
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO events (event_id, peer, direction, kind, body, timestamp_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        event.event_id,
+                        event.peer,
+                        event.direction,
+                        event.kind,
+                        self.seal(event.body.as_bytes())?,
+                        event.timestamp_ms,
+                    ],
+                )? > 0
+            }
+            SyncOperation::UpsertContact {
+                contact,
+                changed_at_ms,
+            } => {
+                let entity = format!("contact:{}", contact.peer);
+                if !self.accept_version(&entity, *changed_at_ms, op_id)? {
+                    return Ok(false);
+                }
+                self.connection.execute(
+                    "INSERT INTO contacts (peer, name, link, added_at_ms) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(peer) DO UPDATE SET
+                        name = excluded.name,
+                        link = CASE WHEN excluded.link = '' THEN contacts.link ELSE excluded.link END,
+                        added_at_ms = excluded.added_at_ms",
+                    params![contact.peer, contact.name, contact.link, changed_at_ms],
+                )?;
+                self.connection.execute(
+                    "DELETE FROM ignored_contacts WHERE peer = ?1",
+                    [&contact.peer],
+                )?;
+                true
+            }
+            SyncOperation::DeleteContact {
+                peer,
+                changed_at_ms,
+            } => {
+                let entity = format!("contact:{peer}");
+                if !self.accept_version(&entity, *changed_at_ms, op_id)? {
+                    return Ok(false);
+                }
+                self.connection
+                    .execute("DELETE FROM events WHERE peer = ?1", [peer])?;
+                self.connection
+                    .execute("DELETE FROM contacts WHERE peer = ?1", [peer])?;
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO ignored_contacts (peer) VALUES (?1)",
+                    [peer],
+                )?;
+                self.set_version(&format!("conversation:{peer}"), *changed_at_ms, op_id)?;
+                true
+            }
+            SyncOperation::ClearConversation {
+                peer,
+                changed_at_ms,
+            } => {
+                let entity = format!("conversation:{peer}");
+                if !self.accept_version(&entity, *changed_at_ms, op_id)? {
+                    return Ok(false);
+                }
+                self.connection.execute(
+                    "DELETE FROM events WHERE peer = ?1 AND timestamp_ms <= ?2",
+                    params![peer, changed_at_ms],
+                )?;
+                true
+            }
+            SyncOperation::UpsertGroup {
+                group,
+                changed_at_ms,
+            } => {
+                let entity = format!("group:{}", group.id);
+                if !self.accept_version(&entity, *changed_at_ms, op_id)? {
+                    return Ok(false);
+                }
+                let encoded = cbor4ii::serde::to_vec(Vec::new(), group)?;
+                self.connection.execute(
+                    "INSERT INTO group_chats (id, definition) VALUES (?1, ?2)
+                     ON CONFLICT(id) DO UPDATE SET definition = excluded.definition",
+                    params![group.id, self.seal(&encoded)?],
+                )?;
+                true
+            }
+            SyncOperation::DeleteGroup { id, changed_at_ms } => {
+                let entity = format!("group:{id}");
+                if !self.accept_version(&entity, *changed_at_ms, op_id)? {
+                    return Ok(false);
+                }
+                let conversation = format!("group:{id}");
+                self.connection
+                    .execute("DELETE FROM events WHERE peer = ?1", [&conversation])?;
+                self.connection
+                    .execute("DELETE FROM group_chats WHERE id = ?1", [id])?;
+                self.set_version(
+                    &format!("conversation:{conversation}"),
+                    *changed_at_ms,
+                    op_id,
+                )?;
+                true
+            }
+        };
+        Ok(applied)
+    }
+
+    fn accept_version(
+        &self,
+        entity: &str,
+        changed_at_ms: u64,
+        op_id: &str,
+    ) -> Result<bool, Box<dyn Error>> {
+        if self.entity_version(entity)?.is_some_and(|current| {
+            current.0 > changed_at_ms || (current.0 == changed_at_ms && current.1.as_str() >= op_id)
+        }) {
+            return Ok(false);
+        }
+        self.set_version(entity, changed_at_ms, op_id)?;
+        Ok(true)
+    }
+
+    fn entity_version(&self, entity: &str) -> Result<Option<(u64, String)>, Box<dyn Error>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT changed_at_ms, op_id FROM sync_versions WHERE entity = ?1",
+                [entity],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    fn set_version(
+        &self,
+        entity: &str,
+        changed_at_ms: u64,
+        op_id: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        self.connection.execute(
+            "INSERT INTO sync_versions (entity, changed_at_ms, op_id) VALUES (?1, ?2, ?3)
+             ON CONFLICT(entity) DO UPDATE SET changed_at_ms = excluded.changed_at_ms, op_id = excluded.op_id",
+            params![entity, changed_at_ms, op_id],
+        )?;
+        Ok(())
+    }
+
+    fn seed_sync_log(&self) -> Result<(), Box<dyn Error>> {
+        if self.latest_sync_seq()? != 0 {
+            return Ok(());
+        }
+        for contact in self.contacts()? {
+            self.append_sync_record(
+                &random_id(),
+                &SyncOperation::UpsertContact {
+                    contact,
+                    changed_at_ms: 0,
+                },
+            )?;
+        }
+        for entry in self.latest(i64::MAX as usize)? {
+            self.append_sync_record(&random_id(), &SyncOperation::RecordEvent(entry))?;
+        }
+        for group in self.group_chats()? {
+            self.append_sync_record(
+                &random_id(),
+                &SyncOperation::UpsertGroup {
+                    group,
+                    changed_at_ms: 0,
+                },
+            )?;
+        }
+        for peer in self.ignored_contacts()? {
+            self.append_sync_record(
+                &random_id(),
+                &SyncOperation::DeleteContact {
+                    peer,
+                    changed_at_ms: 0,
+                },
+            )?;
+        }
         Ok(())
     }
 
@@ -326,6 +773,91 @@ impl History {
             .decrypt(XNonce::from_slice(&encrypted[..24]), &encrypted[24..])
             .map_err(|_| "dato non decifrabile".into())
     }
+}
+
+fn column_exists(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, Box<dyn Error>> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    Ok(rows
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|name| name == column))
+}
+
+fn random_id() -> String {
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+pub fn rekey_database(
+    path: &Path,
+    old_key: [u8; 32],
+    new_key: [u8; 32],
+) -> Result<(), Box<dyn Error>> {
+    if old_key == new_key || !path.exists() {
+        return Ok(());
+    }
+    let mut connection = Connection::open(path)?;
+    let transaction = connection.transaction()?;
+    let old_cipher = XChaCha20Poly1305::new((&old_key).into());
+    let new_cipher = XChaCha20Poly1305::new((&new_key).into());
+    for (table, column) in [
+        ("events", "body"),
+        ("group_chats", "definition"),
+        ("linked_devices", "addresses"),
+        ("sync_log", "payload"),
+    ] {
+        let exists = transaction
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            continue;
+        }
+        let mut statement = transaction.prepare(&format!("SELECT rowid, {column} FROM {table}"))?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let encrypted = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for (rowid, value) in encrypted {
+            if value.len() < 24 {
+                return Err(format!("dato cifrato non valido in {table}").into());
+            }
+            let plaintext = old_cipher
+                .decrypt(XNonce::from_slice(&value[..24]), &value[24..])
+                .map_err(|_| format!("dato non decifrabile in {table}"))?;
+            let mut nonce = [0u8; 24];
+            OsRng.fill_bytes(&mut nonce);
+            let ciphertext = new_cipher
+                .encrypt(XNonce::from_slice(&nonce), plaintext.as_ref())
+                .map_err(|_| format!("ricifratura fallita in {table}"))?;
+            let mut replacement = nonce.to_vec();
+            replacement.extend(ciphertext);
+            transaction.execute(
+                &format!("UPDATE {table} SET {column} = ?1 WHERE rowid = ?2"),
+                params![replacement, rowid],
+            )?;
+        }
+    }
+    transaction.commit()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -438,6 +970,57 @@ mod tests {
             .unwrap()
             .windows(group.name.len())
             .any(|bytes| bytes == group.name.as_bytes()));
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn sync_log_merges_records_once_and_propagates_deletions() {
+        let source_path =
+            std::env::temp_dir().join(format!("msnnext-sync-source-{}.db", std::process::id()));
+        let target_path =
+            std::env::temp_dir().join(format!("msnnext-sync-target-{}.db", std::process::id()));
+        fs::remove_file(&source_path).ok();
+        fs::remove_file(&target_path).ok();
+        let source = History::open(&source_path, [21; 32]).unwrap();
+        let target = History::open(&target_path, [22; 32]).unwrap();
+        source
+            .save_contact("peer-a", "Alice", "msnnext://add/alice", 10)
+            .unwrap();
+        source.record("peer-a", "in", "text", "ciao", 11).unwrap();
+
+        let first = source.sync_records_since(0, 100).unwrap();
+        assert_eq!(target.apply_sync_records(&first).unwrap().applied, 2);
+        assert_eq!(target.apply_sync_records(&first).unwrap().applied, 0);
+        assert_eq!(target.contacts().unwrap().len(), 1);
+        assert_eq!(target.conversation("peer-a", 10).unwrap().len(), 1);
+
+        let cursor = first.last().unwrap().seq;
+        source.delete_contact("peer-a").unwrap();
+        let deletion = source.sync_records_since(cursor, 100).unwrap();
+        assert_eq!(target.apply_sync_records(&deletion).unwrap().applied, 1);
+        assert!(target.contacts().unwrap().is_empty());
+        assert!(target.conversation("peer-a", 10).unwrap().is_empty());
+
+        drop(source);
+        drop(target);
+        fs::remove_file(source_path).ok();
+        fs::remove_file(target_path).ok();
+    }
+
+    #[test]
+    fn history_can_be_rekeyed_for_a_new_device_identity() {
+        let path = std::env::temp_dir().join(format!("msnnext-rekey-{}.db", std::process::id()));
+        fs::remove_file(&path).ok();
+        {
+            let history = History::open(&path, [31; 32]).unwrap();
+            history
+                .record("peer", "in", "text", "trasferito", 1)
+                .unwrap();
+        }
+        rekey_database(&path, [31; 32], [32; 32]).unwrap();
+        let history = History::open(&path, [32; 32]).unwrap();
+        assert_eq!(history.latest(1).unwrap()[0].body, "trasferito");
+        drop(history);
         fs::remove_file(path).ok();
     }
 }

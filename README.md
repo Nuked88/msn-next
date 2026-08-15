@@ -16,11 +16,12 @@ Messenger desktop P2P ispirato a MSN Messenger. L'obiettivo è mantenere testo, 
 - chat di gruppo persistenti fino a 32 partecipanti, instradate sui canali cifrati individuali;
 - conversazioni separate per Peer ID;
 - contatti, cronologia e identità persistenti dopo il riavvio;
+- collegamento di più dispositivi tramite QR/codice monouso, con Peer ID distinto per ogni installazione;
 - bridge tipizzato tra GUI e core tramite comandi ed eventi Tauri.
 
 ### Rete e sicurezza
 
-- identità Ed25519 persistente;
+- identità Ed25519 persistente e distinta per dispositivo, autorizzata da una radice account condivisa;
 - trasporto libp2p QUIC e TCP;
 - discovery LAN tramite mDNS;
 - Identify, Kademlia DHT, AutoNAT, DCUtR e Circuit Relay v2;
@@ -29,6 +30,7 @@ Messenger desktop P2P ispirato a MSN Messenger. L'obiettivo è mantenere testo, 
 - messaggi applicativi cifrati con XChaCha20-Poly1305 e ratchet simmetrico;
 - protezione da replay e supporto limitato ai messaggi fuori ordine;
 - reconnessione con backoff dopo la perdita del collegamento;
+- sincronizzazione P2P cifrata tra dispositivi con tentativo diretto DCUtR e fallback Circuit Relay;
 - timeout inattivo della connessione portato oltre il precedente limite errato di 60 secondi.
 
 ### Dati locali e protocollo
@@ -43,7 +45,8 @@ Messenger desktop P2P ispirato a MSN Messenger. L'obiettivo è mantenere testo, 
 - limiti e validazione per emoticon PNG, JPEG, GIF e WebP;
 - trilli cifrati e sottoposti a rate limit.
 - identità desktop nel keystore del sistema operativo, con migrazione automatica del precedente `identity.key`;
-- backup cifrato con password per ripristinare identità, Peer ID, contatti e cronologia su un nuovo PC; gli allegati restano locali;
+- log incrementale cifrato con cursori, deduplicazione e tombstone per sincronizzare contatti, cronologia e gruppi; gli allegati restano locali;
+- backup cifrato con password per il recupero di account, contatti e cronologia su un nuovo PC; al ripristino viene mantenuto un Peer ID locale distinto;
 - link contatto v2 firmati Ed25519 e ML-DSA-65; il QR usa una scheda v3 compatta firmata Ed25519 perché una firma ML-DSA-65 non entra in un singolo QR, mantenendo la lettura delle schede v1;
 - CSP restrittiva per la WebView e fingerprint mostrato nella GUI.
 - mininodo pubblico preconfigurato come bootstrap e Circuit Relay v2 per i client dietro CGNAT; non memorizza messaggi.
@@ -56,6 +59,7 @@ Messenger desktop P2P ispirato a MSN Messenger. L'obiettivo è mantenere testo, 
 - negoziazione del canale sicuro;
 - invio e ricezione dei messaggi di testo;
 - cronologia testuale e lista contatti dopo il riavvio;
+- sincronizzazione di contatti, messaggi, gruppi, rinominazioni e cancellazioni mentre almeno due dispositivi dell'account sono online;
 - trillo di base con animazione della finestra web;
 - generazione degli installer Windows MSI e NSIS.
 
@@ -98,6 +102,8 @@ Il file originale inviato non viene copiato nell'archivio di msnnext: viene lett
 - hole punching e fallback relay non sono stati collaudati su due NAT reali;
 - esiste un solo relay pubblico preconfigurato, quindi per ora non c'è ridondanza se la VPS non è disponibile;
 - non esistono messaggi offline: almeno uno dei dispositivi deve essere raggiungibile;
+- il mininodo coordina raggiungibilità e relay ma non conserva i dati sincronizzati; senza sovrapposizione online tra due dispositivi non avviene alcuna sincronizzazione;
+- pairing e sincronizzazione multi-dispositivo devono ancora essere collaudati su due installazioni reali dietro NAT differenti;
 - avatar, nome personale, gruppi, rinomina e rimozione dei contatti sono disponibili; stato personale e blocco restano incompleti.
 
 ### Trilli e UX
@@ -118,8 +124,9 @@ Il file originale inviato non viene copiato nell'archivio di msnnext: viene lett
 2. Aggiungere velocità e annullamento delle ricezioni già accettate.
 3. Eseguire test prolungati di collegamento, disconnessione e reconnessione con due applicazioni installate.
 4. Completare trillo nativo, suono, presenza, avatar e gestione contatti.
-5. Collaudare bootstrap, relay e hole punching su reti reali.
-6. Rafforzare key storage, CSP, firme post-quantum e verifica delle identità.
+5. Collaudare pairing multi-dispositivo, bootstrap, relay e hole punching su reti reali.
+6. Aggiungere revoca dispositivi con rotazione della radice account.
+7. Rafforzare key storage, CSP, firme post-quantum e verifica delle identità.
 
 ## Struttura
 
