@@ -11,6 +11,7 @@ Messenger desktop P2P ispirato a MSN Messenger. L'obiettivo è mantenere testo, 
 - applicazione unica Tauri 2 + Svelte con core Rust integrato, senza processo CLI separato;
 - interfaccia ispirata a MSN con lista contatti online/offline, chat, ricerca e non letti;
 - temi Chiaro, Scuro e Sistema persistenti;
+- chiusura della finestra principale nella tray, con comandi per riaprirla o terminare davvero l'app;
 - onboarding, aggiunta contatto tramite link `msnnext://add/...`, QR grafico e scansione QR da immagine;
 - selettore e drag-and-drop nativi per file e immagini;
 - chat di gruppo persistenti fino a 32 partecipanti, instradate sui canali cifrati individuali;

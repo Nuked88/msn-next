@@ -18,7 +18,11 @@ use chacha20poly1305::{
 };
 use msnnext_core::{ClientCommand, ClientConfig, ClientEvent, GroupModeration};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Emitter, Manager, State, WindowEvent,
+};
 use tokio::sync::mpsc;
 
 type CommandSender = mpsc::UnboundedSender<ClientCommand>;
@@ -445,6 +449,14 @@ fn worker_is_current(current_generation: Option<u64>, worker_generation: u64) ->
     match current_generation {
         None => true,
         Some(current) => current == worker_generation,
+    }
+}
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
     }
 }
 
@@ -1234,7 +1246,43 @@ pub fn run() {
                         .build(),
                 )?;
             }
+            let open = MenuItem::with_id(app, "tray-open", "Apri msnnext", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "tray-quit", "Esci", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open, &quit])?;
+            let mut tray = TrayIconBuilder::with_id("main")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .tooltip("msnnext")
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "tray-open" => show_main_window(app),
+                    "tray-quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if matches!(
+                        event,
+                        TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        }
+                    ) {
+                        show_main_window(tray.app_handle());
+                    }
+                });
+            if let Some(icon) = app.default_window_icon() {
+                tray = tray.icon(icon.clone());
+            }
+            tray.build(app)?;
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             node_start,
