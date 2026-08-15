@@ -43,6 +43,7 @@ Messenger desktop P2P ispirato a MSN Messenger. L'obiettivo è mantenere testo, 
 - limiti e validazione per emoticon PNG, JPEG, GIF e WebP;
 - trilli cifrati e sottoposti a rate limit.
 - identità desktop nel keystore del sistema operativo, con migrazione automatica del precedente `identity.key`;
+- backup cifrato con password per ripristinare identità, Peer ID, contatti e cronologia su un nuovo PC; gli allegati restano locali;
 - link contatto v2 firmati Ed25519 e ML-DSA-65; il QR usa una scheda v3 compatta firmata Ed25519 perché una firma ML-DSA-65 non entra in un singolo QR, mantenendo la lettura delle schede v1;
 - CSP restrittiva per la WebView e fingerprint mostrato nella GUI.
 - mininodo pubblico preconfigurato come bootstrap e Circuit Relay v2 per i client dietro CGNAT; non memorizza messaggi.

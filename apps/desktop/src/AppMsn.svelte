@@ -12,6 +12,7 @@
     Activity,
     BellOff,
     Copy,
+    Download,
     ExternalLink,
     Info,
     Link2,
@@ -35,6 +36,7 @@
     Square,
     Sun,
     Trash2,
+    Upload,
     UserRoundPlus,
     UsersRound,
     X,
@@ -220,6 +222,11 @@
   let starting = false
   let setupOpen = true
   let profileOpen = false
+  let accountBackupOpen = false
+  let accountBackupMode: 'export' | 'import' = 'export'
+  let accountBackupPath = ''
+  let accountBackupPassword = ''
+  let accountBackupBusy = false
   let securityIntroOpen = typeof localStorage !== 'undefined'
     && localStorage.getItem(securityIntroKey) !== 'seen'
   let avatarDataUrl = ''
@@ -1397,6 +1404,71 @@
       .catch((error) => showToast(String(error)))
   }
 
+  async function prepareAccountBackupExport() {
+    if (running) {
+      showToast('Vai offline prima di creare un backup account')
+      return
+    }
+    const path = await save({
+      defaultPath: 'msnnext-account.msnnext-account',
+      filters: [{ name: 'Backup account msnnext', extensions: ['msnnext-account'] }],
+    })
+    if (!path) return
+    accountBackupMode = 'export'
+    accountBackupPath = path
+    accountBackupPassword = ''
+    accountBackupOpen = true
+  }
+
+  async function prepareAccountBackupImport() {
+    if (running) {
+      showToast('Vai offline prima di ripristinare un account')
+      return
+    }
+    const path = await open({
+      multiple: false,
+      directory: false,
+      filters: [{ name: 'Backup account msnnext', extensions: ['msnnext-account'] }],
+    })
+    if (!path || Array.isArray(path)) return
+    accountBackupMode = 'import'
+    accountBackupPath = path
+    accountBackupPassword = ''
+    accountBackupOpen = true
+  }
+
+  async function submitAccountBackup() {
+    if (accountBackupPassword.length < 12 || accountBackupBusy) return
+    accountBackupBusy = true
+    try {
+      await invoke(accountBackupMode === 'export' ? 'account_backup_export' : 'account_backup_import', {
+        password: accountBackupPassword,
+        path: accountBackupPath,
+      })
+      accountBackupOpen = false
+      accountBackupPassword = ''
+      if (accountBackupMode === 'export') {
+        showToast('Account, contatti e cronologia salvati')
+        return
+      }
+      peerId = ''
+      ownFingerprint = ''
+      ownContactLink = ''
+      ownContactQr = ''
+      contacts = []
+      conversations = {}
+      selectedPeerId = ''
+      selectedGroupId = ''
+      profileOpen = false
+      showToast('Account ripristinato')
+      await startNode()
+    } catch (error) {
+      showToast(String(error))
+    } finally {
+      accountBackupBusy = false
+    }
+  }
+
   async function shakeWindow() {
     if (appWindow) {
       try {
@@ -1898,6 +1970,7 @@
         <button class="primary-button wide" disabled={starting || !displayName.trim()} onclick={() => startNode()}>
           {starting ? 'Connessione in corso…' : 'Vai online'}
         </button>
+        <button class="secondary-button wide" onclick={prepareAccountBackupImport}><Upload size={14} /> Ripristina account esistente</button>
         <small class="modal-foot">Sulla stessa rete gli amici vengono trovati automaticamente.</small>
       </div>
     </div>
@@ -2024,6 +2097,17 @@
           <label class="preference-row"><span><strong>Suono del trillo</strong><small>Riproduci un avviso quando ricevi un trillo</small></span><input type="checkbox" bind:checked={nudgeSound} /></label>
         </div>
       </section>
+      <section class="settings-account-backup">
+        <header>
+          <span><strong>Account su un nuovo PC</strong><small>Conserva la stessa identità e lo stesso Peer ID</small></span>
+          <ShieldCheck size={18} />
+        </header>
+        <div class="account-backup-actions">
+          <button class="secondary-button" disabled={running} onclick={prepareAccountBackupExport}><Download size={14} /> Esporta</button>
+          <button class="secondary-button" disabled={running} onclick={prepareAccountBackupImport}><Upload size={14} /> Importa</button>
+        </div>
+        <p>Include contatti, messaggi e gruppi; non include i file allegati.{running ? ' Vai offline per usarlo.' : ''}</p>
+      </section>
       <section class="settings-emoticons">
         <header>
           <span><strong>Emoticon personali</strong><small>Disponibili anche quando i contatti sono offline</small></span>
@@ -2056,6 +2140,26 @@
       </details>
       <button class="security-reopen" onclick={() => securityIntroOpen = true}><ShieldCheck size={15} /> Come msnnext protegge i tuoi dati</button>
       <button class="primary-button wide" disabled={!displayName.trim()} onclick={() => saveProfile()}>Salva profilo</button>
+    </div>
+  </div>
+{/if}
+
+{#if accountBackupOpen}
+  <div class="modal-backdrop">
+    <div class="modal account-backup-modal" role="dialog" aria-modal="true" aria-labelledby="account-backup-title">
+      <button type="button" class="modal-close" aria-label="Chiudi" onclick={() => accountBackupOpen = false}><X size={18} /></button>
+      <form onsubmit={(event) => { event.preventDefault(); void submitAccountBackup() }}>
+        <div class="modal-heading">
+          <span>{#if accountBackupMode === 'export'}<Download size={22} />{:else}<Upload size={22} />{/if}</span>
+          <div><p class="step-label">Account msnnext</p><h2 id="account-backup-title">{accountBackupMode === 'export' ? 'Proteggi il backup' : 'Ripristina il tuo account'}</h2></div>
+        </div>
+        <p>{accountBackupMode === 'export' ? 'Identità, contatti e cronologia saranno cifrati. Scegli una password da usare sul nuovo PC.' : 'Inserisci la password per ripristinare identità, contatti e cronologia.'}</p>
+        <label>Password<input type="password" bind:value={accountBackupPassword} minlength="12" autocomplete={accountBackupMode === 'export' ? 'new-password' : 'current-password'} /></label>
+        <small>Almeno 12 caratteri. La password non può essere recuperata.</small>
+        <button class="primary-button wide" disabled={accountBackupPassword.length < 12 || accountBackupBusy}>
+          {accountBackupBusy ? 'Attendi…' : accountBackupMode === 'export' ? 'Crea backup cifrato' : 'Ripristina account'}
+        </button>
+      </form>
     </div>
   </div>
 {/if}
