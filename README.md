@@ -2,6 +2,8 @@
 
 A P2P desktop messenger inspired by MSN Messenger. Its goal is to keep text, nudges, custom emoticons, and media exchange free of a central account: identities, keys, contacts, and history belong to users.
 
+> ⚠️ **Experimental software — not for sensitive use.** This project is still under active development, is not fully functional or security-audited, and must not be relied on for confidential, important, or production communications or data. Expect bugs, incomplete features, compatibility problems, and potentially breaking changes.
+
 > Current status: **development alpha**. The GUI starts and can be used to try connections and messages, but it is not yet a reliable release. Emoticons and attachments now have confirmations tied to the core result, but still require end-to-end testing between two installed applications.
 
 ## Current progress
