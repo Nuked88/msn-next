@@ -1,17 +1,22 @@
 <script lang="ts">
   import { invoke, isTauri } from '@tauri-apps/api/core'
+  import { getVersion } from '@tauri-apps/api/app'
   import { listen, type UnlistenFn } from '@tauri-apps/api/event'
   import { getCurrentWebview } from '@tauri-apps/api/webview'
   import { getCurrentWindow, UserAttentionType } from '@tauri-apps/api/window'
   import { Image } from '@tauri-apps/api/image'
   import { PhysicalPosition } from '@tauri-apps/api/dpi'
   import { open, save } from '@tauri-apps/plugin-dialog'
+  import { relaunch } from '@tauri-apps/plugin-process'
+  import { check, type Update } from '@tauri-apps/plugin-updater'
   import QRCode from 'qrcode'
   import { onMount, tick } from 'svelte'
   import {
     Activity,
     BellOff,
+    CheckCircle2,
     Copy,
+    Database,
     Download,
     ExternalLink,
     Info,
@@ -22,12 +27,14 @@
     Minus,
     Monitor,
     Moon,
+    Palette,
     Paperclip,
     Pencil,
     Plus,
     Power,
     QrCode,
     Radio,
+    RefreshCw,
     Send,
     Settings2,
     ShieldCheck,
@@ -37,6 +44,7 @@
     Sun,
     Trash2,
     Upload,
+    UserRound,
     UserRoundPlus,
     UsersRound,
     X,
@@ -159,6 +167,8 @@
     | { type: 'stopped' }
 
   type Theme = 'light' | 'dark' | 'system'
+  type SettingsSection = 'profile' | 'appearance' | 'devices' | 'data' | 'updates' | 'network'
+  type UpdateStatus = 'idle' | 'checking' | 'available' | 'downloading' | 'installing' | 'current' | 'error'
   type Emoticon = { glyph: string; shortcut: string; label: string }
   type MessagePart = { text: string; emoticon?: Emoticon; custom?: ClientEmoticon }
   type Profile = {
@@ -185,6 +195,8 @@
   const appWindow = isTauri() ? getCurrentWindow() : null
   const securityIntroKey = 'msnnext-security-intro-v1'
   const notificationMutesKey = 'msnnext-notification-mutes-v1'
+  const lastUpdateCheckKey = 'msnnext-update-last-check-v1'
+  const updateCheckIntervalMs = 5 * 60 * 60 * 1000
 
   function loadNotificationMutes() {
     if (typeof localStorage === 'undefined') return {} as Record<string, number>
@@ -232,6 +244,7 @@
   let starting = false
   let setupOpen = true
   let profileOpen = false
+  let settingsSection: SettingsSection = 'profile'
   let accountBackupOpen = false
   let accountBackupMode: 'export' | 'import' = 'export'
   let accountBackupPath = ''
@@ -290,6 +303,16 @@
   let notificationMutes = loadNotificationMutes()
   let overlayIcon: Image | undefined
   let taskbarUpdate = 0
+  let appVersion = '0.2.0'
+  let updateCandidate: Update | null = null
+  let updateStatus: UpdateStatus = 'idle'
+  let updateMessage = ''
+  let updateProgress = 0
+  let updateDownloaded = 0
+  let updateDownloadTotal = 0
+  let lastUpdateCheck = typeof localStorage === 'undefined'
+    ? 0
+    : Number(localStorage.getItem(lastUpdateCheckKey) || 0)
 
   $: activeContact = contacts.find((contact) => contact.peerId === selectedPeerId)
   $: activeGroup = chatGroups.find((group) => group.id === selectedGroupId)
@@ -326,9 +349,29 @@
     let unlisten: UnlistenFn | undefined
     let unlistenDrop: UnlistenFn | undefined
     let unlistenFocus: UnlistenFn | undefined
+    let updateTimer: ReturnType<typeof setTimeout> | undefined
     const blockNativeMenu = (event: MouseEvent) => event.preventDefault()
+    const openPreferences = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key === ',') {
+        event.preventDefault()
+        openSettings()
+      }
+    }
     window.addEventListener('contextmenu', blockNativeMenu)
-    if (isTauri()) void initializeApp().then((stop) => unlisten = stop)
+    window.addEventListener('keydown', openPreferences)
+    if (isTauri()) {
+      void getVersion().then((version) => appVersion = version)
+      void initializeApp().then((stop) => unlisten = stop)
+      const scheduleUpdateCheck = () => {
+        const elapsed = Date.now() - lastUpdateCheck
+        const delay = Math.max(1_000, updateCheckIntervalMs - Math.max(0, elapsed))
+        updateTimer = setTimeout(async () => {
+          await checkForUpdates(false)
+          scheduleUpdateCheck()
+        }, delay)
+      }
+      scheduleUpdateCheck()
+    }
     if (appWindow) {
       void appWindow.isFocused().then((focused) => windowFocused = focused)
       void appWindow.onFocusChanged(({ payload: focused }) => {
@@ -349,7 +392,9 @@
       unlisten?.()
       unlistenDrop?.()
       unlistenFocus?.()
+      if (updateTimer) clearTimeout(updateTimer)
       window.removeEventListener('contextmenu', blockNativeMenu)
+      window.removeEventListener('keydown', openPreferences)
       media.removeEventListener('change', syncSystemTheme)
     }
   })
@@ -400,6 +445,82 @@
     theme = next
     localStorage.setItem('msnnext-theme', next)
     applyTheme()
+  }
+
+  function openSettings(section: SettingsSection = 'profile') {
+    settingsSection = section
+    profileOpen = true
+  }
+
+  async function checkForUpdates(force: boolean) {
+    if (!isTauri() || updateStatus === 'checking' || updateStatus === 'downloading' || updateStatus === 'installing') return
+    if (!force && Date.now() - lastUpdateCheck < updateCheckIntervalMs) return
+
+    lastUpdateCheck = Date.now()
+    localStorage.setItem(lastUpdateCheckKey, String(lastUpdateCheck))
+    updateStatus = 'checking'
+    updateMessage = 'Controllo della versione disponibile…'
+    try {
+      const update = await check({ timeout: 30_000 })
+      if (!update) {
+        await updateCandidate?.close()
+        updateCandidate = null
+        updateStatus = 'current'
+        updateMessage = 'Stai usando la versione più recente.'
+        if (force) showToast('msnnext è aggiornato')
+        return
+      }
+
+      await updateCandidate?.close()
+      updateCandidate = update
+      updateStatus = 'available'
+      updateMessage = `La versione ${update.version} è pronta per l'installazione.`
+      if (force) showToast(`Aggiornamento ${update.version} disponibile`)
+    } catch (error) {
+      updateStatus = 'error'
+      updateMessage = `Controllo non riuscito: ${String(error)}`
+      if (force) showToast('Impossibile controllare gli aggiornamenti')
+      else console.warn('Controllo aggiornamenti non riuscito', error)
+    }
+  }
+
+  async function installUpdate() {
+    if (!updateCandidate || updateStatus === 'downloading' || updateStatus === 'installing') return
+    updateStatus = 'downloading'
+    updateProgress = 0
+    updateDownloaded = 0
+    updateDownloadTotal = 0
+    updateMessage = `Download di msnnext ${updateCandidate.version}…`
+    try {
+      await updateCandidate.downloadAndInstall((event) => {
+        if (event.event === 'Started') {
+          updateDownloadTotal = event.data.contentLength || 0
+          return
+        }
+        if (event.event === 'Progress') {
+          updateDownloaded += event.data.chunkLength
+          updateProgress = updateDownloadTotal
+            ? Math.min(99, Math.round(updateDownloaded * 100 / updateDownloadTotal))
+            : 0
+          return
+        }
+        updateProgress = 100
+        updateStatus = 'installing'
+        updateMessage = 'Installazione completata. Riavvio di msnnext…'
+      })
+      await relaunch()
+    } catch (error) {
+      updateStatus = 'error'
+      updateMessage = `Aggiornamento non riuscito: ${String(error)}`
+      showToast('Aggiornamento non riuscito')
+    }
+  }
+
+  function lastUpdateCheckLabel() {
+    if (!lastUpdateCheck) return 'Non ancora controllato'
+    return new Date(lastUpdateCheck).toLocaleString([], {
+      day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit',
+    })
   }
 
   function peerConversationKey(peer: string) {
@@ -1344,7 +1465,11 @@
     }
   }
 
-  async function saveProfile(avatarPath: string | null = null, clearAvatar = false) {
+  async function saveProfile(
+    avatarPath: string | null = null,
+    clearAvatar = false,
+    closeAfterSave = true,
+  ) {
     if (!displayName.trim()) return
     try {
       const profile = await invoke<Profile>('profile_save', {
@@ -1355,8 +1480,8 @@
       displayName = profile.name
       avatarDataUrl = profile.avatarDataUrl || ''
       localStorage.setItem('msnnext-name', profile.name)
-      profileOpen = false
-      showToast('Profilo aggiornato')
+      if (closeAfterSave) profileOpen = false
+      showToast(closeAfterSave ? 'Impostazioni salvate' : 'Avatar aggiornato')
     } catch (error) {
       showToast(String(error))
     }
@@ -1368,7 +1493,7 @@
       directory: false,
       filters: [{ name: 'Immagine profilo', extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
     })
-    if (selected && !Array.isArray(selected)) await saveProfile(selected, false)
+    if (selected && !Array.isArray(selected)) await saveProfile(selected, false, false)
   }
 
   async function renameContact() {
@@ -1657,6 +1782,17 @@
           <Monitor size={14} /><span>Sistema</span>
         </button>
       </div>
+      {#if updateCandidate}
+        <button
+          class="titlebar-update"
+          disabled={updateStatus === 'downloading' || updateStatus === 'installing'}
+          title={`Installa msnnext ${updateCandidate.version}`}
+          onclick={installUpdate}
+        >
+          <Download size={14} />
+          <span>{updateStatus === 'downloading' ? `${updateProgress || '…'}%` : updateStatus === 'installing' ? 'Riavvio…' : `Aggiorna a ${updateCandidate.version}`}</span>
+        </button>
+      {/if}
       <span class:online={running} class="node-state"><i></i>{running ? 'Connesso' : 'Non connesso'}</span>
       <button class:online={running} class="power-button" aria-label={running ? 'Disconnetti' : 'Connetti'} title={running ? 'Disconnetti' : 'Connetti'} onclick={running ? stopNode : () => startNode(false)}>
         <Power size={16} />
@@ -1681,7 +1817,7 @@
           <span>{running ? 'Disponibile' : 'Non in linea'}</span>
           <small>{running ? 'Pronto per parlare' : 'Avvia messenger per collegarti'}</small>
         </div>
-        <button aria-label="Modifica profilo" title="Modifica profilo" onclick={() => profileOpen = true}>
+        <button aria-label="Apri impostazioni" title="Impostazioni" onclick={() => openSettings()}>
           <Settings2 size={17} />
         </button>
       </header>
@@ -2195,96 +2331,170 @@
 
 {#if profileOpen}
   <div class="modal-backdrop">
-    <div class="modal profile-modal" role="dialog" aria-modal="true" aria-labelledby="profile-title">
+    <div class="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
       <button class="modal-close" aria-label="Chiudi" onclick={() => profileOpen = false}><X size={18} /></button>
-      <div class="profile-identity-header">
-        <div class="profile-editor-avatar avatar-shell">
+      <header class="settings-header">
+        <div class="settings-avatar avatar-shell">
           {#if avatarDataUrl}<img src={avatarDataUrl} alt="Avatar personale" />{:else}<span>{displayName.slice(0, 1).toUpperCase()}</span>{/if}
         </div>
         <div>
-          <p class="step-label">Il tuo profilo</p>
-          <h2 id="profile-title">Come appari agli amici</h2>
+          <p class="step-label">msnnext {appVersion}</p>
+          <h2 id="settings-title">Impostazioni</h2>
+          <small>{displayName}</small>
         </div>
-      </div>
-      <label>Nome<input bind:value={displayName} maxlength="64" /></label>
-      <div class="profile-avatar-actions">
-        <button class="secondary-button" onclick={chooseAvatar}>Scegli avatar</button>
-        {#if avatarDataUrl}<button class="secondary-button" onclick={() => saveProfile(null, true)}>Rimuovi</button>{/if}
-      </div>
-      <section class="preference-settings" aria-labelledby="preferences-title">
-        <h3 id="preferences-title">Aspetto e comportamento</h3>
-        <div class="preference-list">
-          <label class="preference-row"><span><strong>Dimensione testo</strong><small>L'anteprima è immediata</small></span><select bind:value={fontScale} aria-label="Dimensione testo"><option value={100}>Originale</option><option value={115}>Comoda</option><option value={125}>Grande</option><option value={140}>Molto grande</option></select></label>
-          <label class="preference-row"><span><strong>Immagini inviate</strong><small>Mostrale appena premi invio</small></span><input type="checkbox" bind:checked={previewSentImages} /></label>
-          <label class="preference-row"><span><strong>Immagini ricevute</strong><small>Mostrale senza doverle aprire</small></span><input type="checkbox" bind:checked={previewReceivedImages} /></label>
-          <label class="preference-row"><span><strong>Suono del trillo</strong><small>Riproduci un avviso quando ricevi un trillo</small></span><input type="checkbox" bind:checked={nudgeSound} /></label>
-        </div>
-      </section>
-      <section class="settings-devices" aria-labelledby="linked-devices-title">
-        <header>
-          <span><strong id="linked-devices-title">I tuoi dispositivi</strong><small>Contatti e cronologia passano direttamente tra client online</small></span>
-          <Monitor size={18} />
-        </header>
-        {#if linkedDevices.length}
-          <div class="linked-device-list">
-            {#each linkedDevices as device (device.peerId)}
-              <div class="linked-device-row">
-                <span class:online={device.online} class="device-status-dot"></span>
-                <span><strong>{device.name}</strong><small>{deviceStatus(device)}</small></span>
+      </header>
+
+      <div class="settings-shell">
+        <nav class="settings-navigation" aria-label="Sezioni impostazioni">
+          <button class:active={settingsSection === 'profile'} aria-current={settingsSection === 'profile' ? 'page' : undefined} onclick={() => settingsSection = 'profile'}><UserRound size={17} /><span>Profilo</span></button>
+          <button class:active={settingsSection === 'appearance'} aria-current={settingsSection === 'appearance' ? 'page' : undefined} onclick={() => settingsSection = 'appearance'}><Palette size={17} /><span>Aspetto</span></button>
+          <button class:active={settingsSection === 'devices'} aria-current={settingsSection === 'devices' ? 'page' : undefined} onclick={() => settingsSection = 'devices'}><Monitor size={17} /><span>Dispositivi</span></button>
+          <button class:active={settingsSection === 'data'} aria-current={settingsSection === 'data' ? 'page' : undefined} onclick={() => settingsSection = 'data'}><Database size={17} /><span>Dati</span></button>
+          <button class:active={settingsSection === 'updates'} aria-current={settingsSection === 'updates' ? 'page' : undefined} onclick={() => settingsSection = 'updates'}>
+            <RefreshCw size={17} /><span>Aggiornamenti</span>{#if updateCandidate}<i aria-label="Aggiornamento disponibile"></i>{/if}
+          </button>
+          <button class:active={settingsSection === 'network'} aria-current={settingsSection === 'network' ? 'page' : undefined} onclick={() => settingsSection = 'network'}><Radio size={17} /><span>Rete e sicurezza</span></button>
+        </nav>
+
+        <div class="settings-content">
+          {#if settingsSection === 'profile'}
+            <section class="settings-panel" aria-labelledby="profile-panel-title">
+              <header class="settings-panel-heading">
+                <h3 id="profile-panel-title">Profilo personale</h3>
+                <p>Le persone collegate vedono questo nome e questa immagine.</p>
+              </header>
+              <div class="profile-settings-editor">
+                <div class="profile-editor-avatar avatar-shell">
+                  {#if avatarDataUrl}<img src={avatarDataUrl} alt="Avatar personale" />{:else}<span>{displayName.slice(0, 1).toUpperCase()}</span>{/if}
+                </div>
+                <div class="profile-avatar-copy">
+                  <strong>Immagine del profilo</strong>
+                  <small>PNG, JPEG o WebP</small>
+                  <div class="profile-avatar-actions">
+                    <button class="secondary-button" onclick={chooseAvatar}>Scegli</button>
+                    {#if avatarDataUrl}<button class="secondary-button" onclick={() => saveProfile(null, true, false)}>Rimuovi</button>{/if}
+                  </div>
+                </div>
               </div>
-            {/each}
-          </div>
-        {:else}
-          <p>Nessun altro dispositivo collegato.</p>
-        {/if}
-        <div class="account-backup-actions">
-          <button class="secondary-button" disabled={!running} onclick={shareDevicePairing}><QrCode size={14} /> Mostra codice</button>
-          <button class="secondary-button" disabled={!running} onclick={joinDevicePairing}><Link2 size={14} /> Usa codice</button>
+              <label class="settings-field">Nome visualizzato<input bind:value={displayName} maxlength="64" /></label>
+            </section>
+          {:else if settingsSection === 'appearance'}
+            <section class="settings-panel" aria-labelledby="appearance-panel-title">
+              <header class="settings-panel-heading">
+                <h3 id="appearance-panel-title">Aspetto e comportamento</h3>
+                <p>Personalizza leggibilità, anteprime e avvisi.</p>
+              </header>
+              <div class="settings-theme-control" role="group" aria-label="Tema dell'app">
+                <button class:active={theme === 'light'} onclick={() => setTheme('light')}><Sun size={16} /> Chiaro</button>
+                <button class:active={theme === 'dark'} onclick={() => setTheme('dark')}><Moon size={16} /> Scuro</button>
+                <button class:active={theme === 'system'} onclick={() => setTheme('system')}><Monitor size={16} /> Sistema</button>
+              </div>
+              <div class="settings-list">
+                <label class="settings-row"><span><strong>Dimensione testo</strong><small>L'anteprima cambia immediatamente</small></span><select bind:value={fontScale} aria-label="Dimensione testo"><option value={100}>Originale</option><option value={115}>Comoda</option><option value={125}>Grande</option><option value={140}>Molto grande</option></select></label>
+                <label class="settings-row"><span><strong>Immagini inviate</strong><small>Mostrale appena premi invio</small></span><input type="checkbox" bind:checked={previewSentImages} /></label>
+                <label class="settings-row"><span><strong>Immagini ricevute</strong><small>Mostrale senza doverle aprire</small></span><input type="checkbox" bind:checked={previewReceivedImages} /></label>
+                <label class="settings-row"><span><strong>Suono del trillo</strong><small>Riproduci un avviso quando ricevi un trillo</small></span><input type="checkbox" bind:checked={nudgeSound} /></label>
+              </div>
+            </section>
+          {:else if settingsSection === 'devices'}
+            <section class="settings-panel" aria-labelledby="linked-devices-title">
+              <header class="settings-panel-heading">
+                <h3 id="linked-devices-title">Dispositivi collegati</h3>
+                <p>Contatti e cronologia passano direttamente tra i client online.</p>
+              </header>
+              {#if linkedDevices.length}
+                <div class="linked-device-list settings-list">
+                  {#each linkedDevices as device (device.peerId)}
+                    <div class="linked-device-row settings-row">
+                      <span class:online={device.online} class="device-status-dot"></span>
+                      <span><strong>{device.name}</strong><small>{deviceStatus(device)}</small></span>
+                    </div>
+                  {/each}
+                </div>
+              {:else}
+                <div class="settings-empty"><Monitor size={22} /><strong>Solo questo dispositivo</strong><small>Collegane un altro per sincronizzare i dati mentre entrambi sono online.</small></div>
+              {/if}
+              <div class="settings-action-row">
+                <button class="secondary-button" disabled={!running} onclick={shareDevicePairing}><QrCode size={14} /> Mostra codice</button>
+                <button class="secondary-button" disabled={!running} onclick={joinDevicePairing}><Link2 size={14} /> Usa codice</button>
+              </div>
+            </section>
+          {:else if settingsSection === 'data'}
+            <section class="settings-panel" aria-labelledby="data-panel-title">
+              <header class="settings-panel-heading">
+                <h3 id="data-panel-title">Dati e contenuti</h3>
+                <p>Gestisci backup di emergenza ed emoticon personali.</p>
+              </header>
+              <div class="settings-subsection">
+                <div class="settings-subsection-heading"><span><strong>Backup cifrato</strong><small>Include account, contatti, messaggi e gruppi, ma non gli allegati.</small></span><ShieldCheck size={18} /></div>
+                <div class="settings-action-row">
+                  <button class="secondary-button" disabled={running} onclick={prepareAccountBackupExport}><Download size={14} /> Esporta</button>
+                  <button class="secondary-button" disabled={running} onclick={prepareAccountBackupImport}><Upload size={14} /> Importa</button>
+                </div>
+                {#if running}<p class="settings-note">Vai offline per esportare o ripristinare un backup.</p>{/if}
+              </div>
+              <div class="settings-subsection settings-emoticons-flat">
+                <div class="settings-subsection-heading">
+                  <span><strong>Emoticon personali</strong><small>Disponibili anche quando i contatti sono offline.</small></span>
+                  <button class="secondary-button" onclick={chooseEmoticonFile}><Plus size={14} /> Crea</button>
+                </div>
+                {#if customEmoticons.length}
+                  <div class="emoji-grid custom-emoji-grid">
+                    {#each customEmoticons as item (item.assetId)}
+                      <button aria-label={`Modifica ${item.name}`} title="Modifica o elimina" onclick={() => openSaveEmoticon(item)}><img src={item.dataUrl} alt="" /><small>{item.trigger}</small></button>
+                    {/each}
+                  </div>
+                {:else}
+                  <div class="settings-empty compact"><Smile size={20} /><strong>Nessuna emoticon personale</strong></div>
+                {/if}
+                {#if offeredEmoticons.length}
+                  <small class="emoji-section-label">Ricevute da salvare</small>
+                  <div class="received-emoji-list">
+                    {#each offeredEmoticons as item (item.assetId)}
+                      <div><img src={item.dataUrl} alt={item.name} /><span><strong>{item.name}</strong><small>{item.trigger}</small></span><button onclick={() => openSaveEmoticon(item)}>Salva</button></div>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+            </section>
+          {:else if settingsSection === 'updates'}
+            <section class="settings-panel" aria-labelledby="updates-panel-title">
+              <header class="settings-panel-heading">
+                <h3 id="updates-panel-title">Aggiornamenti</h3>
+                <p>msnnext controlla automaticamente le nuove versioni ogni cinque ore.</p>
+              </header>
+              <div class:available={!!updateCandidate} class:error={updateStatus === 'error'} class="update-status-panel">
+                <span class:spinning={updateStatus === 'checking'}>
+                  {#if updateCandidate}<Download size={22} />{:else if updateStatus === 'current'}<CheckCircle2 size={22} />{:else}<RefreshCw size={22} />{/if}
+                </span>
+                <div><strong>{updateCandidate ? `msnnext ${updateCandidate.version} disponibile` : `msnnext ${appVersion}`}</strong><small>{updateMessage || 'Il controllo automatico è attivo.'}</small></div>
+              </div>
+              {#if updateStatus === 'downloading' || updateStatus === 'installing'}
+                <div class="update-progress" aria-label={`Aggiornamento al ${updateProgress}%`}><i style={`width: ${updateProgress}%`}></i></div>
+              {/if}
+              <div class="update-meta"><span>Versione installata<strong>{appVersion}</strong></span><span>Ultimo controllo<strong>{lastUpdateCheckLabel()}</strong></span></div>
+              <div class="settings-action-row update-actions">
+                <button class="secondary-button" disabled={updateStatus === 'checking' || updateStatus === 'downloading' || updateStatus === 'installing'} onclick={() => checkForUpdates(true)}><RefreshCw size={14} /> Controlla ora</button>
+                {#if updateCandidate}<button class="primary-button" disabled={updateStatus === 'downloading' || updateStatus === 'installing'} onclick={installUpdate}><Download size={14} /> {updateStatus === 'downloading' ? `Download ${updateProgress || '…'}%` : 'Scarica e installa'}</button>{/if}
+              </div>
+            </section>
+          {:else}
+            <section class="settings-panel" aria-labelledby="network-panel-title">
+              <header class="settings-panel-heading">
+                <h3 id="network-panel-title">Rete e sicurezza</h3>
+                <p>Il mininodo aiuta i dispositivi a trovarsi; i dati restano cifrati tra client.</p>
+              </header>
+              <label class="settings-field">Relay personalizzato<input bind:value={relayAddress} maxlength="512" placeholder="Usa il mininodo msnnext" /><small>Lascia vuoto per usare automaticamente il mininodo pubblico. Riconnettiti dopo averlo cambiato.</small></label>
+              <button class="security-settings-row" onclick={() => securityIntroOpen = true}><ShieldCheck size={19} /><span><strong>Protezione dei tuoi dati</strong><small>Cifratura, identità locale e limiti del modello di sicurezza</small></span><ExternalLink size={15} /></button>
+            </section>
+          {/if}
         </div>
-      </section>
-      <section class="settings-account-backup">
-        <header>
-          <span><strong>Backup di emergenza</strong><small>Ripristina l'account con un nuovo Peer ID dispositivo</small></span>
-          <ShieldCheck size={18} />
-        </header>
-        <div class="account-backup-actions">
-          <button class="secondary-button" disabled={running} onclick={prepareAccountBackupExport}><Download size={14} /> Esporta</button>
-          <button class="secondary-button" disabled={running} onclick={prepareAccountBackupImport}><Upload size={14} /> Importa</button>
-        </div>
-        <p>Include contatti, messaggi e gruppi; non include i file allegati. Per l'uso quotidiano su più PC collega invece i dispositivi.{running ? ' Vai offline per usarlo.' : ''}</p>
-      </section>
-      <section class="settings-emoticons">
-        <header>
-          <span><strong>Emoticon personali</strong><small>Disponibili anche quando i contatti sono offline</small></span>
-          <button class="secondary-button" onclick={chooseEmoticonFile}><Plus size={14} /> Crea</button>
-        </header>
-        {#if customEmoticons.length}
-          <div class="emoji-grid custom-emoji-grid">
-            {#each customEmoticons as item (item.assetId)}
-              <button aria-label={`Modifica ${item.name}`} title="Modifica o elimina" onclick={() => openSaveEmoticon(item)}>
-                <img src={item.dataUrl} alt="" /><small>{item.trigger}</small>
-              </button>
-            {/each}
-          </div>
-        {:else}
-          <p>Non hai ancora creato emoticon.</p>
-        {/if}
-        {#if offeredEmoticons.length}
-          <small class="emoji-section-label">Ricevute da salvare</small>
-          <div class="received-emoji-list">
-            {#each offeredEmoticons as item (item.assetId)}
-              <div><img src={item.dataUrl} alt={item.name} /><span><strong>{item.name}</strong><small>{item.trigger}</small></span><button onclick={() => openSaveEmoticon(item)}>Salva</button></div>
-            {/each}
-          </div>
-        {/if}
-      </section>
-      <details class="network-settings">
-        <summary>Rete avanzata</summary>
-        <label>Relay personalizzato<input bind:value={relayAddress} maxlength="512" placeholder="Usa il mininodo MSN Next" /></label>
-        <small>Lascia vuoto per usare automaticamente il mininodo pubblico. Riconnettiti dopo averlo cambiato.</small>
-      </details>
-      <button class="security-reopen" onclick={() => securityIntroOpen = true}><ShieldCheck size={15} /> Come msnnext protegge i tuoi dati</button>
-      <button class="primary-button wide" disabled={!displayName.trim()} onclick={() => saveProfile()}>Salva profilo</button>
+      </div>
+
+      <footer class="settings-footer">
+        <small>Le modifiche al tema e al testo sono visibili subito.</small>
+        <div><button class="secondary-button" onclick={() => profileOpen = false}>Annulla</button><button class="primary-button" disabled={!displayName.trim()} onclick={() => saveProfile()}>Salva modifiche</button></div>
+      </footer>
     </div>
   </div>
 {/if}

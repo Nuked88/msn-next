@@ -12,6 +12,7 @@ Messenger desktop P2P ispirato a MSN Messenger. L'obiettivo è mantenere testo, 
 - interfaccia ispirata a MSN con lista contatti online/offline, chat, ricerca e non letti;
 - temi Chiaro, Scuro e Sistema persistenti;
 - chiusura della finestra principale nella tray, con comandi per riaprirla o terminare davvero l'app;
+- aggiornamenti firmati controllati all'avvio e ogni cinque ore, con download avviato solo dall'utente;
 - onboarding, aggiunta contatto tramite link `msnnext://add/...`, QR grafico e scansione QR da immagine;
 - selettore e drag-and-drop nativi per file e immagini;
 - chat di gruppo persistenti fino a 32 partecipanti, instradate sui canali cifrati individuali;
@@ -158,16 +159,16 @@ cargo clippy --workspace --all-targets -- -D warnings
 cd apps/desktop
 npm run check
 npm run build
-npx tauri build
+npx tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
 ```
 
-La suite standard corrente passa con 58 test; un test con due socket reali è escluso dalla suite automatica perché il teardown libp2p può bloccare l'harness su Windows. Il suo scenario deve essere sostituito da un collaudo end-to-end desktop deterministico.
+La suite standard corrente passa con 68 test; un test con due socket reali è escluso dalla suite automatica perché il teardown libp2p può bloccare l'harness su Windows. Il suo scenario deve essere sostituito da un collaudo end-to-end desktop deterministico.
 
 Gli installer vengono generati in:
 
 ```text
-target/release/bundle/msi/msnnext_0.1.0_x64_en-US.msi
-target/release/bundle/nsis/msnnext_0.1.0_x64-setup.exe
+target/release/bundle/msi/msnnext_0.2.0_x64_en-US.msi
+target/release/bundle/nsis/msnnext_0.2.0_x64-setup.exe
 ```
 
 ## Creazione release e installer
@@ -194,7 +195,9 @@ Le release Windows e Linux vanno costruite sui rispettivi sistemi operativi. And
 
 ### Build multipiattaforma su GitHub
 
-Il workflow `Build release bundles` compila NSIS su Windows, DEB/AppImage su Linux e un DMG universale Intel/Apple Silicon su macOS. Sulle pull request conserva i pacchetti come artifact della run; avviato manualmente dalla scheda **Actions**, dopo tre build riuscite pubblica i quattro installer in una GitHub prerelease.
+Il workflow `Build release bundles` compila NSIS su Windows, DEB/AppImage su Linux e un DMG universale Intel/Apple Silicon su macOS. Sulle pull request conserva i pacchetti come artifact senza usare chiavi di firma; avviato manualmente dalla scheda **Actions**, pubblica una release GitHub completa con installer, firme e `latest.json` per l'updater integrato.
+
+Gli aggiornamenti sono verificati dal client con la chiave pubblica inclusa nell'app. La chiave privata non deve entrare nel repository: GitHub Actions la legge dal secret `TAURI_SIGNING_PRIVATE_KEY`. Una copia di recupero della chiave attuale è conservata localmente in `~/.tauri/msnnext-updater.key` con permessi solo-utente. Per una build locale firmata, impostare `TAURI_SIGNING_PRIVATE_KEY_PATH` su quel file; senza la chiave, usare l'override di sviluppo mostrato sopra.
 
 La versione dell'app segue SemVer ed è definita una sola volta in `apps/desktop/package.json`; Tauri la legge da quel file. Finché il progetto è alpha: `0.x.0` per nuove funzionalità o cambi incompatibili e `0.x.y` per correzioni compatibili. Le release future useranno tag Git `v0.x.y`.
 
