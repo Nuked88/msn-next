@@ -1,17 +1,22 @@
 <script lang="ts">
   import { invoke, isTauri } from '@tauri-apps/api/core'
+  import { getVersion } from '@tauri-apps/api/app'
   import { listen, type UnlistenFn } from '@tauri-apps/api/event'
   import { getCurrentWebview } from '@tauri-apps/api/webview'
   import { getCurrentWindow, UserAttentionType } from '@tauri-apps/api/window'
   import { Image } from '@tauri-apps/api/image'
   import { PhysicalPosition } from '@tauri-apps/api/dpi'
   import { open, save } from '@tauri-apps/plugin-dialog'
+  import { relaunch } from '@tauri-apps/plugin-process'
+  import { check, type Update } from '@tauri-apps/plugin-updater'
   import QRCode from 'qrcode'
   import { onMount, tick } from 'svelte'
   import {
     Activity,
     BellOff,
+    CheckCircle2,
     Copy,
+    Database,
     Download,
     ExternalLink,
     Info,
@@ -22,12 +27,14 @@
     Minus,
     Monitor,
     Moon,
+    Palette,
     Paperclip,
     Pencil,
     Plus,
     Power,
     QrCode,
     Radio,
+    RefreshCw,
     Send,
     Settings2,
     ShieldCheck,
@@ -37,6 +44,7 @@
     Sun,
     Trash2,
     Upload,
+    UserRound,
     UserRoundPlus,
     UsersRound,
     X,
@@ -159,6 +167,8 @@
     | { type: 'stopped' }
 
   type Theme = 'light' | 'dark' | 'system'
+  type SettingsSection = 'profile' | 'appearance' | 'devices' | 'data' | 'updates' | 'network'
+  type UpdateStatus = 'idle' | 'checking' | 'available' | 'downloading' | 'installing' | 'current' | 'error'
   type Emoticon = { glyph: string; shortcut: string; label: string }
   type MessagePart = { text: string; emoticon?: Emoticon; custom?: ClientEmoticon }
   type Profile = {
@@ -185,6 +195,8 @@
   const appWindow = isTauri() ? getCurrentWindow() : null
   const securityIntroKey = 'msnnext-security-intro-v1'
   const notificationMutesKey = 'msnnext-notification-mutes-v1'
+  const lastUpdateCheckKey = 'msnnext-update-last-check-v1'
+  const updateCheckIntervalMs = 5 * 60 * 60 * 1000
 
   function loadNotificationMutes() {
     if (typeof localStorage === 'undefined') return {} as Record<string, number>
@@ -232,6 +244,7 @@
   let starting = false
   let setupOpen = true
   let profileOpen = false
+  let settingsSection: SettingsSection = 'profile'
   let accountBackupOpen = false
   let accountBackupMode: 'export' | 'import' = 'export'
   let accountBackupPath = ''
@@ -290,6 +303,16 @@
   let notificationMutes = loadNotificationMutes()
   let overlayIcon: Image | undefined
   let taskbarUpdate = 0
+  let appVersion = '0.2.0'
+  let updateCandidate: Update | null = null
+  let updateStatus: UpdateStatus = 'idle'
+  let updateMessage = ''
+  let updateProgress = 0
+  let updateDownloaded = 0
+  let updateDownloadTotal = 0
+  let lastUpdateCheck = typeof localStorage === 'undefined'
+    ? 0
+    : Number(localStorage.getItem(lastUpdateCheckKey) || 0)
 
   $: activeContact = contacts.find((contact) => contact.peerId === selectedPeerId)
   $: activeGroup = chatGroups.find((group) => group.id === selectedGroupId)
@@ -326,9 +349,29 @@
     let unlisten: UnlistenFn | undefined
     let unlistenDrop: UnlistenFn | undefined
     let unlistenFocus: UnlistenFn | undefined
+    let updateTimer: ReturnType<typeof setTimeout> | undefined
     const blockNativeMenu = (event: MouseEvent) => event.preventDefault()
+    const openPreferences = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key === ',') {
+        event.preventDefault()
+        openSettings()
+      }
+    }
     window.addEventListener('contextmenu', blockNativeMenu)
-    if (isTauri()) void initializeApp().then((stop) => unlisten = stop)
+    window.addEventListener('keydown', openPreferences)
+    if (isTauri()) {
+      void getVersion().then((version) => appVersion = version)
+      void initializeApp().then((stop) => unlisten = stop)
+      const scheduleUpdateCheck = () => {
+        const elapsed = Date.now() - lastUpdateCheck
+        const delay = Math.max(1_000, updateCheckIntervalMs - Math.max(0, elapsed))
+        updateTimer = setTimeout(async () => {
+          await checkForUpdates(false)
+          scheduleUpdateCheck()
+        }, delay)
+      }
+      scheduleUpdateCheck()
+    }
     if (appWindow) {
       void appWindow.isFocused().then((focused) => windowFocused = focused)
       void appWindow.onFocusChanged(({ payload: focused }) => {
@@ -349,7 +392,9 @@
       unlisten?.()
       unlistenDrop?.()
       unlistenFocus?.()
+      if (updateTimer) clearTimeout(updateTimer)
       window.removeEventListener('contextmenu', blockNativeMenu)
+      window.removeEventListener('keydown', openPreferences)
       media.removeEventListener('change', syncSystemTheme)
     }
   })
@@ -400,6 +445,82 @@
     theme = next
     localStorage.setItem('msnnext-theme', next)
     applyTheme()
+  }
+
+  function openSettings(section: SettingsSection = 'profile') {
+    settingsSection = section
+    profileOpen = true
+  }
+
+  async function checkForUpdates(force: boolean) {
+    if (!isTauri() || updateStatus === 'checking' || updateStatus === 'downloading' || updateStatus === 'installing') return
+    if (!force && Date.now() - lastUpdateCheck < updateCheckIntervalMs) return
+
+    lastUpdateCheck = Date.now()
+    localStorage.setItem(lastUpdateCheckKey, String(lastUpdateCheck))
+    updateStatus = 'checking'
+    updateMessage = 'Checking for an available version…'
+    try {
+      const update = await check({ timeout: 30_000 })
+      if (!update) {
+        await updateCandidate?.close()
+        updateCandidate = null
+        updateStatus = 'current'
+        updateMessage = 'You are using the latest version.'
+        if (force) showToast('msnnext is up to date')
+        return
+      }
+
+      await updateCandidate?.close()
+      updateCandidate = update
+      updateStatus = 'available'
+      updateMessage = `Version ${update.version} is ready to install.`
+      if (force) showToast(`Update ${update.version} is available`)
+    } catch (error) {
+      updateStatus = 'error'
+      updateMessage = `Check failed: ${String(error)}`
+      if (force) showToast('Could not check for updates')
+      else console.warn('Update check failed', error)
+    }
+  }
+
+  async function installUpdate() {
+    if (!updateCandidate || updateStatus === 'downloading' || updateStatus === 'installing') return
+    updateStatus = 'downloading'
+    updateProgress = 0
+    updateDownloaded = 0
+    updateDownloadTotal = 0
+    updateMessage = `Downloading msnnext ${updateCandidate.version}…`
+    try {
+      await updateCandidate.downloadAndInstall((event) => {
+        if (event.event === 'Started') {
+          updateDownloadTotal = event.data.contentLength || 0
+          return
+        }
+        if (event.event === 'Progress') {
+          updateDownloaded += event.data.chunkLength
+          updateProgress = updateDownloadTotal
+            ? Math.min(99, Math.round(updateDownloaded * 100 / updateDownloadTotal))
+            : 0
+          return
+        }
+        updateProgress = 100
+        updateStatus = 'installing'
+        updateMessage = 'Installation complete. Restarting msnnext…'
+      })
+      await relaunch()
+    } catch (error) {
+      updateStatus = 'error'
+      updateMessage = `Update failed: ${String(error)}`
+      showToast('Update failed')
+    }
+  }
+
+  function lastUpdateCheckLabel() {
+    if (!lastUpdateCheck) return 'Not checked yet'
+    return new Date(lastUpdateCheck).toLocaleString([], {
+      day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit',
+    })
   }
 
   function peerConversationKey(peer: string) {
@@ -550,7 +671,7 @@
         ...offeredEmoticons.filter((item) => item.assetId !== event.emoticon.assetId),
         event.emoticon,
       ]
-      showToast(`Nuova emoticon da ${contacts.find((item) => item.peerId === event.peerId)?.name || 'un contatto'}`)
+      showToast(`New emoticon from ${contacts.find((item) => item.peerId === event.peerId)?.name || 'a contact'}`)
       return
     }
     if (event.type === 'contactLink') {
@@ -595,7 +716,7 @@
         ...conversation[index], attachmentId: event.id, attachmentMime: event.mime,
       }
       conversations = { ...conversations, [event.peerId]: conversation }
-      showToast(`File ricevuto: ${event.filename}`)
+      showToast(`File received: ${event.filename}`)
       if (previewReceivedImages && event.mime.startsWith('image/')) {
         automaticPreviewIds.add(event.id)
         void invoke('node_read_attachment', { id: event.id, mime: event.mime }).catch((error) => {
@@ -608,7 +729,7 @@
     if (event.type === 'attachmentSent') {
       pendingFileCount = Math.max(0, pendingFileCount - 1)
       fileSending = pendingFileCount > 0
-      showToast(`File inviato: ${event.filename}`)
+      showToast(`File sent: ${event.filename}`)
       return
     }
     if (event.type === 'attachmentProgress') {
@@ -640,7 +761,7 @@
     }
     if (event.type === 'conversationCleared') {
       conversations = { ...conversations, [event.peerId]: [] }
-      showToast('Cronologia eliminata')
+      showToast('History deleted')
       return
     }
     if (event.type === 'contactRemoved') {
@@ -649,7 +770,7 @@
       conversations = remaining
       if (selectedPeerId === event.peerId) selectedPeerId = contacts[0]?.peerId || ''
       detailsOpen = false
-      showToast('Contatto eliminato')
+      showToast('Contact deleted')
       return
     }
     if (event.type === 'groupChatsUpdated') {
@@ -703,7 +824,7 @@
         ...conversation[index], attachmentId: event.id, attachmentMime: event.mime,
       }
       conversations = { ...conversations, [key]: conversation }
-      showToast(`File ricevuto nel gruppo: ${event.filename}`)
+      showToast(`File received in group: ${event.filename}`)
       if (previewReceivedImages && event.mime.startsWith('image/')) {
         automaticPreviewIds.add(event.id)
         void invoke('node_read_attachment', { id: event.id, mime: event.mime }).catch((error) => {
@@ -715,7 +836,7 @@
     }
     if (event.type === 'groupConversationCleared') {
       conversations = { ...conversations, [`group:${event.groupId}`]: [] }
-      showToast('Cronologia del gruppo eliminata')
+      showToast('Group history deleted')
       return
     }
     if (event.type === 'attachmentOpened') {
@@ -732,7 +853,7 @@
       return
     }
     if (event.type === 'attachmentExported') {
-      showToast(`File esportato: ${event.path}`)
+      showToast(`File exported: ${event.path}`)
       return
     }
     if (event.type === 'error') {
@@ -871,7 +992,7 @@
 
   function senderName(message: ChatMessage) {
     if (message.mine) return displayName
-    if (!activeGroup) return activeContact?.name || 'Contatto'
+    if (!activeGroup) return activeContact?.name || 'Contact'
     return contacts.find((contact) => contact.peerId === message.senderPeerId)?.name
       || `${message.senderPeerId?.slice(0, 8) || 'Partecipante'}…`
   }
@@ -904,7 +1025,7 @@
   }
 
   function deviceStatus(device: LinkedDevice) {
-    if (device.online) return 'Online, sincronizzazione attiva'
+    if (device.online) return 'Online, syncing'
     if (!device.lastSeenMs) return 'Mai collegato'
     return `Ultimo collegamento ${new Date(device.lastSeenMs).toLocaleString()}`
   }
@@ -932,11 +1053,11 @@
   function contactSubtitle(contact: Contact) {
     const last = conversations[contact.peerId]?.at(-1)
     if (last) {
-      if (last.kind === 'nudge') return '⚡ Trillo'
+    if (last.kind === 'nudge') return '⚡ Nudge'
       if (last.kind === 'file') return `📎 ${last.body}`
       return last.body
     }
-    return contact.secure ? 'Conversazione protetta' : contact.online ? 'Collegamento…' : 'Non in linea'
+    return contact.secure ? 'Protected conversation' : contact.online ? 'Connecting…' : 'Offline'
   }
 
   function builtinMessageParts(text: string): MessagePart[] {
@@ -1257,13 +1378,13 @@
   }
 
   async function clearGroupConversation() {
-    if (!selectedGroupId || !confirm('Eliminare la cronologia di questa chat di gruppo?')) return
+    if (!selectedGroupId || !confirm('Delete this group chat history?')) return
     await invoke('node_clear_group_conversation', { groupId: selectedGroupId })
       .catch((error) => showToast(String(error)))
   }
 
   async function deleteChatGroup() {
-    if (!selectedGroupId || !confirm('Rimuovere questa chat di gruppo dal dispositivo?')) return
+    if (!selectedGroupId || !confirm('Remove this group chat from this device?')) return
     const id = selectedGroupId
     selectedGroupId = ''
     await invoke('node_delete_chat_group', { groupId: id })
@@ -1272,7 +1393,7 @@
 
   async function openAttachment(message: ChatMessage) {
     if (!message.attachmentId || !message.attachmentMime) {
-      showToast('Il file appartiene a una vecchia cronologia e non ha un riferimento all’archivio')
+      showToast('This file belongs to an old history and has no archive reference')
       return
     }
     if (message.attachmentMime.startsWith('image/') || message.attachmentMime.startsWith('video/')) {
@@ -1302,7 +1423,7 @@
   async function createCustomEmoticon() {
     if (!emoticonPath || !emoticonTrigger.trim()) return
     try {
-      pendingEmoticonAction = 'Emoticon creata'
+      pendingEmoticonAction = 'Emoticon created'
       await invoke('node_create_emoticon', {
         path: emoticonPath,
         trigger: emoticonTrigger.trim(),
@@ -1322,7 +1443,7 @@
   async function saveReceivedEmoticon() {
     if (!emoticonToSave || !emoticonTrigger.trim()) return
     try {
-      pendingEmoticonAction = emoticonToSave.saved ? 'Scorciatoia aggiornata' : 'Emoticon salvata'
+      pendingEmoticonAction = emoticonToSave.saved ? 'Shortcut updated' : 'Emoticon saved'
       await invoke(emoticonToSave.saved ? 'node_update_emoticon' : 'node_save_emoticon', {
         assetId: emoticonToSave.assetId,
         trigger: emoticonTrigger.trim(),
@@ -1334,8 +1455,8 @@
   }
 
   async function deleteEmoticon() {
-    if (!emoticonToSave?.saved || !confirm('Eliminare questa emoticon?')) return
-    pendingEmoticonAction = 'Eliminazione emoticon…'
+    if (!emoticonToSave?.saved || !confirm('Delete this emoticon?')) return
+    pendingEmoticonAction = 'Deleting emoticon…'
     try {
       await invoke('node_delete_emoticon', { assetId: emoticonToSave.assetId })
     } catch (error) {
@@ -1344,7 +1465,11 @@
     }
   }
 
-  async function saveProfile(avatarPath: string | null = null, clearAvatar = false) {
+  async function saveProfile(
+    avatarPath: string | null = null,
+    clearAvatar = false,
+    closeAfterSave = true,
+  ) {
     if (!displayName.trim()) return
     try {
       const profile = await invoke<Profile>('profile_save', {
@@ -1355,8 +1480,8 @@
       displayName = profile.name
       avatarDataUrl = profile.avatarDataUrl || ''
       localStorage.setItem('msnnext-name', profile.name)
-      profileOpen = false
-      showToast('Profilo aggiornato')
+      if (closeAfterSave) profileOpen = false
+      showToast(closeAfterSave ? 'Settings saved' : 'Avatar updated')
     } catch (error) {
       showToast(String(error))
     }
@@ -1366,9 +1491,9 @@
     const selected = await open({
       multiple: false,
       directory: false,
-      filters: [{ name: 'Immagine profilo', extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
+      filters: [{ name: 'Profile image', extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
     })
-    if (selected && !Array.isArray(selected)) await saveProfile(selected, false)
+    if (selected && !Array.isArray(selected)) await saveProfile(selected, false, false)
   }
 
   async function renameContact() {
@@ -1379,26 +1504,26 @@
   }
 
   async function clearConversation() {
-    if (!selectedPeerId || !confirm('Eliminare tutta la cronologia di questa chat?')) return
+    if (!selectedPeerId || !confirm('Delete this chat history?')) return
     try { await invoke('node_clear_conversation', { peerId: selectedPeerId }) }
     catch (error) { showToast(String(error)) }
   }
 
   async function deleteContact() {
-    if (!selectedPeerId || !confirm(`Eliminare ${activeContact?.name || 'questo contatto'} e la sua chat?`)) return
+    if (!selectedPeerId || !confirm(`Delete ${activeContact?.name || 'this contact'} and their chat?`)) return
     try { await invoke('node_delete_contact', { peerId: selectedPeerId }) }
     catch (error) { showToast(String(error)) }
   }
 
   async function importContact() {
     if (!contactLink.trim().startsWith('msnnext://add/')) {
-      showToast('Il link contatto non è valido')
+      showToast('The contact link is invalid')
       return
     }
     try {
       await invoke('node_import_contact', { link: contactLink.trim() })
       contactLink = ''
-      showToast('Contatto aggiunto. Provo a collegarlo…')
+      showToast('Contact added. Trying to connect…')
     } catch (error) {
       showToast(String(error))
     }
@@ -1408,7 +1533,7 @@
     const selected = await open({
       multiple: false,
       directory: false,
-      filters: [{ name: 'Immagini QR', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] }],
+      filters: [{ name: 'QR images', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] }],
     })
     if (!selected || Array.isArray(selected)) return
     try {
@@ -1438,24 +1563,24 @@
   async function copyOwnLink() {
     if (!ownContactLink) return
     await navigator.clipboard.writeText(ownContactLink)
-    showToast('Link contatto copiato')
+    showToast('Contact link copied')
   }
 
   async function saveContactQr() {
     if (!ownContactQr) return
     const path = await save({
-      defaultPath: 'msnnext-contatto.png',
-      filters: [{ name: 'Immagine PNG', extensions: ['png'] }],
+      defaultPath: 'msnnext-contact.png',
+      filters: [{ name: 'PNG image', extensions: ['png'] }],
     })
     if (!path) return
     await invoke('save_contact_qr', { path, dataUrl: ownContactQr })
-      .then(() => showToast('QR salvato in alta qualità'))
+      .then(() => showToast('QR saved in high quality'))
       .catch((error) => showToast(String(error)))
   }
 
   async function shareDevicePairing() {
     if (!running) {
-      showToast('Vai online per collegare un dispositivo')
+      showToast('Go online to link a device')
       return
     }
     devicePairingMode = 'share'
@@ -1473,7 +1598,7 @@
 
   function joinDevicePairing() {
     if (!running) {
-      showToast('Vai online per collegare questo dispositivo')
+      showToast('Go online to link this device')
       return
     }
     devicePairingMode = 'join'
@@ -1498,7 +1623,7 @@
     const selected = await open({
       multiple: false,
       directory: false,
-      filters: [{ name: 'Immagini QR', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] }],
+      filters: [{ name: 'QR images', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] }],
     })
     if (!selected || Array.isArray(selected)) return
     try {
@@ -1512,29 +1637,29 @@
   async function copyDevicePairingLink() {
     if (!devicePairingLink) return
     await navigator.clipboard.writeText(devicePairingLink)
-    showToast('Codice dispositivo copiato')
+    showToast('Device code copied')
   }
 
   async function saveDevicePairingQr() {
     if (!devicePairingQr) return
     const path = await save({
-      defaultPath: 'msnnext-dispositivo.png',
-      filters: [{ name: 'Immagine PNG', extensions: ['png'] }],
+      defaultPath: 'msnnext-device.png',
+      filters: [{ name: 'PNG image', extensions: ['png'] }],
     })
     if (!path) return
     await invoke('save_contact_qr', { path, dataUrl: devicePairingQr })
-      .then(() => showToast('QR dispositivo salvato'))
+      .then(() => showToast('Device QR saved'))
       .catch((error) => showToast(String(error)))
   }
 
   async function prepareAccountBackupExport() {
     if (running) {
-      showToast('Vai offline prima di creare un backup account')
+      showToast('Go offline before creating an account backup')
       return
     }
     const path = await save({
       defaultPath: 'msnnext-account.msnnext-account',
-      filters: [{ name: 'Backup account msnnext', extensions: ['msnnext-account'] }],
+      filters: [{ name: 'msnnext account backup', extensions: ['msnnext-account'] }],
     })
     if (!path) return
     accountBackupMode = 'export'
@@ -1545,13 +1670,13 @@
 
   async function prepareAccountBackupImport() {
     if (running) {
-      showToast('Vai offline prima di ripristinare un account')
+      showToast('Go offline before restoring an account')
       return
     }
     const path = await open({
       multiple: false,
       directory: false,
-      filters: [{ name: 'Backup account msnnext', extensions: ['msnnext-account'] }],
+      filters: [{ name: 'msnnext account backup', extensions: ['msnnext-account'] }],
     })
     if (!path || Array.isArray(path)) return
     accountBackupMode = 'import'
@@ -1571,7 +1696,7 @@
       accountBackupOpen = false
       accountBackupPassword = ''
       if (accountBackupMode === 'export') {
-        showToast('Account, contatti e cronologia salvati')
+        showToast('Account, contacts, and history saved')
         return
       }
       peerId = ''
@@ -1583,7 +1708,7 @@
       selectedPeerId = ''
       selectedGroupId = ''
       profileOpen = false
-      showToast('Account ripristinato')
+      showToast('Account restored')
       await startNode()
     } catch (error) {
       showToast(String(error))
@@ -1646,25 +1771,36 @@
       <small>messenger</small>
     </div>
     <div class="titlebar-tools">
-      <div class="theme-switcher" role="group" aria-label="Tema">
-        <button class:active={theme === 'light'} aria-label="Tema chiaro" title="Tema chiaro" onclick={() => setTheme('light')}>
-          <Sun size={14} /><span>Chiaro</span>
+      <div class="theme-switcher" role="group" aria-label="Theme">
+        <button class:active={theme === 'light'} aria-label="Light theme" title="Light theme" onclick={() => setTheme('light')}>
+          <Sun size={14} /><span>Light</span>
         </button>
-        <button class:active={theme === 'dark'} aria-label="Tema scuro" title="Tema scuro" onclick={() => setTheme('dark')}>
-          <Moon size={14} /><span>Scuro</span>
+        <button class:active={theme === 'dark'} aria-label="Dark theme" title="Dark theme" onclick={() => setTheme('dark')}>
+          <Moon size={14} /><span>Dark</span>
         </button>
-        <button class:active={theme === 'system'} aria-label="Tema di sistema" title="Usa il tema del sistema" onclick={() => setTheme('system')}>
-          <Monitor size={14} /><span>Sistema</span>
+        <button class:active={theme === 'system'} aria-label="System theme" title="Use system theme" onclick={() => setTheme('system')}>
+          <Monitor size={14} /><span>System</span>
         </button>
       </div>
-      <span class:online={running} class="node-state"><i></i>{running ? 'Connesso' : 'Non connesso'}</span>
-      <button class:online={running} class="power-button" aria-label={running ? 'Disconnetti' : 'Connetti'} title={running ? 'Disconnetti' : 'Connetti'} onclick={running ? stopNode : () => startNode(false)}>
+      {#if updateCandidate}
+        <button
+          class="titlebar-update"
+          disabled={updateStatus === 'downloading' || updateStatus === 'installing'}
+          title={`Install msnnext ${updateCandidate.version}`}
+          onclick={installUpdate}
+        >
+          <Download size={14} />
+          <span>{updateStatus === 'downloading' ? `${updateProgress || '…'}%` : updateStatus === 'installing' ? 'Restarting…' : `Update to ${updateCandidate.version}`}</span>
+        </button>
+      {/if}
+      <span class:online={running} class="node-state"><i></i>{running ? 'Connected' : 'Disconnected'}</span>
+      <button class:online={running} class="power-button" aria-label={running ? 'Disconnect' : 'Connect'} title={running ? 'Disconnect' : 'Connect'} onclick={running ? stopNode : () => startNode(false)}>
         <Power size={16} />
       </button>
       <div class="window-controls">
-        <button aria-label="Riduci a icona" title="Riduci a icona" onclick={() => void appWindow?.minimize()}><Minus size={15} /></button>
-        <button aria-label="Ingrandisci o ripristina" title="Ingrandisci o ripristina" onclick={() => void appWindow?.toggleMaximize()}><Square size={12} /></button>
-        <button class="window-close" aria-label="Chiudi" title="Chiudi" onclick={() => void appWindow?.close()}><X size={16} /></button>
+        <button aria-label="Minimize" title="Minimize" onclick={() => void appWindow?.minimize()}><Minus size={15} /></button>
+        <button aria-label="Maximize or restore" title="Maximize or restore" onclick={() => void appWindow?.toggleMaximize()}><Square size={12} /></button>
+        <button class="window-close" aria-label="Close" title="Close" onclick={() => void appWindow?.close()}><X size={16} /></button>
       </div>
     </div>
   </header>
@@ -1678,37 +1814,37 @@
         </div>
         <div class="profile-copy">
           <strong>{displayName}</strong>
-          <span>{running ? 'Disponibile' : 'Non in linea'}</span>
-          <small>{running ? 'Pronto per parlare' : 'Avvia messenger per collegarti'}</small>
+          <span>{running ? 'Available' : 'Offline'}</span>
+          <small>{running ? 'Ready to chat' : 'Start messenger to connect'}</small>
         </div>
-        <button aria-label="Modifica profilo" title="Modifica profilo" onclick={() => profileOpen = true}>
+        <button aria-label="Open settings" title="Settings" onclick={() => openSettings()}>
           <Settings2 size={17} />
         </button>
       </header>
 
       <div class="roster-actions">
         <label class="search-field">
-          <span>Cerca tra i contatti</span>
-          <input bind:value={searchQuery} aria-label="Cerca contatti" placeholder="Cerca un contatto…" />
+          <span>Search contacts</span>
+          <input bind:value={searchQuery} aria-label="Search contacts" placeholder="Search contacts…" />
         </label>
-        <button class="add-contact" aria-label="Aggiungi un contatto" title="Aggiungi un contatto" onclick={openContacts}>
+        <button class="add-contact" aria-label="Add a contact" title="Add a contact" onclick={openContacts}>
           <UserRoundPlus size={18} />
         </button>
       </div>
 
-      <section class="contact-list" aria-label="Lista contatti">
+      <section class="contact-list" aria-label="Contact list">
         {#if chatGroups.length}
-          <div class="roster-section-label">Chat di gruppo</div>
+          <div class="roster-section-label">Group chats</div>
           {#each chatGroups as group (group.id)}
             <button class:active={group.id === selectedGroupId} class="contact-row group-chat-row" oncontextmenu={(event) => showGroupMenu(event, group)} onclick={() => selectGroup(group.id)}>
               <span class="group-chat-avatar"><UsersRound size={18} /></span>
-              <span class="contact-copy"><strong>{group.name}</strong><small>{group.members.length} partecipanti</small></span>
+              <span class="contact-copy"><strong>{group.name}</strong><small>{group.members.length} participants</small></span>
               <span class="roster-indicators">{#if isConversationMuted(groupConversationKey(group.id))}<BellOff class="muted-conversation" size={13} />{/if}{#if group.unread}<b class="unread">{group.unread}</b>{/if}</span>
             </button>
           {/each}
         {/if}
         {#if visibleContacts.length}
-          <div class="roster-section-label">Contatti</div>
+          <div class="roster-section-label">Contacts</div>
           {#each sortedContacts as contact (contact.peerId)}
             <button
               class:active={contact.peerId === selectedPeerId}
@@ -1726,32 +1862,32 @@
           {/each}
         {:else if contacts.length && !chatGroups.length}
           <div class="empty-contacts compact">
-            <strong>Nessun risultato</strong>
-            <p>Prova a cercare con un altro nome.</p>
+            <strong>No results</strong>
+            <p>Try searching for a different name.</p>
           </div>
         {:else if !chatGroups.length}
           <div class="empty-contacts">
             <span class="empty-people" aria-hidden="true"><i></i><i></i></span>
-            <strong>La tua lista è vuota</strong>
-            <p>Aggiungi un amico con il suo QR o con un link.</p>
-            <button onclick={openContacts}><Plus size={15} /> Aggiungi contatto</button>
+            <strong>Your list is empty</strong>
+            <p>Add a friend with their QR code or a link.</p>
+            <button onclick={openContacts}><Plus size={15} /> Add contact</button>
           </div>
         {/if}
       </section>
 
       <footer class="roster-footer">
-        <button onclick={openContacts}><UserRoundPlus size={15} /> Aggiungi</button>
-        <button onclick={openGroupCreation}><UsersRound size={15} /> Nuovo gruppo</button>
+        <button onclick={openContacts}><UserRoundPlus size={15} /> Add</button>
+        <button onclick={openGroupCreation}><UsersRound size={15} /> New group</button>
         <span>{onlineContacts.length} online</span>
       </footer>
     </aside>
 
-    <button class="roster-scrim" aria-label="Chiudi lista contatti" onclick={() => rosterOpen = false}></button>
+    <button class="roster-scrim" aria-label="Close contact list" onclick={() => rosterOpen = false}></button>
 
     <section class="conversation">
       <header class="conversation-header">
         <div class="conversation-person">
-          <button class="mobile-roster-button" aria-label="Apri lista contatti" onclick={() => rosterOpen = true}>
+          <button class="mobile-roster-button" aria-label="Open contact list" onclick={() => rosterOpen = true}>
             <Menu size={19} />
           </button>
           <div class="avatar-shell large">
@@ -1761,13 +1897,13 @@
           <span>
             <strong>{activeGroup?.name || activeContact?.name || 'msnnext'}</strong>
             <small>
-              {activeGroup ? `${groupOnline} partecipanti collegati · canali protetti` : ready ? 'Disponibile · conversazione protetta' : activeContact?.online ? 'Sto preparando la conversazione…' : activeContact ? 'Non in linea' : 'Scegli una conversazione dalla lista'}
+              {activeGroup ? `${groupOnline} participants connected · protected channels` : ready ? 'Available · protected conversation' : activeContact?.online ? 'Preparing the conversation…' : activeContact ? 'Offline' : 'Choose a conversation from the list'}
             </small>
           </span>
         </div>
         <div class="header-actions">
-          <span class:secure={ready} class="security-badge"><ShieldCheck size={14} />{ready ? 'Protetta' : 'In attesa'}</span>
-          <button class:active={detailsOpen} class="header-tool" aria-label="Dettagli conversazione" title="Dettagli conversazione" onclick={openConversationDetails}>
+          <span class:secure={ready} class="security-badge"><ShieldCheck size={14} />{ready ? 'Protected' : 'Waiting'}</span>
+          <button class:active={detailsOpen} class="header-tool" aria-label="Conversation details" title="Conversation details" onclick={openConversationDetails}>
             <Info size={17} />
           </button>
         </div>
@@ -1783,11 +1919,11 @@
                 <i class="orbit one"></i>
                 <i class="orbit two"></i>
               </div>
-              <p class="welcome-kicker">Bentornato su msnnext</p>
-              <h1>Le persone che vuoi.<br />Nient’altro.</h1>
-              <p>Scegli un contatto dalla lista, oppure aggiungi un amico per iniziare.</p>
+              <p class="welcome-kicker">Welcome back to msnnext</p>
+              <h1>The people you want.<br />Nothing else.</h1>
+              <p>Choose a contact from the list, or add a friend to get started.</p>
               <button class="primary-button" onclick={running ? openContacts : () => setupOpen = true}>
-                {running ? 'Aggiungi un contatto' : 'Vai online'}
+                {running ? 'Add a contact' : 'Go online'}
               </button>
             </div>
           {:else if messages.length === 0}
@@ -1796,15 +1932,15 @@
                 {#if activeGroup}<UsersRound size={30} />{:else}<span>{activeContact?.name.slice(0, 1).toUpperCase()}</span><i class:online={activeContact?.online}></i>{/if}
               </div>
               <h2>{activeGroup?.name || activeContact?.name}</h2>
-              <p>{activeGroup ? (ready ? 'Scrivi il primo messaggio al gruppo.' : 'La chat sarà disponibile quando almeno un partecipante sarà online.') : ready ? 'È online. Scrivi il primo messaggio o manda un trillo.' : 'Quando tornerà online potrete riprendere a parlare.'}</p>
+              <p>{activeGroup ? (ready ? 'Write the first message to the group.' : 'The chat will be available when at least one participant is online.') : ready ? 'They are online. Write the first message or send a nudge.' : 'You can resume chatting when they come back online.'}</p>
             </div>
           {:else}
-            <div class="session-start"><span>Inizio della conversazione</span></div>
+            <div class="session-start"><span>Start of conversation</span></div>
             {#each messages as message (message.id)}
               {#if message.kind === 'nudge'}
                 <div class="nudge-message">
                   <span><Zap size={18} /></span>
-                  <p><strong>{message.mine ? 'Hai inviato un trillo!' : `${activeContact?.name || 'Un contatto'} ti ha inviato un trillo!`}</strong><small>La finestra ha fatto un piccolo salto.</small></p>
+                  <p><strong>{message.mine ? 'You sent a nudge!' : `${activeContact?.name || 'A contact'} sent you a nudge!`}</strong><small>The window gave a little shake.</small></p>
                   <time>{message.time}</time>
                 </div>
               {:else}
@@ -1818,7 +1954,7 @@
                       {#if message.attachmentDataUrl}
                         <img src={message.attachmentDataUrl} alt={message.body} />
                       {:else}<Paperclip size={17} />{/if}
-                      <span><b>{message.attachmentMime?.startsWith('image/') ? (message.mine ? 'Immagine inviata' : 'Immagine ricevuta') : (message.mine ? 'File inviato' : 'File ricevuto')}</b><small>{message.body}</small></span>
+                      <span><b>{message.attachmentMime?.startsWith('image/') ? (message.mine ? 'Image sent' : 'Image received') : (message.mine ? 'File sent' : 'File received')}</b><small>{message.body}</small></span>
                       {#if message.attachmentId}<ExternalLink size={14} />{/if}
                     </button>
                   {:else}
@@ -1840,53 +1976,53 @@
 
         {#if detailsOpen}
           <aside class="details-pane">
-            <header><strong>Dettagli</strong><button aria-label="Chiudi dettagli" onclick={() => detailsOpen = false}><X size={17} /></button></header>
+            <header><strong>Details</strong><button aria-label="Close details" onclick={() => detailsOpen = false}><X size={17} /></button></header>
             <div class="detail-profile">
               <div class="avatar-shell profile-avatar">
                 {#if activeGroup}<UsersRound size={25} />{:else}<span>{activeContact?.name.slice(0, 1).toUpperCase() || displayName.slice(0, 1).toUpperCase()}</span><i class:online={activeContact?.online || running}></i>{/if}
               </div>
               <strong>{activeGroup?.name || activeContact?.name || displayName}</strong>
-              <small>{activeGroup ? `${activeGroup.members.length} partecipanti` : activeContact ? (activeContact.online ? 'Disponibile' : 'Non in linea') : (running ? 'Online' : 'Non in linea')}</small>
+              <small>{activeGroup ? `${activeGroup.members.length} participants` : activeContact ? (activeContact.online ? 'Available' : 'Offline') : (running ? 'Online' : 'Offline')}</small>
             </div>
             <section class="detail-section">
-              <h3>Sicurezza</h3>
+              <h3>Security</h3>
               <div class="detail-row">
                 <span><ShieldCheck size={18} /></span>
-                <p><strong>Conversazione protetta</strong><small>{ready ? 'Canale cifrato; confronta il codice identità' : 'Disponibile quando il contatto è online'}</small></p>
+                <p><strong>Protected conversation</strong><small>{ready ? 'Encrypted channel; compare the identity code' : 'Available when the contact is online'}</small></p>
                 <i class:active={ready}></i>
               </div>
               <div class="detail-row">
                 <span><Activity size={18} /></span>
-                <p><strong>Collegamento diretto</strong><small>{activeContact?.online ? 'Attivo tra i vostri dispositivi' : 'Non collegato'}</small></p>
+                <p><strong>Direct connection</strong><small>{activeContact?.online ? 'Active between your devices' : 'Not connected'}</small></p>
                 <i class:active={activeContact?.online}></i>
               </div>
               <details class="technical-details">
-                <summary>Dettagli tecnici</summary>
-                <p>Cifratura ibrida X25519 + ML-KEM-768. Trasporto QUIC peer-to-peer.</p>
+                <summary>Technical details</summary>
+                <p>Hybrid encryption X25519 + ML-KEM-768. Peer-to-peer QUIC transport.</p>
               </details>
             </section>
             <section class="detail-section identity-detail">
-              <h3>{activeContact ? 'Codice identità del contatto' : 'La tua identità'}</h3>
-              <code>{activeContact?.fingerprint || ownFingerprint || 'Disponibile dopo l’avvio'}</code>
-              <small>Confrontalo a voce o tramite il QR prima di considerare verificata l’identità.</small>
-              <button disabled={!running || linkRequested} onclick={openContacts}><QrCode size={15} /> Mostra QR e link</button>
+              <h3>{activeContact ? 'Contact identity code' : 'Your identity'}</h3>
+              <code>{activeContact?.fingerprint || ownFingerprint || 'Available after startup'}</code>
+              <small>Compare it verbally or with the QR code before considering the identity verified.</small>
+              <button disabled={!running || linkRequested} onclick={openContacts}><QrCode size={15} /> Show QR and link</button>
             </section>
             {#if activeContact}
               <section class="detail-section contact-management">
-                <h3>Gestione contatto</h3>
+                <h3>Contact management</h3>
                 <div class="contact-name-editor">
-                  <label for="contact-display-name">Nome visualizzato</label>
-                  <div class="contact-name-row"><input id="contact-display-name" bind:value={contactName} maxlength="64" placeholder={activeContact.name} /><button onclick={renameContact}><Pencil size={14} /> Salva</button></div>
+                  <label for="contact-display-name">Display name</label>
+                  <div class="contact-name-row"><input id="contact-display-name" bind:value={contactName} maxlength="64" placeholder={activeContact.name} /><button onclick={renameContact}><Pencil size={14} /> Save</button></div>
                 </div>
                 <div class="contact-danger-zone">
-                  <button onclick={clearConversation}><Trash2 size={14} /><span><strong>Cancella cronologia</strong><small>Il contatto rimane nella lista</small></span></button>
-                  <button class="danger-button" onclick={deleteContact}><Trash2 size={14} /><span><strong>Rimuovi contatto</strong><small>Elimina anche la conversazione</small></span></button>
+                  <button onclick={clearConversation}><Trash2 size={14} /><span><strong>Clear history</strong><small>The contact stays in the list</small></span></button>
+                  <button class="danger-button" onclick={deleteContact}><Trash2 size={14} /><span><strong>Remove contact</strong><small>Also deletes the conversation</small></span></button>
                 </div>
               </section>
             {/if}
             {#if activeGroup}
               <section class="detail-section group-management">
-                <h3>Partecipanti</h3>
+                <h3>Participants</h3>
                 <ul>
                   {#each activeGroup.members as member}
                     {@const ban = memberBan(activeGroup, member)}
@@ -1895,25 +2031,25 @@
                         <strong>{memberName(member)}</strong>
                         <small>
                           <b>{memberRole(activeGroup, member)}</b>
-                          {#if activeGroup.silenced.includes(member)}<i>Silenziato</i>{/if}
+                          {#if activeGroup.silenced.includes(member)}<i>Muted</i>{/if}
                           {#if ban}<i class="ban-status">{banLabel(ban)}</i>{/if}
                         </small>
                       </span>
                       {#if canModerateMember(activeGroup, member)}
-                        <select aria-label={`Gestisci ${memberName(member)}`} value="" onchange={(event) => moderateGroup(member, event.currentTarget.value)}>
-                          <option value="">Gestisci…</option>
+                        <select aria-label={`Manage ${memberName(member)}`} value="" onchange={(event) => moderateGroup(member, event.currentTarget.value)}>
+                          <option value="">Manage…</option>
                           {#if peerId === activeGroup.ownerPeerId}
-                            <option value={activeGroup.admins.includes(member) ? 'member' : 'admin'}>{activeGroup.admins.includes(member) ? 'Rendi membro' : 'Rendi amministratore'}</option>
+                            <option value={activeGroup.admins.includes(member) ? 'member' : 'admin'}>{activeGroup.admins.includes(member) ? 'Make member' : 'Make administrator'}</option>
                           {/if}
                           {#if !activeGroup.admins.includes(member)}
                             {#if ban}
-                              <option value="unban">Rimuovi ban</option>
+                              <option value="unban">Remove ban</option>
                             {:else}
-                              <option value={activeGroup.silenced.includes(member) ? 'unsilence' : 'silence'}>{activeGroup.silenced.includes(member) ? 'Rimuovi silence' : 'Silenzia'}</option>
-                              <option value="tempBan:3600000">Ban per 1 ora</option>
-                              <option value="tempBan:86400000">Ban per 24 ore</option>
-                              <option value="tempBan:604800000">Ban per 7 giorni</option>
-                              <option value="permaBan">Ban permanente</option>
+                              <option value={activeGroup.silenced.includes(member) ? 'unsilence' : 'silence'}>{activeGroup.silenced.includes(member) ? 'Unmute' : 'Mute'}</option>
+                              <option value="tempBan:3600000">Ban for 1 hour</option>
+                              <option value="tempBan:86400000">Ban for 24 hours</option>
+                              <option value="tempBan:604800000">Ban for 7 days</option>
+                              <option value="permaBan">Permanent ban</option>
                             {/if}
                           {/if}
                         </select>
@@ -1921,11 +2057,11 @@
                     </li>
                   {/each}
                 </ul>
-                <button onclick={clearGroupConversation}><Trash2 size={14} /> Elimina cronologia</button>
-                <button class="danger-button" onclick={deleteChatGroup}><Trash2 size={14} /> Rimuovi chat dal dispositivo</button>
+                <button onclick={clearGroupConversation}><Trash2 size={14} /> Delete history</button>
+                <button class="danger-button" onclick={deleteChatGroup}><Trash2 size={14} /> Remove chat from device</button>
               </section>
             {/if}
-            <div class="privacy-note"><LockKeyhole size={14} /><span>Contatti e cronologia restano su questo dispositivo.</span></div>
+            <div class="privacy-note"><LockKeyhole size={14} /><span>Contacts and history stay on this device.</span></div>
           </aside>
         {/if}
       </div>
@@ -2195,96 +2331,170 @@
 
 {#if profileOpen}
   <div class="modal-backdrop">
-    <div class="modal profile-modal" role="dialog" aria-modal="true" aria-labelledby="profile-title">
+    <div class="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
       <button class="modal-close" aria-label="Chiudi" onclick={() => profileOpen = false}><X size={18} /></button>
-      <div class="profile-identity-header">
-        <div class="profile-editor-avatar avatar-shell">
+      <header class="settings-header">
+        <div class="settings-avatar avatar-shell">
           {#if avatarDataUrl}<img src={avatarDataUrl} alt="Avatar personale" />{:else}<span>{displayName.slice(0, 1).toUpperCase()}</span>{/if}
         </div>
         <div>
-          <p class="step-label">Il tuo profilo</p>
-          <h2 id="profile-title">Come appari agli amici</h2>
+          <p class="step-label">msnnext {appVersion}</p>
+          <h2 id="settings-title">Impostazioni</h2>
+          <small>{displayName}</small>
         </div>
-      </div>
-      <label>Nome<input bind:value={displayName} maxlength="64" /></label>
-      <div class="profile-avatar-actions">
-        <button class="secondary-button" onclick={chooseAvatar}>Scegli avatar</button>
-        {#if avatarDataUrl}<button class="secondary-button" onclick={() => saveProfile(null, true)}>Rimuovi</button>{/if}
-      </div>
-      <section class="preference-settings" aria-labelledby="preferences-title">
-        <h3 id="preferences-title">Aspetto e comportamento</h3>
-        <div class="preference-list">
-          <label class="preference-row"><span><strong>Dimensione testo</strong><small>L'anteprima è immediata</small></span><select bind:value={fontScale} aria-label="Dimensione testo"><option value={100}>Originale</option><option value={115}>Comoda</option><option value={125}>Grande</option><option value={140}>Molto grande</option></select></label>
-          <label class="preference-row"><span><strong>Immagini inviate</strong><small>Mostrale appena premi invio</small></span><input type="checkbox" bind:checked={previewSentImages} /></label>
-          <label class="preference-row"><span><strong>Immagini ricevute</strong><small>Mostrale senza doverle aprire</small></span><input type="checkbox" bind:checked={previewReceivedImages} /></label>
-          <label class="preference-row"><span><strong>Suono del trillo</strong><small>Riproduci un avviso quando ricevi un trillo</small></span><input type="checkbox" bind:checked={nudgeSound} /></label>
-        </div>
-      </section>
-      <section class="settings-devices" aria-labelledby="linked-devices-title">
-        <header>
-          <span><strong id="linked-devices-title">I tuoi dispositivi</strong><small>Contatti e cronologia passano direttamente tra client online</small></span>
-          <Monitor size={18} />
-        </header>
-        {#if linkedDevices.length}
-          <div class="linked-device-list">
-            {#each linkedDevices as device (device.peerId)}
-              <div class="linked-device-row">
-                <span class:online={device.online} class="device-status-dot"></span>
-                <span><strong>{device.name}</strong><small>{deviceStatus(device)}</small></span>
+      </header>
+
+      <div class="settings-shell">
+        <nav class="settings-navigation" aria-label="Sezioni impostazioni">
+          <button class:active={settingsSection === 'profile'} aria-current={settingsSection === 'profile' ? 'page' : undefined} onclick={() => settingsSection = 'profile'}><UserRound size={17} /><span>Profilo</span></button>
+          <button class:active={settingsSection === 'appearance'} aria-current={settingsSection === 'appearance' ? 'page' : undefined} onclick={() => settingsSection = 'appearance'}><Palette size={17} /><span>Aspetto</span></button>
+          <button class:active={settingsSection === 'devices'} aria-current={settingsSection === 'devices' ? 'page' : undefined} onclick={() => settingsSection = 'devices'}><Monitor size={17} /><span>Dispositivi</span></button>
+          <button class:active={settingsSection === 'data'} aria-current={settingsSection === 'data' ? 'page' : undefined} onclick={() => settingsSection = 'data'}><Database size={17} /><span>Dati</span></button>
+          <button class:active={settingsSection === 'updates'} aria-current={settingsSection === 'updates' ? 'page' : undefined} onclick={() => settingsSection = 'updates'}>
+            <RefreshCw size={17} /><span>Aggiornamenti</span>{#if updateCandidate}<i aria-label="Aggiornamento disponibile"></i>{/if}
+          </button>
+          <button class:active={settingsSection === 'network'} aria-current={settingsSection === 'network' ? 'page' : undefined} onclick={() => settingsSection = 'network'}><Radio size={17} /><span>Rete e sicurezza</span></button>
+        </nav>
+
+        <div class="settings-content">
+          {#if settingsSection === 'profile'}
+            <section class="settings-panel" aria-labelledby="profile-panel-title">
+              <header class="settings-panel-heading">
+                <h3 id="profile-panel-title">Profilo personale</h3>
+                <p>Le persone collegate vedono questo nome e questa immagine.</p>
+              </header>
+              <div class="profile-settings-editor">
+                <div class="profile-editor-avatar avatar-shell">
+                  {#if avatarDataUrl}<img src={avatarDataUrl} alt="Avatar personale" />{:else}<span>{displayName.slice(0, 1).toUpperCase()}</span>{/if}
+                </div>
+                <div class="profile-avatar-copy">
+                  <strong>Immagine del profilo</strong>
+                  <small>PNG, JPEG o WebP</small>
+                  <div class="profile-avatar-actions">
+                    <button class="secondary-button" onclick={chooseAvatar}>Scegli</button>
+                    {#if avatarDataUrl}<button class="secondary-button" onclick={() => saveProfile(null, true, false)}>Rimuovi</button>{/if}
+                  </div>
+                </div>
               </div>
-            {/each}
-          </div>
-        {:else}
-          <p>Nessun altro dispositivo collegato.</p>
-        {/if}
-        <div class="account-backup-actions">
-          <button class="secondary-button" disabled={!running} onclick={shareDevicePairing}><QrCode size={14} /> Mostra codice</button>
-          <button class="secondary-button" disabled={!running} onclick={joinDevicePairing}><Link2 size={14} /> Usa codice</button>
+              <label class="settings-field">Nome visualizzato<input bind:value={displayName} maxlength="64" /></label>
+            </section>
+          {:else if settingsSection === 'appearance'}
+            <section class="settings-panel" aria-labelledby="appearance-panel-title">
+              <header class="settings-panel-heading">
+                <h3 id="appearance-panel-title">Aspetto e comportamento</h3>
+                <p>Personalizza leggibilità, anteprime e avvisi.</p>
+              </header>
+              <div class="settings-theme-control" role="group" aria-label="Tema dell'app">
+                <button class:active={theme === 'light'} onclick={() => setTheme('light')}><Sun size={16} /> Chiaro</button>
+                <button class:active={theme === 'dark'} onclick={() => setTheme('dark')}><Moon size={16} /> Scuro</button>
+                <button class:active={theme === 'system'} onclick={() => setTheme('system')}><Monitor size={16} /> Sistema</button>
+              </div>
+              <div class="settings-list">
+                <label class="settings-row"><span><strong>Dimensione testo</strong><small>L'anteprima cambia immediatamente</small></span><select bind:value={fontScale} aria-label="Dimensione testo"><option value={100}>Originale</option><option value={115}>Comoda</option><option value={125}>Grande</option><option value={140}>Molto grande</option></select></label>
+                <label class="settings-row"><span><strong>Immagini inviate</strong><small>Mostrale appena premi invio</small></span><input type="checkbox" bind:checked={previewSentImages} /></label>
+                <label class="settings-row"><span><strong>Immagini ricevute</strong><small>Mostrale senza doverle aprire</small></span><input type="checkbox" bind:checked={previewReceivedImages} /></label>
+                <label class="settings-row"><span><strong>Suono del trillo</strong><small>Riproduci un avviso quando ricevi un trillo</small></span><input type="checkbox" bind:checked={nudgeSound} /></label>
+              </div>
+            </section>
+          {:else if settingsSection === 'devices'}
+            <section class="settings-panel" aria-labelledby="linked-devices-title">
+              <header class="settings-panel-heading">
+                <h3 id="linked-devices-title">Dispositivi collegati</h3>
+                <p>Contatti e cronologia passano direttamente tra i client online.</p>
+              </header>
+              {#if linkedDevices.length}
+                <div class="linked-device-list settings-list">
+                  {#each linkedDevices as device (device.peerId)}
+                    <div class="linked-device-row settings-row">
+                      <span class:online={device.online} class="device-status-dot"></span>
+                      <span><strong>{device.name}</strong><small>{deviceStatus(device)}</small></span>
+                    </div>
+                  {/each}
+                </div>
+              {:else}
+                <div class="settings-empty"><Monitor size={22} /><strong>Solo questo dispositivo</strong><small>Collegane un altro per sincronizzare i dati mentre entrambi sono online.</small></div>
+              {/if}
+              <div class="settings-action-row">
+                <button class="secondary-button" disabled={!running} onclick={shareDevicePairing}><QrCode size={14} /> Mostra codice</button>
+                <button class="secondary-button" disabled={!running} onclick={joinDevicePairing}><Link2 size={14} /> Usa codice</button>
+              </div>
+            </section>
+          {:else if settingsSection === 'data'}
+            <section class="settings-panel" aria-labelledby="data-panel-title">
+              <header class="settings-panel-heading">
+                <h3 id="data-panel-title">Dati e contenuti</h3>
+                <p>Gestisci backup di emergenza ed emoticon personali.</p>
+              </header>
+              <div class="settings-subsection">
+                <div class="settings-subsection-heading"><span><strong>Backup cifrato</strong><small>Include account, contatti, messaggi e gruppi, ma non gli allegati.</small></span><ShieldCheck size={18} /></div>
+                <div class="settings-action-row">
+                  <button class="secondary-button" disabled={running} onclick={prepareAccountBackupExport}><Download size={14} /> Esporta</button>
+                  <button class="secondary-button" disabled={running} onclick={prepareAccountBackupImport}><Upload size={14} /> Importa</button>
+                </div>
+                {#if running}<p class="settings-note">Vai offline per esportare o ripristinare un backup.</p>{/if}
+              </div>
+              <div class="settings-subsection settings-emoticons-flat">
+                <div class="settings-subsection-heading">
+                  <span><strong>Emoticon personali</strong><small>Disponibili anche quando i contatti sono offline.</small></span>
+                  <button class="secondary-button" onclick={chooseEmoticonFile}><Plus size={14} /> Crea</button>
+                </div>
+                {#if customEmoticons.length}
+                  <div class="emoji-grid custom-emoji-grid">
+                    {#each customEmoticons as item (item.assetId)}
+                      <button aria-label={`Modifica ${item.name}`} title="Modifica o elimina" onclick={() => openSaveEmoticon(item)}><img src={item.dataUrl} alt="" /><small>{item.trigger}</small></button>
+                    {/each}
+                  </div>
+                {:else}
+                  <div class="settings-empty compact"><Smile size={20} /><strong>Nessuna emoticon personale</strong></div>
+                {/if}
+                {#if offeredEmoticons.length}
+                  <small class="emoji-section-label">Ricevute da salvare</small>
+                  <div class="received-emoji-list">
+                    {#each offeredEmoticons as item (item.assetId)}
+                      <div><img src={item.dataUrl} alt={item.name} /><span><strong>{item.name}</strong><small>{item.trigger}</small></span><button onclick={() => openSaveEmoticon(item)}>Salva</button></div>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+            </section>
+          {:else if settingsSection === 'updates'}
+            <section class="settings-panel" aria-labelledby="updates-panel-title">
+              <header class="settings-panel-heading">
+                <h3 id="updates-panel-title">Aggiornamenti</h3>
+                <p>msnnext controlla automaticamente le nuove versioni ogni cinque ore.</p>
+              </header>
+              <div class:available={!!updateCandidate} class:error={updateStatus === 'error'} class="update-status-panel">
+                <span class:spinning={updateStatus === 'checking'}>
+                  {#if updateCandidate}<Download size={22} />{:else if updateStatus === 'current'}<CheckCircle2 size={22} />{:else}<RefreshCw size={22} />{/if}
+                </span>
+                <div><strong>{updateCandidate ? `msnnext ${updateCandidate.version} disponibile` : `msnnext ${appVersion}`}</strong><small>{updateMessage || 'Il controllo automatico è attivo.'}</small></div>
+              </div>
+              {#if updateStatus === 'downloading' || updateStatus === 'installing'}
+                <div class="update-progress" aria-label={`Aggiornamento al ${updateProgress}%`}><i style={`width: ${updateProgress}%`}></i></div>
+              {/if}
+              <div class="update-meta"><span>Versione installata<strong>{appVersion}</strong></span><span>Ultimo controllo<strong>{lastUpdateCheckLabel()}</strong></span></div>
+              <div class="settings-action-row update-actions">
+                <button class="secondary-button" disabled={updateStatus === 'checking' || updateStatus === 'downloading' || updateStatus === 'installing'} onclick={() => checkForUpdates(true)}><RefreshCw size={14} /> Controlla ora</button>
+                {#if updateCandidate}<button class="primary-button" disabled={updateStatus === 'downloading' || updateStatus === 'installing'} onclick={installUpdate}><Download size={14} /> {updateStatus === 'downloading' ? `Download ${updateProgress || '…'}%` : 'Scarica e installa'}</button>{/if}
+              </div>
+            </section>
+          {:else}
+            <section class="settings-panel" aria-labelledby="network-panel-title">
+              <header class="settings-panel-heading">
+                <h3 id="network-panel-title">Rete e sicurezza</h3>
+                <p>Il mininodo aiuta i dispositivi a trovarsi; i dati restano cifrati tra client.</p>
+              </header>
+              <label class="settings-field">Relay personalizzato<input bind:value={relayAddress} maxlength="512" placeholder="Usa il mininodo msnnext" /><small>Lascia vuoto per usare automaticamente il mininodo pubblico. Riconnettiti dopo averlo cambiato.</small></label>
+              <button class="security-settings-row" onclick={() => securityIntroOpen = true}><ShieldCheck size={19} /><span><strong>Protezione dei tuoi dati</strong><small>Cifratura, identità locale e limiti del modello di sicurezza</small></span><ExternalLink size={15} /></button>
+            </section>
+          {/if}
         </div>
-      </section>
-      <section class="settings-account-backup">
-        <header>
-          <span><strong>Backup di emergenza</strong><small>Ripristina l'account con un nuovo Peer ID dispositivo</small></span>
-          <ShieldCheck size={18} />
-        </header>
-        <div class="account-backup-actions">
-          <button class="secondary-button" disabled={running} onclick={prepareAccountBackupExport}><Download size={14} /> Esporta</button>
-          <button class="secondary-button" disabled={running} onclick={prepareAccountBackupImport}><Upload size={14} /> Importa</button>
-        </div>
-        <p>Include contatti, messaggi e gruppi; non include i file allegati. Per l'uso quotidiano su più PC collega invece i dispositivi.{running ? ' Vai offline per usarlo.' : ''}</p>
-      </section>
-      <section class="settings-emoticons">
-        <header>
-          <span><strong>Emoticon personali</strong><small>Disponibili anche quando i contatti sono offline</small></span>
-          <button class="secondary-button" onclick={chooseEmoticonFile}><Plus size={14} /> Crea</button>
-        </header>
-        {#if customEmoticons.length}
-          <div class="emoji-grid custom-emoji-grid">
-            {#each customEmoticons as item (item.assetId)}
-              <button aria-label={`Modifica ${item.name}`} title="Modifica o elimina" onclick={() => openSaveEmoticon(item)}>
-                <img src={item.dataUrl} alt="" /><small>{item.trigger}</small>
-              </button>
-            {/each}
-          </div>
-        {:else}
-          <p>Non hai ancora creato emoticon.</p>
-        {/if}
-        {#if offeredEmoticons.length}
-          <small class="emoji-section-label">Ricevute da salvare</small>
-          <div class="received-emoji-list">
-            {#each offeredEmoticons as item (item.assetId)}
-              <div><img src={item.dataUrl} alt={item.name} /><span><strong>{item.name}</strong><small>{item.trigger}</small></span><button onclick={() => openSaveEmoticon(item)}>Salva</button></div>
-            {/each}
-          </div>
-        {/if}
-      </section>
-      <details class="network-settings">
-        <summary>Rete avanzata</summary>
-        <label>Relay personalizzato<input bind:value={relayAddress} maxlength="512" placeholder="Usa il mininodo MSN Next" /></label>
-        <small>Lascia vuoto per usare automaticamente il mininodo pubblico. Riconnettiti dopo averlo cambiato.</small>
-      </details>
-      <button class="security-reopen" onclick={() => securityIntroOpen = true}><ShieldCheck size={15} /> Come msnnext protegge i tuoi dati</button>
-      <button class="primary-button wide" disabled={!displayName.trim()} onclick={() => saveProfile()}>Salva profilo</button>
+      </div>
+
+      <footer class="settings-footer">
+        <small>Le modifiche al tema e al testo sono visibili subito.</small>
+        <div><button class="secondary-button" onclick={() => profileOpen = false}>Annulla</button><button class="primary-button" disabled={!displayName.trim()} onclick={() => saveProfile()}>Salva modifiche</button></div>
+      </footer>
     </div>
   </div>
 {/if}

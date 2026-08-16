@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, State, WindowEvent,
+    AppHandle, Emitter, Manager, RunEvent, State, WindowEvent,
 };
 use tokio::sync::mpsc;
 
@@ -151,13 +151,13 @@ fn desktop_identity(data_dir: &Path) -> Result<StoredIdentity, String> {
                 if encoded != bytes {
                     entry
                         .set_secret(&encoded)
-                        .map_err(|error| format!("aggiornamento del keystore fallito: {error}"))?;
+                        .map_err(|error| format!("failed to update keystore: {error}"))?;
                 }
                 migrated
             }
             _ => {
                 libp2p_identity::Keypair::from_protobuf_encoding(&bytes)
-                    .map_err(|error| format!("identità nel keystore non valida: {error}"))?;
+                    .map_err(|error| format!("invalid identity in keystore: {error}"))?;
                 let identity = StoredIdentity {
                     version: 2,
                     classic: bytes,
@@ -166,7 +166,7 @@ fn desktop_identity(data_dir: &Path) -> Result<StoredIdentity, String> {
                 };
                 entry
                     .set_secret(&serde_json::to_vec(&identity).map_err(|error| error.to_string())?)
-                    .map_err(|error| format!("aggiornamento del keystore fallito: {error}"))?;
+                    .map_err(|error| format!("failed to update keystore: {error}"))?;
                 identity
             }
         },
@@ -179,7 +179,7 @@ fn desktop_identity(data_dir: &Path) -> Result<StoredIdentity, String> {
                     .map_err(|error| error.to_string())?
             };
             libp2p_identity::Keypair::from_protobuf_encoding(&bytes)
-                .map_err(|error| format!("identità locale non valida: {error}"))?;
+                .map_err(|error| format!("invalid local identity: {error}"))?;
             let identity = StoredIdentity {
                 version: 2,
                 classic: bytes,
@@ -189,20 +189,20 @@ fn desktop_identity(data_dir: &Path) -> Result<StoredIdentity, String> {
             let encoded = serde_json::to_vec(&identity).map_err(|error| error.to_string())?;
             entry
                 .set_secret(&encoded)
-                .map_err(|error| format!("salvataggio nel keystore fallito: {error}"))?;
+                .map_err(|error| format!("failed to save to keystore: {error}"))?;
             if entry.get_secret().map_err(|error| error.to_string())? != encoded {
-                return Err("verifica del keystore fallita".into());
+                return Err("keystore verification failed".into());
             }
             identity
         }
-        Err(error) => return Err(format!("lettura del keystore fallita: {error}")),
+        Err(error) => return Err(format!("failed to read keystore: {error}")),
     };
     libp2p_identity::Keypair::from_protobuf_encoding(&identity.classic)
-        .map_err(|error| format!("identità nel keystore non valida: {error}"))?;
+        .map_err(|error| format!("invalid identity in keystore: {error}"))?;
     if legacy_path.exists() {
         let legacy = std::fs::read(&legacy_path).map_err(|error| error.to_string())?;
         if legacy != identity.classic {
-            return Err("l'identità nel keystore non coincide con identity.key".into());
+            return Err("the identity in the keystore does not match identity.key".into());
         }
         std::fs::remove_file(legacy_path).map_err(|error| error.to_string())?;
     }
@@ -223,39 +223,39 @@ fn store_account_key(account_key: [u8; 32]) -> Result<(), String> {
     let entry = identity_entry()?;
     let encoded = entry
         .get_secret()
-        .map_err(|error| format!("lettura del keystore fallita: {error}"))?;
+        .map_err(|error| format!("failed to read keystore: {error}"))?;
     let mut identity: StoredIdentity = serde_json::from_slice(&encoded)
         .map(normalize_identity)
-        .map_err(|_| "identità nel keystore non valida".to_owned())?;
+        .map_err(|_| "invalid identity in keystore".to_owned())?;
     identity.account_key = Some(account_key);
     identity.version = 2;
     let encoded = serde_json::to_vec(&identity).map_err(|error| error.to_string())?;
     entry
         .set_secret(&encoded)
-        .map_err(|error| format!("salvataggio nel keystore fallito: {error}"))?;
+        .map_err(|error| format!("failed to save to keystore: {error}"))?;
     if entry
         .get_secret()
-        .map_err(|error| format!("verifica del keystore fallita: {error}"))?
+        .map_err(|error| format!("keystore verification failed: {error}"))?
         != encoded
     {
-        return Err("verifica del keystore fallita".into());
+        return Err("keystore verification failed".into());
     }
     Ok(())
 }
 
 fn identity_entry() -> Result<keyring::Entry, String> {
     keyring::Entry::new("app.msnnext.desktop", "identity-v1")
-        .map_err(|error| format!("keystore non disponibile: {error}"))
+        .map_err(|error| format!("keystore unavailable: {error}"))
 }
 
 fn derive_backup_key(password: &str, salt: &[u8; 16]) -> Result<[u8; 32], String> {
     if password.chars().count() < 12 {
-        return Err("usa una password di almeno 12 caratteri".into());
+        return Err("use a password with at least 12 characters".into());
     }
     let mut key = [0u8; 32];
     Argon2::default()
         .hash_password_into(password.as_bytes(), salt, &mut key)
-        .map_err(|_| "password non elaborabile".to_owned())?;
+        .map_err(|_| "password could not be processed".to_owned())?;
     Ok(key)
 }
 
@@ -272,7 +272,7 @@ fn encrypt_account_backup(
     let plaintext = serde_json::to_vec(payload).map_err(|error| error.to_string())?;
     let ciphertext = cipher
         .encrypt(XNonce::from_slice(&nonce), plaintext.as_slice())
-        .map_err(|_| "backup non creato".to_owned())?;
+        .map_err(|_| "backup could not be created".to_owned())?;
     serde_json::to_string_pretty(&AccountBackup {
         version: 3,
         kdf: "argon2id-v1".into(),
@@ -286,46 +286,46 @@ fn encrypt_account_backup(
 
 fn decrypt_account_backup(contents: &str, password: &str) -> Result<AccountBackupPayload, String> {
     let backup: AccountBackup =
-        serde_json::from_str(contents).map_err(|_| "backup account non valido".to_owned())?;
+        serde_json::from_str(contents).map_err(|_| "invalid account backup".to_owned())?;
     if !matches!(backup.version, 1..=3)
         || backup.kdf != "argon2id-v1"
         || backup.cipher != "xchacha20poly1305"
     {
-        return Err("formato backup account non supportato".into());
+        return Err("unsupported account backup format".into());
     }
     let salt: [u8; 16] = BASE64
         .decode(backup.salt)
-        .map_err(|_| "backup account non valido".to_owned())?
+        .map_err(|_| "invalid account backup".to_owned())?
         .try_into()
-        .map_err(|_| "backup account non valido".to_owned())?;
+        .map_err(|_| "invalid account backup".to_owned())?;
     let nonce: [u8; 24] = BASE64
         .decode(backup.nonce)
-        .map_err(|_| "backup account non valido".to_owned())?
+        .map_err(|_| "invalid account backup".to_owned())?
         .try_into()
-        .map_err(|_| "backup account non valido".to_owned())?;
+        .map_err(|_| "invalid account backup".to_owned())?;
     let ciphertext = BASE64
         .decode(backup.ciphertext)
-        .map_err(|_| "backup account non valido".to_owned())?;
+        .map_err(|_| "invalid account backup".to_owned())?;
     let key = derive_backup_key(password, &salt)?;
     let cipher = XChaCha20Poly1305::new((&key).into());
     let plaintext = cipher
         .decrypt(XNonce::from_slice(&nonce), ciphertext.as_slice())
-        .map_err(|_| "password errata o backup corrotto".to_owned())?;
+        .map_err(|_| "incorrect password or corrupted backup".to_owned())?;
     let mut payload = if backup.version == 1 {
         AccountBackupPayload {
             identity: serde_json::from_slice(&plaintext)
-                .map_err(|_| "identità nel backup non valida".to_owned())?,
+                .map_err(|_| "invalid identity in backup".to_owned())?,
             history: None,
         }
     } else {
         serde_json::from_slice(&plaintext)
-            .map_err(|_| "contenuto del backup non valido".to_owned())?
+            .map_err(|_| "invalid backup content".to_owned())?
     };
     payload.identity = normalize_identity(payload.identity);
     if payload.identity.version != 2
         || libp2p_identity::Keypair::from_protobuf_encoding(&payload.identity.classic).is_err()
     {
-        return Err("identità nel backup non valida".into());
+        return Err("invalid identity in backup".into());
     }
     if let Some(history) = payload.history.as_deref() {
         decode_backup_history(history)?;
@@ -340,11 +340,11 @@ fn read_backup_history(data_dir: &Path) -> Result<Option<String>, String> {
     }
     let metadata = std::fs::metadata(&path).map_err(|error| error.to_string())?;
     if metadata.len() > MAX_ACCOUNT_HISTORY_BYTES {
-        return Err("cronologia troppo grande per il backup account".into());
+        return Err("history is too large for the account backup".into());
     }
     let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
     if !bytes.starts_with(SQLITE_HEADER) {
-        return Err("database della cronologia non valido".into());
+        return Err("invalid history database".into());
     }
     Ok(Some(BASE64.encode(bytes)))
 }
@@ -352,9 +352,9 @@ fn read_backup_history(data_dir: &Path) -> Result<Option<String>, String> {
 fn decode_backup_history(encoded: &str) -> Result<Vec<u8>, String> {
     let bytes = BASE64
         .decode(encoded)
-        .map_err(|_| "cronologia nel backup non valida".to_owned())?;
+        .map_err(|_| "invalid history in backup".to_owned())?;
     if bytes.len() as u64 > MAX_ACCOUNT_HISTORY_BYTES || !bytes.starts_with(SQLITE_HEADER) {
-        return Err("cronologia nel backup non valida".into());
+        return Err("invalid history in backup".into());
     }
     Ok(bytes)
 }
@@ -468,17 +468,17 @@ fn wait_for_worker(
     let running = workers
         .0
         .lock()
-        .map_err(|_| "stato worker non disponibile")?;
+        .map_err(|_| "worker state unavailable")?;
     let (running, _) = workers
         .1
         .wait_timeout_while(running, timeout, |workers| workers.contains(&generation))
-        .map_err(|_| "arresto del nodo non disponibile")?;
+        .map_err(|_| "node shutdown unavailable")?;
     Ok(!running.contains(&generation))
 }
 
 fn decode_qr_image(path: &Path) -> Result<String, String> {
     let image = image::open(path)
-        .map_err(|error| format!("immagine non leggibile: {error}"))?
+        .map_err(|error| format!("image could not be read: {error}"))?
         .to_luma8();
     let mut prepared = rqrr::PreparedImage::prepare(image);
     for grid in prepared.detect_grids() {
@@ -488,24 +488,24 @@ fn decode_qr_image(path: &Path) -> Result<String, String> {
             }
         }
     }
-    Err("nessun QR msnnext trovato".into())
+    Err("no msnnext QR code found".into())
 }
 
 fn send_command(state: &NodeState, command: ClientCommand) -> Result<(), String> {
     let commands = state
         .commands
         .lock()
-        .map_err(|_| "stato del nodo non disponibile")?
+        .map_err(|_| "node state unavailable")?
         .as_ref()
         .map(|(_, commands)| commands.clone())
-        .ok_or_else(|| "avvia prima il nodo".to_owned())?;
+        .ok_or_else(|| "start the node first".to_owned())?;
     commands
         .send(command)
-        .map_err(|_| "il nodo non è più attivo".to_owned())
+        .map_err(|_| "the node is no longer running".to_owned())
 }
 
 #[tauri::command]
-fn node_start(
+async fn node_start(
     app: AppHandle,
     state: State<'_, NodeState>,
     config: NodeConfig,
@@ -513,12 +513,12 @@ fn node_start(
     let mut command_slot = state
         .commands
         .lock()
-        .map_err(|_| "stato del nodo non disponibile")?;
+        .map_err(|_| "node state unavailable")?;
     if command_slot
         .as_ref()
         .is_some_and(|(_, commands)| !commands.is_closed())
     {
-        return Err("il nodo è già in esecuzione".into());
+        return Err("the node is already running".into());
     }
 
     let data_dir = app
@@ -529,7 +529,7 @@ fn node_start(
     let identity = desktop_identity(&data_dir)?;
     let account_key = identity
         .account_key
-        .ok_or_else(|| "chiave account non disponibile".to_owned())?;
+        .ok_or_else(|| "account key unavailable".to_owned())?;
     let client_config = ClientConfig::desktop(config.name, data_dir, config.connect, config.relay)
         .and_then(|config| config.with_identity_bytes(identity.classic, identity.ml_dsa_seed))
         .map(|config| config.with_account_key(account_key, store_account_key))
@@ -541,7 +541,7 @@ fn node_start(
         .workers
         .0
         .lock()
-        .map_err(|_| "stato worker non disponibile")?
+        .map_err(|_| "worker state unavailable")?
         .insert(generation);
     *command_slot = Some((generation, command_tx));
     drop(command_slot);
@@ -635,7 +635,7 @@ fn node_send_text(
     text: String,
 ) -> Result<(), String> {
     if text.trim().is_empty() {
-        return Err("il messaggio è vuoto".into());
+        return Err("the message is empty".into());
     }
     send_command(
         &state,
@@ -670,7 +670,7 @@ fn node_set_notification_mute(
             group.len() == 32 && group.bytes().all(|byte| byte.is_ascii_hexdigit())
         });
     if !valid {
-        return Err("conversazione non valida".into());
+        return Err("invalid conversation".into());
     }
     send_command(
         &state,
@@ -812,11 +812,11 @@ fn node_moderate_group(
         "silence" => GroupModeration::SetSilenced(true),
         "unsilence" => GroupModeration::SetSilenced(false),
         "tempBan" => GroupModeration::Ban(Some(
-            duration_ms.ok_or("scegli la durata del ban temporaneo")?,
+            duration_ms.ok_or("choose a temporary ban duration")?,
         )),
         "permaBan" => GroupModeration::Ban(None),
         "unban" => GroupModeration::Unban,
-        _ => return Err("azione di moderazione non valida".into()),
+        _ => return Err("invalid moderation action".into()),
     };
     send_command(
         &state,
@@ -835,7 +835,7 @@ fn node_send_group_text(
     text: String,
 ) -> Result<(), String> {
     if text.trim().is_empty() {
-        return Err("il messaggio è vuoto".into());
+        return Err("the message is empty".into());
     }
     send_command(&state, ClientCommand::SendGroupText { group_id, text })
 }
@@ -916,16 +916,16 @@ fn save_contact_qr(path: PathBuf, data_url: String) -> Result<(), String> {
     const MAX_QR_BYTES: usize = 5 * 1024 * 1024;
     let encoded = data_url
         .strip_prefix("data:image/png;base64,")
-        .ok_or_else(|| "QR non valido".to_owned())?;
+        .ok_or_else(|| "invalid QR code".to_owned())?;
     let bytes = BASE64
         .decode(encoded)
-        .map_err(|_| "QR non valido".to_owned())?;
+        .map_err(|_| "invalid QR code".to_owned())?;
     if bytes.len() > MAX_QR_BYTES
         || image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).is_err()
     {
-        return Err("QR non valido".into());
+        return Err("invalid QR code".into());
     }
-    std::fs::write(path, bytes).map_err(|error| format!("QR non salvato: {error}"))
+    std::fs::write(path, bytes).map_err(|error| format!("QR code could not be saved: {error}"))
 }
 
 #[tauri::command]
@@ -933,19 +933,19 @@ fn image_preview(path: String) -> Result<String, String> {
     const MAX_PREVIEW_SOURCE_BYTES: u64 = 100 * 1024 * 1024;
     let path = Path::new(&path);
     if std::fs::metadata(path)
-        .map_err(|error| format!("immagine non leggibile: {error}"))?
+        .map_err(|error| format!("image could not be read: {error}"))?
         .len()
         > MAX_PREVIEW_SOURCE_BYTES
     {
-        return Err("immagine troppo grande per l’anteprima".into());
+        return Err("image is too large for preview".into());
     }
     let image = image::open(path)
-        .map_err(|error| format!("immagine non leggibile: {error}"))?
+        .map_err(|error| format!("image could not be read: {error}"))?
         .thumbnail(1280, 1280);
     let mut bytes = Cursor::new(Vec::new());
     image
         .write_to(&mut bytes, image::ImageFormat::Png)
-        .map_err(|error| format!("anteprima non creata: {error}"))?;
+        .map_err(|error| format!("preview could not be created: {error}"))?;
     Ok(format!(
         "data:image/png;base64,{}",
         BASE64.encode(bytes.into_inner())
@@ -983,7 +983,7 @@ fn profile_save(
 ) -> Result<ProfileView, String> {
     let name = name.trim();
     if name.is_empty() || name.len() > 64 {
-        return Err("nome non valido".into());
+        return Err("invalid name".into());
     }
     let data_dir = app
         .path()
@@ -1011,7 +1011,7 @@ fn profile_save(
         .or_else(|| previous.as_ref().map(|profile| profile.font_scale))
         .unwrap_or_else(default_font_scale);
     if !valid_font_scale(font_scale) {
-        return Err("dimensione testo non valida".into());
+        return Err("invalid text size".into());
     }
     let relay_address = relay_address
         .or_else(|| {
@@ -1031,7 +1031,7 @@ fn profile_save(
         )
         .is_err()
     {
-        return Err("indirizzo relay non valido".into());
+        return Err("invalid relay address".into());
     }
     let avatar_file = if clear_avatar {
         if let Some(file) = previous
@@ -1042,12 +1042,12 @@ fn profile_save(
         }
         None
     } else if let Some(path) = avatar_path {
-        let image = image::open(path).map_err(|error| format!("avatar non leggibile: {error}"))?;
+        let image = image::open(path).map_err(|error| format!("avatar could not be read: {error}"))?;
         let file = "profile-avatar.png".to_owned();
         image
             .thumbnail(256, 256)
             .save(data_dir.join(&file))
-            .map_err(|error| format!("avatar non salvato: {error}"))?;
+            .map_err(|error| format!("avatar could not be saved: {error}"))?;
         Some(file)
     } else {
         previous.and_then(|profile| profile.avatar_file)
@@ -1085,7 +1085,7 @@ fn account_backup_export(
     path: PathBuf,
 ) -> Result<(), String> {
     if node_status(state)? {
-        return Err("vai offline prima di creare un backup account".into());
+        return Err("go offline before creating an account backup".into());
     }
     let data_dir = app
         .path()
@@ -1097,7 +1097,7 @@ fn account_backup_export(
         history: read_backup_history(&data_dir)?,
     };
     let backup = encrypt_account_backup(&payload, &password)?;
-    std::fs::write(path, backup).map_err(|error| format!("backup non salvato: {error}"))
+    std::fs::write(path, backup).map_err(|error| format!("backup could not be saved: {error}"))
 }
 
 #[tauri::command]
@@ -1108,15 +1108,15 @@ fn account_backup_import(
     path: PathBuf,
 ) -> Result<(), String> {
     if node_status(state)? {
-        return Err("vai offline prima di ripristinare un account".into());
+        return Err("go offline before restoring an account".into());
     }
     let metadata = std::fs::metadata(&path)
-        .map_err(|error| format!("backup account non leggibile: {error}"))?;
+        .map_err(|error| format!("account backup could not be read: {error}"))?;
     if metadata.len() > MAX_ACCOUNT_BACKUP_BYTES {
-        return Err("backup account troppo grande".into());
+        return Err("account backup is too large".into());
     }
     let contents = std::fs::read_to_string(path)
-        .map_err(|error| format!("backup account non leggibile: {error}"))?;
+        .map_err(|error| format!("account backup could not be read: {error}"))?;
     let imported = decrypt_account_backup(&contents, &password)?;
     let imported_history = imported
         .history
@@ -1154,16 +1154,16 @@ fn account_backup_import(
     {
         entry
             .set_secret(imported_encoded)
-            .map_err(|error| format!("ripristino nel keystore fallito: {error}"))
+            .map_err(|error| format!("failed to restore keystore: {error}"))
             .and_then(|_| {
                 entry
                     .get_secret()
-                    .map_err(|error| format!("verifica del keystore fallita: {error}"))
+                    .map_err(|error| format!("keystore verification failed: {error}"))
             })
             .and_then(|stored| {
                 (stored.as_slice() == imported_encoded.as_slice())
                     .then_some(())
-                    .ok_or_else(|| "verifica del keystore fallita".to_owned())
+                    .ok_or_else(|| "keystore verification failed".to_owned())
             })
     } else {
         Ok(())
@@ -1178,7 +1178,7 @@ fn account_backup_import(
                     &imported.identity.classic,
                     &current.classic,
                 )
-                .map_err(|error| format!("cronologia non ricifrata: {error}"))
+                .map_err(|error| format!("history could not be re-encrypted: {error}"))
             })
             .transpose()
             .map(|_| ())
@@ -1194,7 +1194,7 @@ fn account_backup_import(
         }
         return match rollback_error {
             Some(rollback) => Err(format!(
-                "{error}; anche il ripristino dell'identità precedente è fallito: {rollback}"
+                "{error}; restoring the previous identity also failed: {rollback}"
             )),
             None => Err(error),
         };
@@ -1207,7 +1207,7 @@ fn node_status(state: State<'_, NodeState>) -> Result<bool, String> {
     let mut command_slot = state
         .commands
         .lock()
-        .map_err(|_| "stato del nodo non disponibile")?;
+        .map_err(|_| "node state unavailable")?;
     let running = command_slot
         .as_ref()
         .is_some_and(|(_, commands)| !commands.is_closed());
@@ -1222,12 +1222,12 @@ fn node_stop(state: State<'_, NodeState>) -> Result<(), String> {
     let commands = state
         .commands
         .lock()
-        .map_err(|_| "stato del nodo non disponibile")?
+        .map_err(|_| "node state unavailable")?
         .take();
     if let Some((generation, commands)) = commands {
         let _ = commands.send(ClientCommand::Shutdown);
         if !wait_for_worker(&state.workers, generation, Duration::from_secs(5))? {
-            return Err("il nodo non si è arrestato in tempo; riprova".into());
+            return Err("the node did not stop in time; try again".into());
         }
     }
     Ok(())
@@ -1238,6 +1238,8 @@ pub fn run() {
     tauri::Builder::default()
         .manage(NodeState::default())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -1246,8 +1248,8 @@ pub fn run() {
                         .build(),
                 )?;
             }
-            let open = MenuItem::with_id(app, "tray-open", "Apri msnnext", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "tray-quit", "Esci", true, None::<&str>)?;
+            let open = MenuItem::with_id(app, "tray-open", "Open msnnext", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "tray-quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open, &quit])?;
             let mut tray = TrayIconBuilder::with_id("main")
                 .menu(&menu)
@@ -1322,8 +1324,13 @@ pub fn run() {
             node_status,
             node_stop
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if matches!(event, RunEvent::Ready) {
+                show_main_window(app);
+            }
+        });
 }
 
 #[cfg(test)]
