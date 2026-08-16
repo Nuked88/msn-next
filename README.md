@@ -1,148 +1,148 @@
 # msnnext
 
-Messenger desktop P2P ispirato a MSN Messenger. L'obiettivo è mantenere testo, trilli, emoticon personali e scambio multimediale senza account centrale: identità, chiavi, contatti e cronologia appartengono agli utenti.
+A P2P desktop messenger inspired by MSN Messenger. Its goal is to keep text, nudges, custom emoticons, and media exchange free of a central account: identities, keys, contacts, and history belong to users.
 
-> Stato attuale: **alpha di sviluppo**. La GUI si avvia ed è utilizzabile per provare collegamento e messaggi, ma non è ancora una release affidabile. Emoticon e allegati hanno ora conferme collegate al risultato del core, ma richiedono ancora collaudo end-to-end tra due applicazioni installate.
+> Current status: **development alpha**. The GUI starts and can be used to try connections and messages, but it is not yet a reliable release. Emoticons and attachments now have confirmations tied to the core result, but still require end-to-end testing between two installed applications.
 
-## Dove siamo arrivati
+## Current progress
 
-### Applicazione desktop
+### Desktop application
 
-- applicazione unica Tauri 2 + Svelte con core Rust integrato, senza processo CLI separato;
-- interfaccia ispirata a MSN con lista contatti online/offline, chat, ricerca e non letti;
-- temi Chiaro, Scuro e Sistema persistenti;
-- chiusura della finestra principale nella tray, con comandi per riaprirla o terminare davvero l'app;
-- aggiornamenti firmati controllati all'avvio e ogni cinque ore, con download avviato solo dall'utente;
-- onboarding, aggiunta contatto tramite link `msnnext://add/...`, QR grafico e scansione QR da immagine;
-- selettore e drag-and-drop nativi per file e immagini;
-- chat di gruppo persistenti fino a 32 partecipanti, instradate sui canali cifrati individuali;
-- conversazioni separate per Peer ID;
-- contatti, cronologia e identità persistenti dopo il riavvio;
-- collegamento di più dispositivi tramite QR/codice monouso, con Peer ID distinto per ogni installazione;
-- bridge tipizzato tra GUI e core tramite comandi ed eventi Tauri.
+- single Tauri 2 + Svelte application with an integrated Rust core and no separate CLI process;
+- MSN-inspired UI with online/offline contacts, chats, search, and unread counts;
+- persistent Light, Dark, and System themes;
+- main window closes to the tray, with commands to reopen or truly quit the app;
+- signed updates checked at startup and every five hours, with downloads started only by the user;
+- onboarding, adding contacts through `msnnext://add/...` links, rendered QR codes, and QR scanning from images;
+- native file and image picker plus drag and drop;
+- persistent group chats with up to 32 participants, routed through individual encrypted channels;
+- separate conversations per Peer ID;
+- contacts, history, and identity persist across restarts;
+- multi-device linking through a one-time QR/code, with a distinct Peer ID for every installation;
+- typed bridge between GUI and core through Tauri commands and events.
 
-### Rete e sicurezza
+### Networking and security
 
-- identità Ed25519 persistente e distinta per dispositivo, autorizzata da una radice account condivisa;
-- trasporto libp2p QUIC e TCP;
-- discovery LAN tramite mDNS;
-- Identify, Kademlia DHT, AutoNAT, DCUtR e Circuit Relay v2;
-- link contatto firmati e verifica della corrispondenza tra chiave pubblica e Peer ID;
-- handshake applicativo ibrido X25519 + ML-KEM-768;
-- messaggi applicativi cifrati con XChaCha20-Poly1305 e ratchet simmetrico;
-- protezione da replay e supporto limitato ai messaggi fuori ordine;
-- reconnessione con backoff dopo la perdita del collegamento;
-- sincronizzazione P2P cifrata tra dispositivi con tentativo diretto DCUtR e fallback Circuit Relay;
-- timeout inattivo della connessione portato oltre il precedente limite errato di 60 secondi.
+- persistent Ed25519 identity, distinct per device and authorized by a shared account root;
+- libp2p QUIC and TCP transport;
+- LAN discovery through mDNS;
+- Identify, Kademlia DHT, AutoNAT, DCUtR, and Circuit Relay v2;
+- signed contact links and verification that the public key matches the Peer ID;
+- hybrid X25519 + ML-KEM-768 application handshake;
+- application messages encrypted with XChaCha20-Poly1305 and a symmetric ratchet;
+- replay protection and limited support for out-of-order messages;
+- backoff reconnection after a lost connection;
+- encrypted P2P device synchronization, attempting direct DCUtR with Circuit Relay fallback;
+- idle connection timeout increased beyond the previous incorrect 60-second limit.
 
-### Dati locali e protocollo
+### Local data and protocol
 
-- envelope CBOR versionati e legati a dispositivo e conversazione;
-- cronologia SQLite con contenuto cifrato localmente;
-- contatti persistenti;
-- trasferimento core a chunk con hash BLAKE3 e ripresa dei chunk mancanti;
-- allegati fino a 5 GB, senza ricostruzione integrale in RAM;
-- archivio allegati ricevuti cifrato localmente per singolo chunk, inclusi i chunk parziali;
-- anteprime immagini inviate e ricevute configurabili dal profilo;
-- limiti e validazione per emoticon PNG, JPEG, GIF e WebP;
-- trilli cifrati e sottoposti a rate limit.
-- identità desktop nel keystore del sistema operativo, con migrazione automatica del precedente `identity.key`;
-- log incrementale cifrato con cursori, deduplicazione e tombstone per sincronizzare contatti, cronologia e gruppi; gli allegati restano locali;
-- backup cifrato con password per il recupero di account, contatti e cronologia su un nuovo PC; al ripristino viene mantenuto un Peer ID locale distinto;
-- link contatto v2 firmati Ed25519 e ML-DSA-65; il QR usa una scheda v3 compatta firmata Ed25519 perché una firma ML-DSA-65 non entra in un singolo QR, mantenendo la lettura delle schede v1;
-- CSP restrittiva per la WebView e fingerprint mostrato nella GUI.
-- mininodo pubblico preconfigurato come bootstrap e Circuit Relay v2 per i client dietro CGNAT; non memorizza messaggi.
+- versioned CBOR envelopes bound to device and conversation;
+- SQLite history with locally encrypted content;
+- persistent contacts;
+- chunked core transfers with BLAKE3 hashes and resuming missing chunks;
+- attachments up to 5 GB, without reconstructing the whole file in RAM;
+- locally encrypted received-attachment archive per chunk, including partial chunks;
+- profile-configurable sent and received image previews;
+- limits and validation for PNG, JPEG, GIF, and WebP emoticons;
+- encrypted, rate-limited nudges;
+- desktop identity in the operating-system keystore, with automatic migration from the previous `identity.key`;
+- encrypted incremental log with cursors, deduplication, and tombstones to synchronize contacts, history, and groups; attachments remain local;
+- password-encrypted backups to recover account, contacts, and history on a new PC; restoring retains a distinct local Peer ID;
+- Ed25519- and ML-DSA-65-signed v2 contact links; QR uses a compact Ed25519-signed v3 card because an ML-DSA-65 signature does not fit in one QR code, while retaining v1 card support;
+- restrictive WebView CSP and a fingerprint displayed in the GUI;
+- public mininode preconfigured as bootstrap and Circuit Relay v2 for clients behind CGNAT; it does not store messages.
 
-## Cosa funziona oggi
+## What works today
 
-- avvio della GUI e creazione dell'identità;
-- aggiunta di un contatto tramite link o QR;
-- collegamento diretto sulla stessa macchina o LAN nelle condizioni già provate;
-- negoziazione del canale sicuro;
-- invio e ricezione dei messaggi di testo;
-- cronologia testuale e lista contatti dopo il riavvio;
-- sincronizzazione di contatti, messaggi, gruppi, rinominazioni e cancellazioni mentre almeno due dispositivi dell'account sono online;
-- trillo di base con animazione della finestra web;
-- generazione degli installer Windows MSI e NSIS.
+- GUI startup and identity creation;
+- adding contacts through a link or QR code;
+- direct connection on the same machine or LAN under the conditions already tested;
+- secure-channel negotiation;
+- sending and receiving text messages;
+- text history and contact list after a restart;
+- synchronizing contacts, messages, groups, renames, and deletions while at least two account devices are online;
+- basic nudge with web-window animation;
+- generating Windows MSI and NSIS installers.
 
-La stabilità della reconnessione è stata migliorata e provata manualmente con due core locali, compreso un riavvio, ma deve ancora essere collaudata a lungo con due applicazioni installate e su reti reali diverse.
+Reconnection stability has improved and was manually tested with two local cores, including a restart, but still needs long-running testing with two installed applications on different real networks.
 
-## Problemi noti
+## Known issues
 
-### Emoticon personalizzate
+### Custom emoticons
 
-Il flusso è presente nel core e nella GUI, con creazione, salvataggio, rinomina della scorciatoia ed eliminazione:
+The flow is present in the core and GUI, including creation, saving, shortcut renaming, and deletion:
 
-- invio, anteprima, salvataggio sul destinatario e riutilizzo tramite scorciatoia devono ancora essere collaudati end-to-end tra due applicazioni installate;
-- gli span delle emoticon vengono conservati nella cronologia cifrata e ripristinati dopo il riavvio;
-- i conflitti tra scorciatoie vengono rifiutati, ma la GUI non propone ancora automaticamente una scorciatoia alternativa.
+- sending, previewing, saving on the recipient side, and reuse through a shortcut still need end-to-end testing between two installed applications;
+- emoticon spans are retained in encrypted history and restored after restart;
+- shortcut conflicts are rejected, but the GUI does not yet automatically suggest an alternative shortcut.
 
-Il risultato richiesto da `GROUND.md` resta: scegliere un'immagine o GIF, assegnare una combinazione, vederla nel messaggio del destinatario e permettergli di salvarla in pochi secondi.
+The outcome required by `GROUND.md` remains: choose an image or GIF, assign a shortcut, see it in the recipient’s message, and let them save it in a few seconds.
 
-### Immagini, video e file
+### Images, videos, and files
 
-Il protocollo Rust a chunk, il drag-and-drop e l'archivio cifrato sono integrati; l'esperienza resta incompleta:
+The chunked Rust protocol, drag and drop, and encrypted archive are integrated, but the experience is still incomplete:
 
-- manca una verifica end-to-end affidabile tra due applicazioni desktop;
-- immagini e video fino al limite di anteprima vengono visualizzati internamente;
-- ogni file ricevuto richiede accettazione esplicita e le offerte pendenti sono limitate;
-- l'invio mostra l'avanzamento per chunk e può essere annullato; restano velocità e annullamento di una ricezione già accettata;
-- i file non visualizzabili vengono esportati esplicitamente dall'utente; non sono aperti automaticamente in chiaro.
+- reliable end-to-end verification between two desktop applications is missing;
+- images and videos up to the preview limit are displayed internally;
+- every received file requires explicit acceptance and pending offers are limited;
+- sending shows chunk progress and can be cancelled; transfer speed and cancellation of an already accepted download remain;
+- files that cannot be previewed are explicitly exported by the user and are not automatically opened in plaintext.
 
-Il file originale inviato non viene copiato nell'archivio di msnnext: viene letto a chunk dal percorso scelto, verificato con BLAKE3 e spedito sul canale cifrato. Sul destinatario i chunk restano cifrati nella directory dati dell'app e vengono decifrati solo in memoria per l'anteprima oppure in streaming verso un percorso scelto durante l'esportazione; non viene usata la cartella temporanea. La chiave dell'archivio deriva dall'identità locale, ora custodita nel keystore del sistema operativo sulla versione desktop.
+The original file sent is not copied into the msnnext archive: it is read in chunks from the selected path, verified with BLAKE3, and sent over the encrypted channel. On the recipient, chunks remain encrypted in the app data directory and are decrypted only in memory for preview or streamed to a path chosen during export; the temporary directory is not used. The archive key derives from the local identity, now held in the operating-system keystore on desktop.
 
-### Chat di gruppo
+### Group chats
 
-- la creazione, la cronologia locale, i messaggi e gli allegati funzionano tramite invio separato a ogni partecipante online;
-- proprietario, amministratori e membri hanno una gerarchia persistente; proprietario e amministratori possono applicare silence, ban temporanei e ban permanenti;
-- non esiste ancora consegna offline: chi non è collegato al momento non riceve il messaggio;
-- trilli e modifica successiva dei partecipanti non sono ancora disponibili nelle chat di gruppo.
+- creation, local history, messages, and attachments work by sending separately to each online participant;
+- owner, administrators, and members have a persistent hierarchy; owners and administrators can apply mutes, temporary bans, and permanent bans;
+- offline delivery does not yet exist: anyone disconnected at the time does not receive the message;
+- nudges and subsequent participant editing are not yet available in group chats.
 
-### Collegamento e presenza
+### Connection and presence
 
-- la reconnessione automatica necessita ancora di test prolungati su due PC e reti differenti;
-- hole punching e fallback relay non sono stati collaudati su due NAT reali;
-- esiste un solo relay pubblico preconfigurato, quindi per ora non c'è ridondanza se la VPS non è disponibile;
-- non esistono messaggi offline: almeno uno dei dispositivi deve essere raggiungibile;
-- il mininodo coordina raggiungibilità e relay ma non conserva i dati sincronizzati; senza sovrapposizione online tra due dispositivi non avviene alcuna sincronizzazione;
-- pairing e sincronizzazione multi-dispositivo devono ancora essere collaudati su due installazioni reali dietro NAT differenti;
-- avatar, nome personale, gruppi, rinomina e rimozione dei contatti sono disponibili; stato personale e blocco restano incompleti.
+- automatic reconnection still needs long-running tests on two PCs and different networks;
+- hole punching and relay fallback have not been tested across two real NATs;
+- there is only one preconfigured public relay, so there is currently no redundancy if the VPS is unavailable;
+- offline messages do not exist: at least one device must be reachable;
+- the mininode coordinates reachability and relay but does not retain synchronized data; without overlapping online time between two devices, no synchronization occurs;
+- multi-device pairing and synchronization still need testing on two real installations behind different NATs;
+- avatar, personal name, groups, contact rename, and contact removal are available; personal status and blocking remain incomplete.
 
-### Trilli e UX
+### Nudges and UX
 
-- il trillo sposta la finestra nativa, con fallback sulla WebView, e dispone di un suono disattivabile;
-- mancano impostazioni, accessibilità e controllo completo delle notifiche.
+- nudges move the native window, with WebView fallback, and have a disableable sound;
+- settings, accessibility, and complete notification control are still missing.
 
-### Sicurezza ancora da completare
+### Security work remaining
 
-- firma ML-DSA del transcript dell'handshake applicativo, oltre alle schede contatto v2 già firmate in modo ibrido;
-- memorizzazione esplicita dell'esito del confronto fingerprint/QR;
-- audit crittografico e di sicurezza indipendente;
-- protocollo di migrazione/versionamento delle primitive crittografiche.
+- ML-DSA signature of the application-handshake transcript, in addition to the hybrid-signed v2 contact cards already implemented;
+- explicit persistence of fingerprint/QR comparison results;
+- independent cryptographic and security audit;
+- migration/versioning protocol for cryptographic primitives.
 
-## Prossime priorità
+## Next priorities
 
-1. Collaudare il flusso completo delle emoticon personalizzate tra due GUI installate.
-2. Aggiungere velocità e annullamento delle ricezioni già accettate.
-3. Eseguire test prolungati di collegamento, disconnessione e reconnessione con due applicazioni installate.
-4. Completare trillo nativo, suono, presenza, avatar e gestione contatti.
-5. Collaudare pairing multi-dispositivo, bootstrap, relay e hole punching su reti reali.
-6. Aggiungere revoca dispositivi con rotazione della radice account.
-7. Rafforzare key storage, CSP, firme post-quantum e verifica delle identità.
+1. Test the complete custom-emoticon flow between two installed GUIs.
+2. Add speed reporting and cancellation for already accepted downloads.
+3. Run extended connection, disconnection, and reconnection tests with two installed applications.
+4. Complete native nudge, sound, presence, avatar, and contact management.
+5. Test multi-device pairing, bootstrap, relay, and hole punching on real networks.
+6. Add device revocation with account-root rotation.
+7. Strengthen key storage, CSP, post-quantum signatures, and identity verification.
 
-## Struttura
+## Structure
 
 ```text
-apps/cli                 core Rust e client CLI
-apps/desktop             GUI Svelte
-apps/desktop/src-tauri   backend desktop Tauri
-crates/protocol          eventi e formati condivisi
-prototypes/web           vecchio prototipo, non applicazione di produzione
+apps/cli                 Rust core and CLI client
+apps/desktop             Svelte GUI
+apps/desktop/src-tauri   Tauri desktop backend
+crates/protocol          shared events and formats
+prototypes/web           old prototype, not a production application
 ```
 
-## Avvio desktop
+## Starting the desktop app
 
-Prerequisiti: Rust, Node.js, npm e dipendenze di sistema richieste da Tauri 2.
+Prerequisites: Rust, Node.js, npm, and the system dependencies required by Tauri 2.
 
 ```powershell
 cd apps/desktop
@@ -150,7 +150,7 @@ npm install
 npm run desktop
 ```
 
-## Verifiche
+## Checks
 
 ```powershell
 cargo test --workspace
@@ -162,52 +162,60 @@ npm run build
 npx tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
 ```
 
-La suite standard corrente passa con 68 test; un test con due socket reali è escluso dalla suite automatica perché il teardown libp2p può bloccare l'harness su Windows. Il suo scenario deve essere sostituito da un collaudo end-to-end desktop deterministico.
+The current standard suite passes with 68 tests. A test using two real sockets is excluded from the automated suite because libp2p teardown can block the harness on Windows. Its scenario should be replaced with deterministic desktop end-to-end testing.
 
-Gli installer vengono generati in:
+Installers are generated in:
 
 ```text
 target/release/bundle/msi/msnnext_0.2.0_x64_en-US.msi
 target/release/bundle/nsis/msnnext_0.2.0_x64-setup.exe
 ```
 
-## Creazione release e installer
+## Creating releases and installers
 
-Su Windows, dalla cartella principale:
+On Windows, from the repository root:
 
 ```powershell
 .\scripts\release-windows.ps1
 ```
 
-Produce l'eseguibile release e il setup NSIS. Per riutilizzare le dipendenze già installate: `.\scripts\release-windows.ps1 -SkipInstall`.
+This produces the release executable and NSIS setup. To reuse installed dependencies: `.\scripts\release-windows.ps1 -SkipInstall`.
 
-Il formato MSI usa il vecchio toolset WiX e può essere richiesto con `.\scripts\release-windows.ps1 -Msi`; NSIS resta il setup Windows predefinito e più affidabile.
+The MSI format uses the old WiX toolset and can be requested with `.\scripts\release-windows.ps1 -Msi`; NSIS remains the default and more reliable Windows installer.
 
-Su Linux:
+On Linux:
 
 ```sh
 ./scripts/release-linux.sh
 ```
 
-Produce il binario release, un pacchetto DEB e un'AppImage. Va eseguito direttamente su Linux con le dipendenze di sistema richieste da Tauri; per riutilizzare `node_modules`, passare `--skip-install`.
+This produces the release binary, a DEB package, and an AppImage. Run it directly on Linux with the system dependencies required by Tauri; to reuse `node_modules`, pass `--skip-install`.
 
-Le release Windows e Linux vanno costruite sui rispettivi sistemi operativi. Android non è ancora incluso: richiede l'inizializzazione del progetto mobile Tauri e l'adattamento delle funzionalità desktop native.
+On macOS, from the repository root, double-click `BUILD.command` or run:
 
-### Build multipiattaforma su GitHub
+```sh
+./scripts/release-macos.sh
+```
 
-Il workflow `Build release bundles` compila NSIS su Windows, DEB/AppImage su Linux e un DMG universale Intel/Apple Silicon su macOS. Sulle pull request conserva i pacchetti come artifact senza usare chiavi di firma; avviato manualmente dalla scheda **Actions**, pubblica una release GitHub completa con installer, firme e `latest.json` per l'updater integrato.
+This produces a native DMG for the current Mac. To create the same universal Intel/Apple Silicon DMG as the GitHub workflow, pass `--universal`; to reuse `node_modules`, pass `--skip-install`. If it finds `~/.tauri/msnnext-updater.key`, the script asks for the password to sign the updater archive too; pressing Enter still creates the DMG without that archive. Local builds are ad-hoc signed but not notarized by Apple.
 
-Gli aggiornamenti sono verificati dal client con la chiave pubblica inclusa nell'app. La chiave privata non deve entrare nel repository: GitHub Actions la legge dal secret `TAURI_SIGNING_PRIVATE_KEY`. Una copia di recupero della chiave attuale è conservata localmente in `~/.tauri/msnnext-updater.key` con permessi solo-utente. Per una build locale firmata, impostare `TAURI_SIGNING_PRIVATE_KEY_PATH` su quel file; senza la chiave, usare l'override di sviluppo mostrato sopra.
+Windows, Linux, and macOS releases must be built on their respective operating systems. Android is not yet included: it requires initializing the Tauri mobile project and adapting native desktop functionality.
 
-La versione dell'app segue SemVer ed è definita una sola volta in `apps/desktop/package.json`; Tauri la legge da quel file. Finché il progetto è alpha: `0.x.0` per nuove funzionalità o cambi incompatibili e `0.x.y` per correzioni compatibili. Le release future useranno tag Git `v0.x.y`.
+### Cross-platform builds on GitHub
 
-## Definizione di “usabile”
+The `Build release bundles` workflow compiles NSIS on Windows, DEB/AppImage on Linux, and a universal Intel/Apple Silicon DMG on macOS. On pull requests it retains packages as artifacts without signing keys; when manually started from the **Actions** tab, it publishes a complete GitHub release with installers, signatures, and `latest.json` for the integrated updater.
 
-msnnext non sarà considerato usabile finché due persone non potranno, senza riavvii manuali:
+Updates are verified by the client with the public key included in the app. The private key must not enter the repository: GitHub Actions reads it from the `TAURI_SIGNING_PRIVATE_KEY` secret. A recovery copy of the current key is stored locally in `~/.tauri/msnnext-updater.key` with user-only permissions. For a signed local build, set `TAURI_SIGNING_PRIVATE_KEY` to that file’s path; without the key, use the development override shown above.
 
-1. aggiungersi tramite QR o link;
-2. collegarsi e restare collegate;
-3. scambiare testo e trilli;
-4. creare, inviare e salvare emoticon statiche o animate;
-5. inviare e ricevere immagini, video e file con feedback chiaro;
-6. chiudere e riaprire l'app ritrovando contatti e conversazioni.
+The app version follows SemVer and is defined only once in `apps/desktop/package.json`; Tauri reads it from that file. While the project is alpha, use `0.x.0` for new features or incompatible changes and `0.x.y` for compatible fixes. Future releases will use `v0.x.y` Git tags.
+
+## Definition of “usable”
+
+msnnext will not be considered usable until two people can, without manual restarts:
+
+1. add each other through QR or a link;
+2. connect and remain connected;
+3. exchange text and nudges;
+4. create, send, and save static or animated emoticons;
+5. send and receive images, videos, and files with clear feedback;
+6. close and reopen the app while retaining contacts and conversations.
