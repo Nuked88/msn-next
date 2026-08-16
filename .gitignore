@@ -2,3 +2,6 @@
 /target-smoke/
 /output/
 /.msnnext/
+.DS_Store
+.superpowers/
+apps/desktop/.playwright-cli/
