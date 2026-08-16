@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, State, WindowEvent,
+    AppHandle, Emitter, Manager, RunEvent, State, WindowEvent,
 };
 use tokio::sync::mpsc;
 
@@ -505,7 +505,7 @@ fn send_command(state: &NodeState, command: ClientCommand) -> Result<(), String>
 }
 
 #[tauri::command]
-fn node_start(
+async fn node_start(
     app: AppHandle,
     state: State<'_, NodeState>,
     config: NodeConfig,
@@ -1238,6 +1238,8 @@ pub fn run() {
     tauri::Builder::default()
         .manage(NodeState::default())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -1322,8 +1324,13 @@ pub fn run() {
             node_status,
             node_stop
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if matches!(event, RunEvent::Ready) {
+                show_main_window(app);
+            }
+        });
 }
 
 #[cfg(test)]
