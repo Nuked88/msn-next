@@ -12,6 +12,11 @@ jobs:
     name: ${{ matrix.name }}
     strategy:
       fail-fast: false
+      # Serializza i job: i 3 OS scrivono sulla stessa release draft; in
+      # parallelo va in race sull'upload ("Not Found - releases/assets").
+      # ponytail: max-parallel 1 = release affidabile ma ~3x più lenta;
+      # se serve velocità, passare a un job unico di publish che assembla.
+      max-parallel: 1
       matrix:
         include:
           - name: Windows x64
