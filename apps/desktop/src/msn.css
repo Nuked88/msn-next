@@ -3187,13 +3187,24 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
 
 .contact-requests {
   position: fixed;
-  z-index: 85;
+  z-index: 95;
   right: 17px;
-  top: 54px;
+  top: calc(54px + env(safe-area-inset-top, 0px));
   display: flex;
   flex-direction: column;
   gap: 8px;
   max-width: min(360px, calc(100vw - 34px));
+}
+
+/* Su schermi stretti (mobile) la richiesta diventa un banner in alto a tutta
+   larghezza, sotto la safe-area, così è impossibile non vederla. */
+@media (max-width: 720px) {
+  .contact-requests {
+    left: 12px;
+    right: 12px;
+    top: calc(10px + env(safe-area-inset-top, 0px));
+    max-width: none;
+  }
 }
 
 .contact-request-card {
