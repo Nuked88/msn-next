@@ -141,6 +141,7 @@
   type ClientEvent =
     | { type: 'started'; peerId: string; displayName: string; fingerprint: string }
     | { type: 'contactUpdated'; contact: Omit<Contact, 'unread'> }
+    | { type: 'contactRequest'; peerId: string; name: string }
     | { type: 'conversationLoaded'; peerId: string; messages: ClientMessage[] }
     | { type: 'message'; message: ClientMessage }
     | { type: 'emoticonCatalog'; emoticons: ClientEmoticon[] }
@@ -316,6 +317,7 @@
   let rosterOpen = false
   let linkRequested = false
   let toastText = ''
+  let contactRequests: { peerId: string; name: string }[] = []
   let toastTimer: ReturnType<typeof setTimeout>
   let messageList: HTMLDivElement
   let messageEditor: HTMLDivElement
@@ -661,7 +663,14 @@
       return
     }
     if (event.type === 'contactUpdated') {
+      contactRequests = contactRequests.filter((request) => request.peerId !== event.contact.peerId)
       upsertContact(event.contact)
+      return
+    }
+    if (event.type === 'contactRequest') {
+      if (!contactRequests.some((request) => request.peerId === event.peerId)) {
+        contactRequests = [...contactRequests, { peerId: event.peerId, name: event.name }]
+      }
       return
     }
     if (event.type === 'conversationLoaded') {
@@ -786,6 +795,7 @@
       return
     }
     if (event.type === 'contactRemoved') {
+      contactRequests = contactRequests.filter((request) => request.peerId !== event.peerId)
       contacts = contacts.filter((contact) => contact.peerId !== event.peerId)
       const { [event.peerId]: _removed, ...remaining } = conversations
       conversations = remaining
@@ -1770,6 +1780,18 @@
     clearTimeout(toastTimer)
     toastTimer = setTimeout(() => toastText = '', 3200)
   }
+
+  async function acceptContactRequest(peerId: string) {
+    contactRequests = contactRequests.filter((request) => request.peerId !== peerId)
+    try { await invoke('node_accept_contact_request', { peerId }) }
+    catch (error) { showToast(String(error)) }
+  }
+
+  async function rejectContactRequest(peerId: string) {
+    contactRequests = contactRequests.filter((request) => request.peerId !== peerId)
+    try { await invoke('node_reject_contact_request', { peerId }) }
+    catch (error) { showToast(String(error)) }
+  }
 </script>
 
 <main class:details-open={detailsOpen} class:roster-open={rosterOpen} class="app-frame">
@@ -2583,6 +2605,24 @@
       <div class="security-caveat"><Info size={16} /><p><strong>{$t('security.caveatTitle')}</strong> {$t('security.caveatBody')}</p></div>
       <button class="primary-button wide" onclick={closeSecurityIntro}>{$t('security.gotIt')}</button>
     </div>
+  </div>
+{/if}
+
+{#if contactRequests.length}
+  <div class="contact-requests" role="region" aria-label={$t('contactRequest.title')}>
+    {#each contactRequests as request (request.peerId)}
+      <div class="contact-request-card">
+        <span class="avatar-shell contact-avatar"><span>{request.name.slice(0, 1).toUpperCase()}</span></span>
+        <div class="contact-request-copy">
+          <strong>{$t('contactRequest.title')}</strong>
+          <small>{$t('contactRequest.wants', { name: request.name })}</small>
+        </div>
+        <div class="contact-request-actions">
+          <button class="secondary-button" onclick={() => rejectContactRequest(request.peerId)}>{$t('offer.decline')}</button>
+          <button class="primary-button" onclick={() => acceptContactRequest(request.peerId)}>{$t('offer.accept')}</button>
+        </div>
+      </div>
+    {/each}
   </div>
 {/if}
 

@@ -776,6 +776,26 @@ fn node_delete_contact(state: State<'_, NodeState>, peer_id: String) -> Result<(
 }
 
 #[tauri::command]
+fn node_accept_contact_request(state: State<'_, NodeState>, peer_id: String) -> Result<(), String> {
+    send_command(
+        &state,
+        ClientCommand::AcceptContactRequest {
+            peer: parse_peer(&peer_id)?,
+        },
+    )
+}
+
+#[tauri::command]
+fn node_reject_contact_request(state: State<'_, NodeState>, peer_id: String) -> Result<(), String> {
+    send_command(
+        &state,
+        ClientCommand::RejectContactRequest {
+            peer: parse_peer(&peer_id)?,
+        },
+    )
+}
+
+#[tauri::command]
 fn node_clear_conversation(state: State<'_, NodeState>, peer_id: String) -> Result<(), String> {
     send_command(
         &state,
@@ -1301,6 +1321,8 @@ pub fn run() {
             node_delete_emoticon,
             node_rename_contact,
             node_delete_contact,
+            node_accept_contact_request,
+            node_reject_contact_request,
             node_clear_conversation,
             node_create_chat_group,
             node_moderate_group,

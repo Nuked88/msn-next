@@ -146,6 +146,12 @@ pub enum ClientCommand {
     RejectAttachment {
         offer_id: u64,
     },
+    AcceptContactRequest {
+        peer: PeerId,
+    },
+    RejectContactRequest {
+        peer: PeerId,
+    },
     SetNotificationMute {
         conversation: String,
         muted: bool,
@@ -170,6 +176,8 @@ impl ClientCommand {
             | Self::SendFile { peer, .. }
             | Self::RenameContact { peer, .. }
             | Self::DeleteContact { peer }
+            | Self::AcceptContactRequest { peer }
+            | Self::RejectContactRequest { peer }
             | Self::ClearConversation { peer } => Some(*peer),
             Self::CreateEmoticon { .. }
             | Self::SaveEmoticon { .. }
@@ -326,6 +334,10 @@ pub enum ClientEvent {
     },
     ContactUpdated {
         contact: ClientContact,
+    },
+    ContactRequest {
+        peer_id: String,
+        name: String,
     },
     ConversationLoaded {
         peer_id: String,
@@ -666,6 +678,9 @@ pub async fn run(
     let mut peers = HashSet::new();
     let mut dialing = HashSet::new();
     let mut mdns_dialing = HashSet::new();
+    // Peer che ci hanno contattato ma non sono ancora contatti: in attesa che
+    // l'utente accetti/rifiuti (niente auto-aggiunta senza consenso).
+    let mut pending_contact_requests = HashMap::<PeerId, String>::new();
     let mut reconnect_at = HashMap::<PeerId, Instant>::new();
     let mut reconnect_attempts = HashMap::<PeerId, u8>::new();
     let mut bootstrap_fallbacks = HashMap::<PeerId, VecDeque<Multiaddr>>::new();
@@ -1516,6 +1531,36 @@ pub async fn run(
                         Err(error) => { let _ = events.send(ClientEvent::Error { message: error.to_string() }); }
                     }
                 }
+                Some(ClientCommand::AcceptContactRequest { peer }) => {
+                    if let Some(name) = pending_contact_requests.remove(&peer) {
+                        ignored_contacts.remove(&peer);
+                        history.allow_contact(&peer.to_string())?;
+                        history.ensure_contact(&peer.to_string(), &name, now_ms())?;
+                        known_contacts.insert(peer);
+                        peer_names.entry(peer).or_insert_with(|| name.clone());
+                        peers.insert(peer);
+                        let _ = events.send(ClientEvent::ContactUpdated { contact: ClientContact {
+                            peer_id: peer.to_string(),
+                            name: peer_names.get(&peer).cloned().unwrap_or(name),
+                            online: true,
+                            secure: sessions.contains_key(&peer),
+                            fingerprint: peer_fingerprint(peer),
+                        }});
+                        // Ricambia la presence e avvia il canale cifrato.
+                        send_event(&mut swarm, &mut sessions, peer, local_peer_id, &mut sent_numbers,
+                            ChatEvent::Presence(PresenceUpdate { display_name: display_name.clone(), online: true }));
+                        maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
+                    }
+                }
+                Some(ClientCommand::RejectContactRequest { peer }) => {
+                    pending_contact_requests.remove(&peer);
+                    ignored_contacts.insert(peer);
+                    known_contacts.remove(&peer);
+                    peers.remove(&peer);
+                    sessions.remove(&peer);
+                    let _ = swarm.disconnect_peer_id(peer);
+                    let _ = events.send(ClientEvent::ContactRemoved { peer_id: peer.to_string() });
+                }
                 Some(ClientCommand::CreateChatGroup { name, members }) => {
                     let name = name.trim();
                     let mut members = members.into_iter().filter(|peer| *peer != local_peer_id).collect::<HashSet<_>>();
@@ -2015,46 +2060,67 @@ pub async fn run(
                         };
                         swarm.behaviour_mut().chat.send_response(channel, response).ok();
                         if valid {
-                            if let ChatEvent::Presence(presence) = &request.event {
-                                history.ensure_contact(
-                                    &peer.to_string(),
-                                    &presence.display_name,
-                                    now_ms(),
-                                )?;
-                            }
-                            if let Some(event) =
-                                client_event_from_chat(peer, &request.event, "in", false, peer_names.get(&peer).map(String::as_str))
-                            {
-                                let _ = events.send(event);
-                            }
-                            if should_classify_application_peer(
-                                true,
-                                infrastructure_peers.contains(&peer),
-                                peers.contains(&peer),
-                            ) {
-                                known_contacts.insert(peer);
-                                peers.insert(peer);
-                                println!("connesso: {peer}");
-                                send_event(
-                                    &mut swarm,
-                                    &mut sessions,
-                                    peer,
-                                    local_peer_id,
-                                    &mut sent_numbers,
-                                    ChatEvent::Presence(PresenceUpdate {
-                                        display_name: display_name.clone(),
-                                        online: true,
-                                    }),
-                                );
-                            }
-                            if event_authorizes_handshake(&request.event) {
-                                maybe_start_hybrid_handshake(
-                                    &mut swarm,
-                                    &mut pending_handshakes,
-                                    &sessions,
-                                    local_peer_id,
-                                    peer,
-                                );
+                            let is_known_peer = known_contacts.contains(&peer)
+                                || known_devices.contains_key(&peer)
+                                || infrastructure_peers.contains(&peer);
+                            if !is_known_peer {
+                                // Presence non sollecitata da uno sconosciuto: niente
+                                // auto-aggiunta. Chiedi conferma all'utente una volta.
+                                if let ChatEvent::Presence(presence) = &request.event {
+                                    if !ignored_contacts.contains(&peer)
+                                        && pending_contact_requests
+                                            .insert(peer, presence.display_name.clone())
+                                            .is_none()
+                                    {
+                                        peer_names.insert(peer, presence.display_name.clone());
+                                        let _ = events.send(ClientEvent::ContactRequest {
+                                            peer_id: peer.to_string(),
+                                            name: presence.display_name.clone(),
+                                        });
+                                    }
+                                }
+                            } else {
+                                if let ChatEvent::Presence(presence) = &request.event {
+                                    history.ensure_contact(
+                                        &peer.to_string(),
+                                        &presence.display_name,
+                                        now_ms(),
+                                    )?;
+                                }
+                                if let Some(event) =
+                                    client_event_from_chat(peer, &request.event, "in", false, peer_names.get(&peer).map(String::as_str))
+                                {
+                                    let _ = events.send(event);
+                                }
+                                if should_classify_application_peer(
+                                    true,
+                                    infrastructure_peers.contains(&peer),
+                                    peers.contains(&peer),
+                                ) {
+                                    known_contacts.insert(peer);
+                                    peers.insert(peer);
+                                    println!("connesso: {peer}");
+                                    send_event(
+                                        &mut swarm,
+                                        &mut sessions,
+                                        peer,
+                                        local_peer_id,
+                                        &mut sent_numbers,
+                                        ChatEvent::Presence(PresenceUpdate {
+                                            display_name: display_name.clone(),
+                                            online: true,
+                                        }),
+                                    );
+                                }
+                                if event_authorizes_handshake(&request.event) {
+                                    maybe_start_hybrid_handshake(
+                                        &mut swarm,
+                                        &mut pending_handshakes,
+                                        &sessions,
+                                        local_peer_id,
+                                        peer,
+                                    );
+                                }
                             }
                         }
                     }
@@ -2124,11 +2190,17 @@ pub async fn run(
                                         peer_names.get(&peer).map(String::as_str),
                                     );
                                     if let ChatEvent::Presence(presence) = &envelope.event {
-                                        history.ensure_contact(
-                                            &peer.to_string(),
-                                            &presence.display_name,
-                                            now_ms(),
-                                        )?;
+                                        // Difesa: aggiorna il contatto solo se già
+                                        // noto; mai auto-aggiungere via canale cifrato.
+                                        if known_contacts.contains(&peer)
+                                            || known_devices.contains_key(&peer)
+                                        {
+                                            history.ensure_contact(
+                                                &peer.to_string(),
+                                                &presence.display_name,
+                                                now_ms(),
+                                            )?;
+                                        }
                                     }
                                     let response = receive_event(peer, &envelope.event, &mut Incoming {
                                         pending_emoticons: &mut pending_emoticons,
@@ -2808,9 +2880,12 @@ fn event_authorizes_handshake(event: &ChatEvent) -> bool {
 fn handshake_peer_authorized(
     known_contact: bool,
     active_peer: bool,
-    trusted_connection: bool,
+    _trusted_connection: bool,
 ) -> bool {
-    known_contact || active_peer || trusted_connection
+    // La sola connessione non basta: uno sconosciuto in attesa di approvazione
+    // non deve poter stabilire un canale cifrato (che lo aggiungerebbe come
+    // contatto). Solo contatti già noti o peer applicativi attivi.
+    known_contact || active_peer
 }
 
 fn next_request_retry(attempts: u8) -> Option<u8> {
@@ -4897,7 +4972,8 @@ mod tests {
         assert!(!handshake_peer_authorized(false, false, false));
         assert!(handshake_peer_authorized(true, false, false));
         assert!(handshake_peer_authorized(false, true, false));
-        assert!(handshake_peer_authorized(false, false, true));
+        // Sola connessione non autorizza più: serve consenso (contatto noto).
+        assert!(!handshake_peer_authorized(false, false, true));
     }
 
     #[test]

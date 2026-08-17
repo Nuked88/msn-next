@@ -151,6 +151,8 @@
   "offer.aContact": "Un contatto",
   "offer.decline": "Rifiuta",
   "offer.accept": "Accetta",
+  "contactRequest.title": "Richiesta di contatto",
+  "contactRequest.wants": "{name} vuole aggiungerti",
   "modal.windowTheme": "Tema della finestra",
   "setup.step": "Prima di andare online",
   "setup.title": "Come vuoi apparire?",
