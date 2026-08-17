@@ -5,10 +5,16 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 DESKTOP="$ROOT/apps/desktop"
 SKIP_INSTALL=0
 UNIVERSAL=0
+BUMP=""
 
 usage() {
   cat <<'EOF'
-Uso: ./scripts/release-macos.sh [opzioni]
+Uso: ./scripts/release-macos.sh [major|minor|patch|keep] [opzioni]
+
+Segmento versione (opzionale, incrementa apps/desktop/package.json):
+  major | minor | patch   incrementa il segmento indicato
+  keep                    lascia la versione invariata
+  (nessuno)               chiede interattivamente; in non-interattivo = keep
 
 Opzioni:
   --skip-install  riutilizza node_modules senza eseguire npm ci
@@ -21,6 +27,9 @@ EOF
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    major|minor|patch|keep)
+      BUMP="$1"
+      ;;
     --skip-install)
       SKIP_INSTALL=1
       ;;
@@ -143,6 +152,8 @@ cd "$DESKTOP"
 if [ "$SKIP_INSTALL" -eq 0 ]; then
   npm ci
 fi
+
+node "$ROOT/scripts/bump-version.mjs" $BUMP
 
 npm run check
 

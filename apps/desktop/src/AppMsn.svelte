@@ -10,6 +10,8 @@
   import { relaunch } from '@tauri-apps/plugin-process'
   import { check, type Update } from '@tauri-apps/plugin-updater'
   import QRCode from 'qrcode'
+  import { sounds } from './lib/sounds'
+  import { t, locale, available as availableLocales } from './lib/i18n'
   import { onMount, tick } from 'svelte'
   import {
     Activity,
@@ -190,13 +192,31 @@
     { glyph: '😮', shortcut: ':o', label: 'Sorpresa' },
     { glyph: '❤️', shortcut: '<3', label: 'Cuore' },
     { glyph: '😎', shortcut: '8)', label: 'Forte' },
+    { glyph: '😐', shortcut: ':|', label: 'Neutro' },
+    { glyph: '😳', shortcut: ':$', label: 'Imbarazzato' },
+    { glyph: '😘', shortcut: ':*', label: 'Bacio' },
+    { glyph: '😠', shortcut: ':@', label: 'Arrabbiato' },
+    { glyph: '😇', shortcut: 'O:)', label: 'Angelo' },
+    { glyph: '😈', shortcut: '}:)', label: 'Diavoletto' },
+    { glyph: '😴', shortcut: '|-)', label: 'Assonnato' },
+    { glyph: '👍', shortcut: '(y)', label: 'Pollice su' },
+    { glyph: '👎', shortcut: '(n)', label: 'Pollice giù' },
+    { glyph: '🌹', shortcut: '@}-', label: 'Rosa' },
+    { glyph: '🎉', shortcut: '\\o/', label: 'Festa' },
   ]
 
   const appWindow = isTauri() ? getCurrentWindow() : null
   const securityIntroKey = 'msnnext-security-intro-v1'
   const notificationMutesKey = 'msnnext-notification-mutes-v1'
   const lastUpdateCheckKey = 'msnnext-update-last-check-v1'
+  const effectsSoundsKey = 'msnnext-effects-sounds-v1'
   const updateCheckIntervalMs = 5 * 60 * 60 * 1000
+
+  // Master toggle for message/sign-in effect sounds (nudge keeps its own setting).
+  let effectsSounds = typeof localStorage === 'undefined'
+    ? true
+    : localStorage.getItem(effectsSoundsKey) !== '0'
+  $: if (typeof localStorage !== 'undefined') localStorage.setItem(effectsSoundsKey, effectsSounds ? '1' : '0')
 
   function loadNotificationMutes() {
     if (typeof localStorage === 'undefined') return {} as Record<string, number>
@@ -459,27 +479,27 @@
     lastUpdateCheck = Date.now()
     localStorage.setItem(lastUpdateCheckKey, String(lastUpdateCheck))
     updateStatus = 'checking'
-    updateMessage = 'Checking for an available version…'
+    updateMessage = $t('update.checking')
     try {
       const update = await check({ timeout: 30_000 })
       if (!update) {
         await updateCandidate?.close()
         updateCandidate = null
         updateStatus = 'current'
-        updateMessage = 'You are using the latest version.'
-        if (force) showToast('msnnext is up to date')
+        updateMessage = $t('update.upToDate')
+        if (force) showToast($t('update.upToDateToast'))
         return
       }
 
       await updateCandidate?.close()
       updateCandidate = update
       updateStatus = 'available'
-      updateMessage = `Version ${update.version} is ready to install.`
-      if (force) showToast(`Update ${update.version} is available`)
+      updateMessage = $t('update.ready', { version: update.version })
+      if (force) showToast($t('update.availableToast', { version: update.version }))
     } catch (error) {
       updateStatus = 'error'
-      updateMessage = `Check failed: ${String(error)}`
-      if (force) showToast('Could not check for updates')
+      updateMessage = $t('update.checkFailed', { error: String(error) })
+      if (force) showToast($t('update.checkFailedToast'))
       else console.warn('Update check failed', error)
     }
   }
@@ -490,7 +510,7 @@
     updateProgress = 0
     updateDownloaded = 0
     updateDownloadTotal = 0
-    updateMessage = `Downloading msnnext ${updateCandidate.version}…`
+    updateMessage = $t('update.downloading', { version: updateCandidate.version })
     try {
       await updateCandidate.downloadAndInstall((event) => {
         if (event.event === 'Started') {
@@ -506,18 +526,18 @@
         }
         updateProgress = 100
         updateStatus = 'installing'
-        updateMessage = 'Installation complete. Restarting msnnext…'
+        updateMessage = $t('update.installComplete')
       })
       await relaunch()
     } catch (error) {
       updateStatus = 'error'
-      updateMessage = `Update failed: ${String(error)}`
-      showToast('Update failed')
+      updateMessage = $t('update.failed', { error: String(error) })
+      showToast($t('update.failedToast'))
     }
   }
 
   function lastUpdateCheckLabel() {
-    if (!lastUpdateCheck) return 'Not checked yet'
+    if (!lastUpdateCheck) return $t('update.notChecked')
     return new Date(lastUpdateCheck).toLocaleString([], {
       day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit',
     })
@@ -558,7 +578,7 @@
       muted: true,
       untilMs: until === -1 ? null : until,
     }).catch((error) => showToast(String(error)))
-    showToast(durationMs === null ? 'Chat silenziata' : 'Chat silenziata temporaneamente')
+    showToast(durationMs === null ? $t('toast.chatMuted') : $t('toast.chatMutedTemp'))
   }
 
   async function unmuteConversation(conversation: string) {
@@ -569,7 +589,7 @@
     if (running) await invoke('node_set_notification_mute', {
       conversation, muted: false, untilMs: null,
     }).catch((error) => showToast(String(error)))
-    showToast('Notifiche riattivate')
+    showToast($t('toast.notificationsOn'))
   }
 
   async function syncNotificationMutes() {
@@ -637,6 +657,7 @@
       displayName = event.displayName
       running = true
       setupOpen = false
+      if (effectsSounds) sounds.signIn()
       return
     }
     if (event.type === 'contactUpdated') {
@@ -671,7 +692,7 @@
         ...offeredEmoticons.filter((item) => item.assetId !== event.emoticon.assetId),
         event.emoticon,
       ]
-      showToast(`New emoticon from ${contacts.find((item) => item.peerId === event.peerId)?.name || 'a contact'}`)
+      showToast($t('toast.newEmoticonFrom', { name: contacts.find((item) => item.peerId === event.peerId)?.name || $t('toast.aContact') }))
       return
     }
     if (event.type === 'contactLink') {
@@ -681,7 +702,7 @@
         width: 1024,
         margin: 4,
         color: { dark: '#10284a', light: '#ffffff' },
-      }).then((qr) => ownContactQr = qr).catch((error) => showToast(`QR non generabile: ${error}`))
+      }).then((qr) => ownContactQr = qr).catch((error) => showToast($t('toast.qrFailed', { error: String(error) })))
       return
     }
     if (event.type === 'deviceLink') {
@@ -692,7 +713,7 @@
         width: 1024,
         margin: 4,
         color: { dark: '#10284a', light: '#ffffff' },
-      }).then((qr) => devicePairingQr = qr).catch((error) => showToast(`QR non generabile: ${error}`))
+      }).then((qr) => devicePairingQr = qr).catch((error) => showToast($t('toast.qrFailed', { error: String(error) })))
       return
     }
     if (event.type === 'devicesUpdated') {
@@ -703,9 +724,9 @@
       devicePairingBusy = false
       if (event.paired) {
         devicePairingOpen = false
-        showToast('Dispositivo collegato')
+        showToast($t('toast.deviceLinked'))
       } else if (event.applied) {
-        showToast(`${event.applied} modifiche sincronizzate`)
+        showToast($t('toast.changesSynced', { count: event.applied }))
       }
       return
     }
@@ -716,7 +737,7 @@
         ...conversation[index], attachmentId: event.id, attachmentMime: event.mime,
       }
       conversations = { ...conversations, [event.peerId]: conversation }
-      showToast(`File received: ${event.filename}`)
+      showToast($t('toast.fileReceived', { filename: event.filename }))
       if (previewReceivedImages && event.mime.startsWith('image/')) {
         automaticPreviewIds.add(event.id)
         void invoke('node_read_attachment', { id: event.id, mime: event.mime }).catch((error) => {
@@ -729,7 +750,7 @@
     if (event.type === 'attachmentSent') {
       pendingFileCount = Math.max(0, pendingFileCount - 1)
       fileSending = pendingFileCount > 0
-      showToast(`File sent: ${event.filename}`)
+      showToast($t('toast.fileSent', { filename: event.filename }))
       return
     }
     if (event.type === 'attachmentProgress') {
@@ -744,7 +765,7 @@
       fileSending = false
       transferFilename = ''
       transferProgress = 0
-      showToast('Invio annullato')
+      showToast($t('toast.sendCancelled'))
       return
     }
     if (event.type === 'incomingAttachmentOffered') {
@@ -756,12 +777,12 @@
       pendingEmoticonAction = ''
       emoticonSaveOpen = false
       emoticonToSave = undefined
-      showToast('Emoticon eliminata')
+      showToast($t('toast.emoticonDeleted'))
       return
     }
     if (event.type === 'conversationCleared') {
       conversations = { ...conversations, [event.peerId]: [] }
-      showToast('History deleted')
+      showToast($t('toast.historyDeleted'))
       return
     }
     if (event.type === 'contactRemoved') {
@@ -770,7 +791,7 @@
       conversations = remaining
       if (selectedPeerId === event.peerId) selectedPeerId = contacts[0]?.peerId || ''
       detailsOpen = false
-      showToast('Contact deleted')
+      showToast($t('toast.contactDeleted'))
       return
     }
     if (event.type === 'groupChatsUpdated') {
@@ -792,7 +813,7 @@
         pendingGroupCreation = false
         groupCreateOpen = false
         selectGroup(event.groupId)
-        showToast('Chat di gruppo creata')
+        showToast($t('toast.groupCreated'))
       }
       scrollMessages()
       return
@@ -824,7 +845,7 @@
         ...conversation[index], attachmentId: event.id, attachmentMime: event.mime,
       }
       conversations = { ...conversations, [key]: conversation }
-      showToast(`File received in group: ${event.filename}`)
+      showToast($t('toast.fileReceivedGroup', { filename: event.filename }))
       if (previewReceivedImages && event.mime.startsWith('image/')) {
         automaticPreviewIds.add(event.id)
         void invoke('node_read_attachment', { id: event.id, mime: event.mime }).catch((error) => {
@@ -836,7 +857,7 @@
     }
     if (event.type === 'groupConversationCleared') {
       conversations = { ...conversations, [`group:${event.groupId}`]: [] }
-      showToast('Group history deleted')
+      showToast($t('toast.groupHistoryDeleted'))
       return
     }
     if (event.type === 'attachmentOpened') {
@@ -853,7 +874,7 @@
       return
     }
     if (event.type === 'attachmentExported') {
-      showToast(`File exported: ${event.path}`)
+      showToast($t('toast.fileExported', { path: event.path }))
       return
     }
     if (event.type === 'error') {
@@ -957,6 +978,8 @@
     if (message.kind === 'nudge' && !next.mine && !isConversationMuted(conversationKey)) {
       void shakeWindow()
       playNudgeSound()
+    } else if (message.direction === 'in' && message.kind !== 'nudge' && effectsSounds && !isConversationMuted(conversationKey)) {
+      sounds.messageIn()
     }
     scrollMessages()
   }
@@ -992,13 +1015,13 @@
 
   function senderName(message: ChatMessage) {
     if (message.mine) return displayName
-    if (!activeGroup) return activeContact?.name || 'Contact'
+    if (!activeGroup) return activeContact?.name || $t('helper.contact')
     return contacts.find((contact) => contact.peerId === message.senderPeerId)?.name
-      || `${message.senderPeerId?.slice(0, 8) || 'Partecipante'}…`
+      || `${message.senderPeerId?.slice(0, 8) || $t('helper.participant')}…`
   }
 
   function memberName(memberId: string) {
-    if (memberId === peerId) return `${displayName} (tu)`
+    if (memberId === peerId) return $t('helper.you', { name: displayName })
     return contacts.find((contact) => contact.peerId === memberId)?.name || `${memberId.slice(0, 8)}…`
   }
 
@@ -1008,9 +1031,9 @@
   }
 
   function memberRole(group: GroupChat, memberId: string) {
-    if (memberId === group.ownerPeerId) return 'Proprietario'
-    if (group.admins.includes(memberId)) return 'Amministratore'
-    return 'Membro'
+    if (memberId === group.ownerPeerId) return $t('role.owner')
+    if (group.admins.includes(memberId)) return $t('role.admin')
+    return $t('role.member')
   }
 
   function canModerateMember(group: GroupChat, memberId: string) {
@@ -1020,20 +1043,20 @@
   }
 
   function banLabel(ban: GroupBan) {
-    if (ban.expiresAtMs === null) return 'Ban permanente'
-    return `Ban fino al ${new Date(ban.expiresAtMs).toLocaleString()}`
+    if (ban.expiresAtMs === null) return $t('ban.permanent')
+    return $t('ban.until', { date: new Date(ban.expiresAtMs).toLocaleString() })
   }
 
   function deviceStatus(device: LinkedDevice) {
-    if (device.online) return 'Online, syncing'
-    if (!device.lastSeenMs) return 'Mai collegato'
-    return `Ultimo collegamento ${new Date(device.lastSeenMs).toLocaleString()}`
+    if (device.online) return $t('device.syncing')
+    if (!device.lastSeenMs) return $t('device.neverLinked')
+    return $t('device.lastSeen', { date: new Date(device.lastSeenMs).toLocaleString() })
   }
 
   async function moderateGroup(memberId: string, value: string) {
     if (!selectedGroupId || !value) return
     const [action, duration] = value.split(':')
-    if (action === 'permaBan' && !confirm(`Bannare definitivamente ${memberName(memberId)}?`)) return
+    if (action === 'permaBan' && !confirm($t('confirm.permaBan', { name: memberName(memberId) }))) return
     await invoke('node_moderate_group', {
       groupId: selectedGroupId,
       peerId: memberId,
@@ -1053,11 +1076,11 @@
   function contactSubtitle(contact: Contact) {
     const last = conversations[contact.peerId]?.at(-1)
     if (last) {
-    if (last.kind === 'nudge') return '⚡ Nudge'
+    if (last.kind === 'nudge') return $t('subtitle.nudge')
       if (last.kind === 'file') return `📎 ${last.body}`
       return last.body
     }
-    return contact.secure ? 'Protected conversation' : contact.online ? 'Connecting…' : 'Offline'
+    return contact.secure ? $t('subtitle.protected') : contact.online ? $t('subtitle.connecting') : $t('subtitle.offline')
   }
 
   function builtinMessageParts(text: string): MessagePart[] {
@@ -1233,6 +1256,7 @@
     try {
       await invoke('node_stop')
       running = false
+      if (effectsSounds) sounds.signOut()
       contacts = contacts.map((contact) => ({ ...contact, online: false, secure: false }))
     } catch (error) {
       showToast(String(error))
@@ -1245,6 +1269,7 @@
     try {
       if (selectedGroupId) await invoke('node_send_group_text', { groupId: selectedGroupId, text })
       else await invoke('node_send_text', { peerId: selectedPeerId, text })
+      if (effectsSounds) sounds.messageOut()
       messageText = ''
       messageEditor.replaceChildren()
       emojiOpen = false
@@ -1393,7 +1418,7 @@
 
   async function openAttachment(message: ChatMessage) {
     if (!message.attachmentId || !message.attachmentMime) {
-      showToast('This file belongs to an old history and has no archive reference')
+      showToast($t('toast.oldFileNoArchive'))
       return
     }
     if (message.attachmentMime.startsWith('image/') || message.attachmentMime.startsWith('video/')) {
@@ -1423,7 +1448,7 @@
   async function createCustomEmoticon() {
     if (!emoticonPath || !emoticonTrigger.trim()) return
     try {
-      pendingEmoticonAction = 'Emoticon created'
+      pendingEmoticonAction = $t('emo.created')
       await invoke('node_create_emoticon', {
         path: emoticonPath,
         trigger: emoticonTrigger.trim(),
@@ -1443,7 +1468,7 @@
   async function saveReceivedEmoticon() {
     if (!emoticonToSave || !emoticonTrigger.trim()) return
     try {
-      pendingEmoticonAction = emoticonToSave.saved ? 'Shortcut updated' : 'Emoticon saved'
+      pendingEmoticonAction = emoticonToSave.saved ? $t('emo.shortcutUpdated') : $t('emo.saved')
       await invoke(emoticonToSave.saved ? 'node_update_emoticon' : 'node_save_emoticon', {
         assetId: emoticonToSave.assetId,
         trigger: emoticonTrigger.trim(),
@@ -1456,7 +1481,7 @@
 
   async function deleteEmoticon() {
     if (!emoticonToSave?.saved || !confirm('Delete this emoticon?')) return
-    pendingEmoticonAction = 'Deleting emoticon…'
+    pendingEmoticonAction = $t('emo.deleting')
     try {
       await invoke('node_delete_emoticon', { assetId: emoticonToSave.assetId })
     } catch (error) {
@@ -1481,7 +1506,7 @@
       avatarDataUrl = profile.avatarDataUrl || ''
       localStorage.setItem('msnnext-name', profile.name)
       if (closeAfterSave) profileOpen = false
-      showToast(closeAfterSave ? 'Settings saved' : 'Avatar updated')
+      showToast(closeAfterSave ? $t('toast.settingsSaved') : $t('toast.avatarUpdated'))
     } catch (error) {
       showToast(String(error))
     }
@@ -1517,13 +1542,13 @@
 
   async function importContact() {
     if (!contactLink.trim().startsWith('msnnext://add/')) {
-      showToast('The contact link is invalid')
+      showToast($t('toast.contactLinkInvalid'))
       return
     }
     try {
       await invoke('node_import_contact', { link: contactLink.trim() })
       contactLink = ''
-      showToast('Contact added. Trying to connect…')
+      showToast($t('toast.contactAdded'))
     } catch (error) {
       showToast(String(error))
     }
@@ -1563,7 +1588,7 @@
   async function copyOwnLink() {
     if (!ownContactLink) return
     await navigator.clipboard.writeText(ownContactLink)
-    showToast('Contact link copied')
+    showToast($t('toast.contactLinkCopied'))
   }
 
   async function saveContactQr() {
@@ -1574,13 +1599,13 @@
     })
     if (!path) return
     await invoke('save_contact_qr', { path, dataUrl: ownContactQr })
-      .then(() => showToast('QR saved in high quality'))
+      .then(() => showToast($t('toast.qrSaved')))
       .catch((error) => showToast(String(error)))
   }
 
   async function shareDevicePairing() {
     if (!running) {
-      showToast('Go online to link a device')
+      showToast($t('toast.goOnlineLinkDevice'))
       return
     }
     devicePairingMode = 'share'
@@ -1598,7 +1623,7 @@
 
   function joinDevicePairing() {
     if (!running) {
-      showToast('Go online to link this device')
+      showToast($t('toast.goOnlineLinkThis'))
       return
     }
     devicePairingMode = 'join'
@@ -1637,7 +1662,7 @@
   async function copyDevicePairingLink() {
     if (!devicePairingLink) return
     await navigator.clipboard.writeText(devicePairingLink)
-    showToast('Device code copied')
+    showToast($t('toast.deviceCodeCopied'))
   }
 
   async function saveDevicePairingQr() {
@@ -1648,13 +1673,13 @@
     })
     if (!path) return
     await invoke('save_contact_qr', { path, dataUrl: devicePairingQr })
-      .then(() => showToast('Device QR saved'))
+      .then(() => showToast($t('toast.deviceQrSaved')))
       .catch((error) => showToast(String(error)))
   }
 
   async function prepareAccountBackupExport() {
     if (running) {
-      showToast('Go offline before creating an account backup')
+      showToast($t('toast.goOfflineBackup'))
       return
     }
     const path = await save({
@@ -1670,7 +1695,7 @@
 
   async function prepareAccountBackupImport() {
     if (running) {
-      showToast('Go offline before restoring an account')
+      showToast($t('toast.goOfflineRestore'))
       return
     }
     const path = await open({
@@ -1696,7 +1721,7 @@
       accountBackupOpen = false
       accountBackupPassword = ''
       if (accountBackupMode === 'export') {
-        showToast('Account, contacts, and history saved')
+        showToast($t('toast.accountSaved'))
         return
       }
       peerId = ''
@@ -1708,7 +1733,7 @@
       selectedPeerId = ''
       selectedGroupId = ''
       profileOpen = false
-      showToast('Account restored')
+      showToast($t('toast.accountRestored'))
       await startNode()
     } catch (error) {
       showToast(String(error))
@@ -1737,22 +1762,7 @@
 
   function playNudgeSound() {
     if (!nudgeSound) return
-    try {
-      const context = new AudioContext()
-      const oscillator = context.createOscillator()
-      const gain = context.createGain()
-      oscillator.type = 'square'
-      oscillator.frequency.setValueAtTime(880, context.currentTime)
-      oscillator.frequency.setValueAtTime(660, context.currentTime + 0.09)
-      gain.gain.setValueAtTime(0.05, context.currentTime)
-      gain.gain.exponentialRampToValueAtTime(0.001, context.currentTime + 0.18)
-      oscillator.connect(gain).connect(context.destination)
-      oscillator.start()
-      oscillator.stop(context.currentTime + 0.18)
-      oscillator.onended = () => void context.close()
-    } catch {
-      // Il trillo visivo resta disponibile se l'audio non può partire.
-    }
+    sounds.nudge()
   }
 
   function showToast(text: string) {
@@ -1771,36 +1781,36 @@
       <small>messenger</small>
     </div>
     <div class="titlebar-tools">
-      <div class="theme-switcher" role="group" aria-label="Theme">
-        <button class:active={theme === 'light'} aria-label="Light theme" title="Light theme" onclick={() => setTheme('light')}>
-          <Sun size={14} /><span>Light</span>
+      <div class="theme-switcher" role="group" aria-label={$t('theme.group')}>
+        <button class:active={theme === 'light'} aria-label={$t('theme.lightTitle')} title={$t('theme.lightTitle')} onclick={() => setTheme('light')}>
+          <Sun size={14} /><span>{$t('theme.light')}</span>
         </button>
-        <button class:active={theme === 'dark'} aria-label="Dark theme" title="Dark theme" onclick={() => setTheme('dark')}>
-          <Moon size={14} /><span>Dark</span>
+        <button class:active={theme === 'dark'} aria-label={$t('theme.darkTitle')} title={$t('theme.darkTitle')} onclick={() => setTheme('dark')}>
+          <Moon size={14} /><span>{$t('theme.dark')}</span>
         </button>
-        <button class:active={theme === 'system'} aria-label="System theme" title="Use system theme" onclick={() => setTheme('system')}>
-          <Monitor size={14} /><span>System</span>
+        <button class:active={theme === 'system'} aria-label={$t('theme.systemTitle')} title={$t('theme.systemTitle')} onclick={() => setTheme('system')}>
+          <Monitor size={14} /><span>{$t('theme.system')}</span>
         </button>
       </div>
       {#if updateCandidate}
         <button
           class="titlebar-update"
           disabled={updateStatus === 'downloading' || updateStatus === 'installing'}
-          title={`Install msnnext ${updateCandidate.version}`}
+          title={$t('update.install', { version: updateCandidate.version })}
           onclick={installUpdate}
         >
           <Download size={14} />
-          <span>{updateStatus === 'downloading' ? `${updateProgress || '…'}%` : updateStatus === 'installing' ? 'Restarting…' : `Update to ${updateCandidate.version}`}</span>
+          <span>{updateStatus === 'downloading' ? `${updateProgress || '…'}%` : updateStatus === 'installing' ? $t('update.restarting') : $t('update.updateTo', { version: updateCandidate.version })}</span>
         </button>
       {/if}
-      <span class:online={running} class="node-state"><i></i>{running ? 'Connected' : 'Disconnected'}</span>
-      <button class:online={running} class="power-button" aria-label={running ? 'Disconnect' : 'Connect'} title={running ? 'Disconnect' : 'Connect'} onclick={running ? stopNode : () => startNode(false)}>
+      <span class:online={running} class="node-state"><i></i>{running ? $t('state.connected') : $t('state.disconnected')}</span>
+      <button class:online={running} class="power-button" aria-label={running ? $t('action.disconnect') : $t('action.connect')} title={running ? $t('action.disconnect') : $t('action.connect')} onclick={running ? stopNode : () => startNode(false)}>
         <Power size={16} />
       </button>
       <div class="window-controls">
-        <button aria-label="Minimize" title="Minimize" onclick={() => void appWindow?.minimize()}><Minus size={15} /></button>
-        <button aria-label="Maximize or restore" title="Maximize or restore" onclick={() => void appWindow?.toggleMaximize()}><Square size={12} /></button>
-        <button class="window-close" aria-label="Close" title="Close" onclick={() => void appWindow?.close()}><X size={16} /></button>
+        <button aria-label={$t('window.minimize')} title={$t('window.minimize')} onclick={() => void appWindow?.minimize()}><Minus size={15} /></button>
+        <button aria-label={$t('window.maximize')} title={$t('window.maximize')} onclick={() => void appWindow?.toggleMaximize()}><Square size={12} /></button>
+        <button class="window-close" aria-label={$t('window.close')} title={$t('window.close')} onclick={() => void appWindow?.close()}><X size={16} /></button>
       </div>
     </div>
   </header>
@@ -1814,37 +1824,37 @@
         </div>
         <div class="profile-copy">
           <strong>{displayName}</strong>
-          <span>{running ? 'Available' : 'Offline'}</span>
-          <small>{running ? 'Ready to chat' : 'Start messenger to connect'}</small>
+          <span>{running ? $t('profile.available') : $t('profile.offline')}</span>
+          <small>{running ? $t('profile.ready') : $t('profile.start')}</small>
         </div>
-        <button aria-label="Open settings" title="Settings" onclick={() => openSettings()}>
+        <button aria-label={$t('settings.open')} title={$t('settings.open')} onclick={() => openSettings()}>
           <Settings2 size={17} />
         </button>
       </header>
 
       <div class="roster-actions">
         <label class="search-field">
-          <span>Search contacts</span>
-          <input bind:value={searchQuery} aria-label="Search contacts" placeholder="Search contacts…" />
+          <span>{$t('roster.search')}</span>
+          <input bind:value={searchQuery} aria-label={$t('roster.search')} placeholder={$t('roster.searchPlaceholder')} />
         </label>
-        <button class="add-contact" aria-label="Add a contact" title="Add a contact" onclick={openContacts}>
+        <button class="add-contact" aria-label={$t('roster.add')} title={$t('roster.add')} onclick={openContacts}>
           <UserRoundPlus size={18} />
         </button>
       </div>
 
-      <section class="contact-list" aria-label="Contact list">
+      <section class="contact-list" aria-label={$t('roster.contacts')}>
         {#if chatGroups.length}
-          <div class="roster-section-label">Group chats</div>
+          <div class="roster-section-label">{$t('roster.groupChats')}</div>
           {#each chatGroups as group (group.id)}
             <button class:active={group.id === selectedGroupId} class="contact-row group-chat-row" oncontextmenu={(event) => showGroupMenu(event, group)} onclick={() => selectGroup(group.id)}>
               <span class="group-chat-avatar"><UsersRound size={18} /></span>
-              <span class="contact-copy"><strong>{group.name}</strong><small>{group.members.length} participants</small></span>
+              <span class="contact-copy"><strong>{group.name}</strong><small>{$t('roster.participants', { count: group.members.length })}</small></span>
               <span class="roster-indicators">{#if isConversationMuted(groupConversationKey(group.id))}<BellOff class="muted-conversation" size={13} />{/if}{#if group.unread}<b class="unread">{group.unread}</b>{/if}</span>
             </button>
           {/each}
         {/if}
         {#if visibleContacts.length}
-          <div class="roster-section-label">Contacts</div>
+          <div class="roster-section-label">{$t('roster.contacts')}</div>
           {#each sortedContacts as contact (contact.peerId)}
             <button
               class:active={contact.peerId === selectedPeerId}
@@ -1862,32 +1872,32 @@
           {/each}
         {:else if contacts.length && !chatGroups.length}
           <div class="empty-contacts compact">
-            <strong>No results</strong>
-            <p>Try searching for a different name.</p>
+            <strong>{$t('roster.noResults.title')}</strong>
+            <p>{$t('roster.noResults.body')}</p>
           </div>
         {:else if !chatGroups.length}
           <div class="empty-contacts">
             <span class="empty-people" aria-hidden="true"><i></i><i></i></span>
-            <strong>Your list is empty</strong>
-            <p>Add a friend with their QR code or a link.</p>
-            <button onclick={openContacts}><Plus size={15} /> Add contact</button>
+            <strong>{$t('roster.empty.title')}</strong>
+            <p>{$t('roster.empty.body')}</p>
+            <button onclick={openContacts}><Plus size={15} /> {$t('roster.empty.add')}</button>
           </div>
         {/if}
       </section>
 
       <footer class="roster-footer">
-        <button onclick={openContacts}><UserRoundPlus size={15} /> Add</button>
-        <button onclick={openGroupCreation}><UsersRound size={15} /> New group</button>
-        <span>{onlineContacts.length} online</span>
+        <button onclick={openContacts}><UserRoundPlus size={15} /> {$t('roster.footer.add')}</button>
+        <button onclick={openGroupCreation}><UsersRound size={15} /> {$t('roster.footer.newGroup')}</button>
+        <span>{$t('roster.online', { count: onlineContacts.length })}</span>
       </footer>
     </aside>
 
-    <button class="roster-scrim" aria-label="Close contact list" onclick={() => rosterOpen = false}></button>
+    <button class="roster-scrim" aria-label={$t('conv.closeList')} onclick={() => rosterOpen = false}></button>
 
     <section class="conversation">
       <header class="conversation-header">
         <div class="conversation-person">
-          <button class="mobile-roster-button" aria-label="Open contact list" onclick={() => rosterOpen = true}>
+          <button class="mobile-roster-button" aria-label={$t('conv.openList')} onclick={() => rosterOpen = true}>
             <Menu size={19} />
           </button>
           <div class="avatar-shell large">
@@ -1897,13 +1907,13 @@
           <span>
             <strong>{activeGroup?.name || activeContact?.name || 'msnnext'}</strong>
             <small>
-              {activeGroup ? `${groupOnline} participants connected · protected channels` : ready ? 'Available · protected conversation' : activeContact?.online ? 'Preparing the conversation…' : activeContact ? 'Offline' : 'Choose a conversation from the list'}
+              {activeGroup ? $t('conv.groupConnected', { count: groupOnline }) : ready ? $t('conv.availableProtected') : activeContact?.online ? $t('conv.preparing') : activeContact ? $t('conv.offline') : $t('conv.choose')}
             </small>
           </span>
         </div>
         <div class="header-actions">
-          <span class:secure={ready} class="security-badge"><ShieldCheck size={14} />{ready ? 'Protected' : 'Waiting'}</span>
-          <button class:active={detailsOpen} class="header-tool" aria-label="Conversation details" title="Conversation details" onclick={openConversationDetails}>
+          <span class:secure={ready} class="security-badge"><ShieldCheck size={14} />{ready ? $t('conv.protected') : $t('conv.waiting')}</span>
+          <button class:active={detailsOpen} class="header-tool" aria-label={$t('conv.details')} title={$t('conv.details')} onclick={openConversationDetails}>
             <Info size={17} />
           </button>
         </div>
@@ -1919,11 +1929,11 @@
                 <i class="orbit one"></i>
                 <i class="orbit two"></i>
               </div>
-              <p class="welcome-kicker">Welcome back to msnnext</p>
-              <h1>The people you want.<br />Nothing else.</h1>
-              <p>Choose a contact from the list, or add a friend to get started.</p>
+              <p class="welcome-kicker">{$t('welcome.kicker')}</p>
+              <h1>{$t('welcome.title1')}<br />{$t('welcome.title2')}</h1>
+              <p>{$t('welcome.body')}</p>
               <button class="primary-button" onclick={running ? openContacts : () => setupOpen = true}>
-                {running ? 'Add a contact' : 'Go online'}
+                {running ? $t('welcome.addContact') : $t('welcome.goOnline')}
               </button>
             </div>
           {:else if messages.length === 0}
@@ -1932,15 +1942,15 @@
                 {#if activeGroup}<UsersRound size={30} />{:else}<span>{activeContact?.name.slice(0, 1).toUpperCase()}</span><i class:online={activeContact?.online}></i>{/if}
               </div>
               <h2>{activeGroup?.name || activeContact?.name}</h2>
-              <p>{activeGroup ? (ready ? 'Write the first message to the group.' : 'The chat will be available when at least one participant is online.') : ready ? 'They are online. Write the first message or send a nudge.' : 'You can resume chatting when they come back online.'}</p>
+              <p>{activeGroup ? (ready ? $t('convEmpty.groupReady') : $t('convEmpty.groupWait')) : ready ? $t('convEmpty.ready') : $t('convEmpty.offline')}</p>
             </div>
           {:else}
-            <div class="session-start"><span>Start of conversation</span></div>
+            <div class="session-start"><span>{$t('msg.sessionStart')}</span></div>
             {#each messages as message (message.id)}
               {#if message.kind === 'nudge'}
                 <div class="nudge-message">
                   <span><Zap size={18} /></span>
-                  <p><strong>{message.mine ? 'You sent a nudge!' : `${activeContact?.name || 'A contact'} sent you a nudge!`}</strong><small>The window gave a little shake.</small></p>
+                  <p><strong>{message.mine ? $t('msg.youNudged') : $t('msg.contactNudged', { name: activeContact?.name || $t('msg.aContact') })}</strong><small>{$t('msg.nudgeShake')}</small></p>
                   <time>{message.time}</time>
                 </div>
               {:else}
@@ -1954,7 +1964,7 @@
                       {#if message.attachmentDataUrl}
                         <img src={message.attachmentDataUrl} alt={message.body} />
                       {:else}<Paperclip size={17} />{/if}
-                      <span><b>{message.attachmentMime?.startsWith('image/') ? (message.mine ? 'Image sent' : 'Image received') : (message.mine ? 'File sent' : 'File received')}</b><small>{message.body}</small></span>
+                      <span><b>{message.attachmentMime?.startsWith('image/') ? (message.mine ? $t('msg.imageSent') : $t('msg.imageReceived')) : (message.mine ? $t('msg.fileSent') : $t('msg.fileReceived'))}</b><small>{message.body}</small></span>
                       {#if message.attachmentId}<ExternalLink size={14} />{/if}
                     </button>
                   {:else}
@@ -1976,53 +1986,53 @@
 
         {#if detailsOpen}
           <aside class="details-pane">
-            <header><strong>Details</strong><button aria-label="Close details" onclick={() => detailsOpen = false}><X size={17} /></button></header>
+            <header><strong>{$t('details.title')}</strong><button aria-label={$t('details.close')} onclick={() => detailsOpen = false}><X size={17} /></button></header>
             <div class="detail-profile">
               <div class="avatar-shell profile-avatar">
                 {#if activeGroup}<UsersRound size={25} />{:else}<span>{activeContact?.name.slice(0, 1).toUpperCase() || displayName.slice(0, 1).toUpperCase()}</span><i class:online={activeContact?.online || running}></i>{/if}
               </div>
               <strong>{activeGroup?.name || activeContact?.name || displayName}</strong>
-              <small>{activeGroup ? `${activeGroup.members.length} participants` : activeContact ? (activeContact.online ? 'Available' : 'Offline') : (running ? 'Online' : 'Offline')}</small>
+              <small>{activeGroup ? $t('roster.participants', { count: activeGroup.members.length }) : activeContact ? (activeContact.online ? $t('profile.available') : $t('profile.offline')) : (running ? $t('details.online') : $t('profile.offline'))}</small>
             </div>
             <section class="detail-section">
-              <h3>Security</h3>
+              <h3>{$t('details.security')}</h3>
               <div class="detail-row">
                 <span><ShieldCheck size={18} /></span>
-                <p><strong>Protected conversation</strong><small>{ready ? 'Encrypted channel; compare the identity code' : 'Available when the contact is online'}</small></p>
+                <p><strong>{$t('details.protectedConv')}</strong><small>{ready ? $t('details.protectedOn') : $t('details.protectedOff')}</small></p>
                 <i class:active={ready}></i>
               </div>
               <div class="detail-row">
                 <span><Activity size={18} /></span>
-                <p><strong>Direct connection</strong><small>{activeContact?.online ? 'Active between your devices' : 'Not connected'}</small></p>
+                <p><strong>{$t('details.directConn')}</strong><small>{activeContact?.online ? $t('details.directOn') : $t('details.directOff')}</small></p>
                 <i class:active={activeContact?.online}></i>
               </div>
               <details class="technical-details">
-                <summary>Technical details</summary>
-                <p>Hybrid encryption X25519 + ML-KEM-768. Peer-to-peer QUIC transport.</p>
+                <summary>{$t('details.technical')}</summary>
+                <p>{$t('details.crypto')}</p>
               </details>
             </section>
             <section class="detail-section identity-detail">
-              <h3>{activeContact ? 'Contact identity code' : 'Your identity'}</h3>
-              <code>{activeContact?.fingerprint || ownFingerprint || 'Available after startup'}</code>
-              <small>Compare it verbally or with the QR code before considering the identity verified.</small>
-              <button disabled={!running || linkRequested} onclick={openContacts}><QrCode size={15} /> Show QR and link</button>
+              <h3>{activeContact ? $t('details.contactIdentity') : $t('details.yourIdentity')}</h3>
+              <code>{activeContact?.fingerprint || ownFingerprint || $t('details.identityAfterStart')}</code>
+              <small>{$t('details.compareIdentity')}</small>
+              <button disabled={!running || linkRequested} onclick={openContacts}><QrCode size={15} /> {$t('details.showQr')}</button>
             </section>
             {#if activeContact}
               <section class="detail-section contact-management">
-                <h3>Contact management</h3>
+                <h3>{$t('details.contactManagement')}</h3>
                 <div class="contact-name-editor">
-                  <label for="contact-display-name">Display name</label>
-                  <div class="contact-name-row"><input id="contact-display-name" bind:value={contactName} maxlength="64" placeholder={activeContact.name} /><button onclick={renameContact}><Pencil size={14} /> Save</button></div>
+                  <label for="contact-display-name">{$t('details.displayName')}</label>
+                  <div class="contact-name-row"><input id="contact-display-name" bind:value={contactName} maxlength="64" placeholder={activeContact.name} /><button onclick={renameContact}><Pencil size={14} /> {$t('details.save')}</button></div>
                 </div>
                 <div class="contact-danger-zone">
-                  <button onclick={clearConversation}><Trash2 size={14} /><span><strong>Clear history</strong><small>The contact stays in the list</small></span></button>
-                  <button class="danger-button" onclick={deleteContact}><Trash2 size={14} /><span><strong>Remove contact</strong><small>Also deletes the conversation</small></span></button>
+                  <button onclick={clearConversation}><Trash2 size={14} /><span><strong>{$t('details.clearHistory')}</strong><small>{$t('details.clearHistoryHint')}</small></span></button>
+                  <button class="danger-button" onclick={deleteContact}><Trash2 size={14} /><span><strong>{$t('details.removeContact')}</strong><small>{$t('details.removeContactHint')}</small></span></button>
                 </div>
               </section>
             {/if}
             {#if activeGroup}
               <section class="detail-section group-management">
-                <h3>Participants</h3>
+                <h3>{$t('details.participantsTitle')}</h3>
                 <ul>
                   {#each activeGroup.members as member}
                     {@const ban = memberBan(activeGroup, member)}
@@ -2031,25 +2041,25 @@
                         <strong>{memberName(member)}</strong>
                         <small>
                           <b>{memberRole(activeGroup, member)}</b>
-                          {#if activeGroup.silenced.includes(member)}<i>Muted</i>{/if}
+                          {#if activeGroup.silenced.includes(member)}<i>{$t('details.muted')}</i>{/if}
                           {#if ban}<i class="ban-status">{banLabel(ban)}</i>{/if}
                         </small>
                       </span>
                       {#if canModerateMember(activeGroup, member)}
-                        <select aria-label={`Manage ${memberName(member)}`} value="" onchange={(event) => moderateGroup(member, event.currentTarget.value)}>
-                          <option value="">Manage…</option>
+                        <select aria-label={$t('details.manage', { name: memberName(member) })} value="" onchange={(event) => moderateGroup(member, event.currentTarget.value)}>
+                          <option value="">{$t('details.manageOpt')}</option>
                           {#if peerId === activeGroup.ownerPeerId}
-                            <option value={activeGroup.admins.includes(member) ? 'member' : 'admin'}>{activeGroup.admins.includes(member) ? 'Make member' : 'Make administrator'}</option>
+                            <option value={activeGroup.admins.includes(member) ? 'member' : 'admin'}>{activeGroup.admins.includes(member) ? $t('details.makeMember') : $t('details.makeAdmin')}</option>
                           {/if}
                           {#if !activeGroup.admins.includes(member)}
                             {#if ban}
-                              <option value="unban">Remove ban</option>
+                              <option value="unban">{$t('details.removeBan')}</option>
                             {:else}
-                              <option value={activeGroup.silenced.includes(member) ? 'unsilence' : 'silence'}>{activeGroup.silenced.includes(member) ? 'Unmute' : 'Mute'}</option>
-                              <option value="tempBan:3600000">Ban for 1 hour</option>
-                              <option value="tempBan:86400000">Ban for 24 hours</option>
-                              <option value="tempBan:604800000">Ban for 7 days</option>
-                              <option value="permaBan">Permanent ban</option>
+                              <option value={activeGroup.silenced.includes(member) ? 'unsilence' : 'silence'}>{activeGroup.silenced.includes(member) ? $t('details.unmute') : $t('details.mute')}</option>
+                              <option value="tempBan:3600000">{$t('details.ban1h')}</option>
+                              <option value="tempBan:86400000">{$t('details.ban24h')}</option>
+                              <option value="tempBan:604800000">{$t('details.ban7d')}</option>
+                              <option value="permaBan">{$t('details.banPerma')}</option>
                             {/if}
                           {/if}
                         </select>
@@ -2057,11 +2067,11 @@
                     </li>
                   {/each}
                 </ul>
-                <button onclick={clearGroupConversation}><Trash2 size={14} /> Delete history</button>
-                <button class="danger-button" onclick={deleteChatGroup}><Trash2 size={14} /> Remove chat from device</button>
+                <button onclick={clearGroupConversation}><Trash2 size={14} /> {$t('details.deleteHistory')}</button>
+                <button class="danger-button" onclick={deleteChatGroup}><Trash2 size={14} /> {$t('details.removeGroup')}</button>
               </section>
             {/if}
-            <div class="privacy-note"><LockKeyhole size={14} /><span>Contacts and history stay on this device.</span></div>
+            <div class="privacy-note"><LockKeyhole size={14} /><span>{$t('details.privacy')}</span></div>
           </aside>
         {/if}
       </div>
@@ -2070,50 +2080,50 @@
         {#if emojiOpen}
           <div class="emoji-picker">
             <header>
-              <span><strong>Emoticon</strong><small>Scegli oppure digita la scorciatoia</small></span>
+              <span><strong>{$t('emoji.title')}</strong><small>{$t('emoji.subtitle')}</small></span>
               <span class="emoji-header-actions">
-                <button class="create-emoticon-button" onclick={chooseEmoticonFile}><Plus size={14} /> Crea</button>
-                <button aria-label="Chiudi emoticon" onclick={() => emojiOpen = false}><X size={15} /></button>
+                <button class="create-emoticon-button" onclick={chooseEmoticonFile}><Plus size={14} /> {$t('emoji.create')}</button>
+                <button aria-label={$t('emoji.close')} onclick={() => emojiOpen = false}><X size={15} /></button>
               </span>
             </header>
             {#if customEmoticons.length}
-              <small class="emoji-section-label">Le tue emoticon</small>
+              <small class="emoji-section-label">{$t('emoji.yours')}</small>
               <div class="emoji-grid custom-emoji-grid">
                 {#each customEmoticons as item (item.assetId)}
                   <div class="custom-emoji-item">
-                    <button aria-label={`Inserisci ${item.name}`} title={`${item.name} · ${item.trigger}`} onclick={() => insertCustomEmoticon(item)}>
+                    <button aria-label={$t('emoji.insert', { name: item.name })} title={`${item.name} · ${item.trigger}`} onclick={() => insertCustomEmoticon(item)}>
                       <img src={item.dataUrl} alt="" /><small>{item.trigger}</small>
                     </button>
-                    <button class="edit-emoticon" aria-label={`Modifica ${item.name}`} title="Modifica o elimina" onclick={() => openSaveEmoticon(item)}><Pencil size={11} /></button>
+                    <button class="edit-emoticon" aria-label={$t('emoji.edit', { name: item.name })} title={$t('emoji.editOrDelete')} onclick={() => openSaveEmoticon(item)}><Pencil size={11} /></button>
                   </div>
                 {/each}
               </div>
             {/if}
             {#if offeredEmoticons.length}
-              <small class="emoji-section-label">Ricevute da salvare</small>
+              <small class="emoji-section-label">{$t('emoji.received')}</small>
               <div class="received-emoji-list">
                 {#each offeredEmoticons as item (item.assetId)}
-                  <div><img src={item.dataUrl} alt={item.name} /><span><strong>{item.name}</strong><small>{item.trigger}</small></span><button onclick={() => openSaveEmoticon(item)}>Salva</button></div>
+                  <div><img src={item.dataUrl} alt={item.name} /><span><strong>{item.name}</strong><small>{item.trigger}</small></span><button onclick={() => openSaveEmoticon(item)}>{$t('emoji.saveShort')}</button></div>
                 {/each}
               </div>
             {/if}
-            <small class="emoji-section-label">Classiche</small>
+            <small class="emoji-section-label">{$t('emoji.classic')}</small>
             <div class="emoji-grid">
               {#each emoticons as item}
-                <button aria-label={`Inserisci ${item.label}`} title={`${item.label} · ${item.shortcut}`} onclick={() => insertEmoticon(item)}>
+                <button aria-label={$t('emoji.insert', { name: item.label })} title={`${item.label} · ${item.shortcut}`} onclick={() => insertEmoticon(item)}>
                   <span>{item.glyph}</span><small>{item.shortcut}</small>
                 </button>
               {/each}
             </div>
-            <p>Le scorciatoie diventano emoticon nella conversazione.</p>
+            <p>{$t('emoji.hint')}</p>
           </div>
         {/if}
 
-        <div class="chat-toolbar" aria-label="Strumenti conversazione">
-          <button class:active={emojiOpen} disabled={!canSend} onclick={() => emojiOpen = !emojiOpen}><Smile size={18} /><span>Emoticon</span></button>
-          <button class="nudge-tool" disabled={!ready || !!activeGroup} onclick={sendNudge}><Zap size={18} /><span>Trillo</span></button>
-          <button disabled={!canSend || fileSending} onclick={chooseFile}><Paperclip size={18} /><span>{fileSending ? 'Invio…' : 'Invia file'}</span></button>
-          {#if fileSending}<button class="danger-item" onclick={cancelFileTransfers}><X size={18} /><span>Annulla</span></button>{/if}
+        <div class="chat-toolbar" aria-label={$t('toolbar.label')}>
+          <button class:active={emojiOpen} disabled={!canSend} onclick={() => emojiOpen = !emojiOpen}><Smile size={18} /><span>{$t('toolbar.emoticon')}</span></button>
+          <button class="nudge-tool" disabled={!ready || !!activeGroup} onclick={sendNudge}><Zap size={18} /><span>{$t('composer.nudge')}</span></button>
+          <button disabled={!canSend || fileSending} onclick={chooseFile}><Paperclip size={18} /><span>{fileSending ? $t('composer.sending') : $t('composer.sendFile')}</span></button>
+          {#if fileSending}<button class="danger-item" onclick={cancelFileTransfers}><X size={18} /><span>{$t('composer.cancel')}</span></button>{/if}
         </div>
         {#if fileSending && transferFilename}
           <div class="transfer-progress"><span>{transferFilename}</span><progress max="100" value={transferProgress}></progress><strong>{transferProgress}%</strong></div>
@@ -2126,10 +2136,10 @@
             contenteditable={canSend}
             role="textbox"
             tabindex={canSend ? 0 : -1}
-            aria-label="Messaggio"
+            aria-label={$t('composer.message')}
             aria-multiline="true"
             aria-disabled={!canSend}
-            data-placeholder={!groupCanSend ? 'Non puoi scrivere: sei silenziato o bannato.' : ready ? `Scrivi a ${activeGroup?.name || activeContact?.name}…` : activeGroup ? 'Nessun partecipante è disponibile.' : activeContact ? 'Il contatto non è disponibile.' : 'Scegli una conversazione per scrivere.'}
+            data-placeholder={!groupCanSend ? $t('composer.cantWrite') : ready ? $t('composer.writeTo', { name: activeGroup?.name || activeContact?.name || '' }) : activeGroup ? $t('composer.noParticipants') : activeContact ? $t('composer.contactUnavailable') : $t('composer.chooseConv')}
             oninput={syncDraft}
             onpaste={pasteDraft}
             ondrop={(event) => event.preventDefault()}
@@ -2143,12 +2153,12 @@
               }
             }}
           ></div>
-          <button type="submit" class="send-button" disabled={!canSend || !messageText.trim()}><Send size={17} /> Invia</button>
+          <button type="submit" class="send-button" disabled={!canSend || !messageText.trim()}><Send size={17} /> {$t('composer.send')}</button>
         </form>
-        <small class="composer-hint">Invio per spedire · Maiusc+Invio per andare a capo</small>
+        <small class="composer-hint">{$t('composer.hint')}</small>
       </footer>
       {#if fileDropActive && canSend}
-        <div class="file-drop-overlay"><Paperclip size={28} /><strong>Rilascia per inviare</strong><small>File e immagini, massimo 5 GB ciascuno</small></div>
+        <div class="file-drop-overlay"><Paperclip size={28} /><strong>{$t('composer.dropToSend')}</strong><small>{$t('composer.dropHint')}</small></div>
       {/if}
     </section>
   </div>
@@ -2156,34 +2166,34 @@
 
 {#if contextPeerId || contextGroupId}
   {@const contextConversation = contextGroupId ? groupConversationKey(contextGroupId) : peerConversationKey(contextPeerId)}
-  <button class="context-scrim" aria-label="Chiudi menu" onclick={closeContextMenu}></button>
+  <button class="context-scrim" aria-label={$t('ctx.close')} onclick={closeContextMenu}></button>
   <div class="contact-context-menu" style={`left:${contextX}px;top:${contextY}px`} role="menu">
-    <button onclick={() => { contextGroupId ? selectGroup(contextGroupId) : selectContact(contextPeerId); closeContextMenu() }}>Apri conversazione</button>
-    {#if contextPeerId}<button onclick={() => manageContact(contextPeerId)}>Rinomina e gestisci</button>{/if}
+    <button onclick={() => { contextGroupId ? selectGroup(contextGroupId) : selectContact(contextPeerId); closeContextMenu() }}>{$t('ctx.open')}</button>
+    {#if contextPeerId}<button onclick={() => manageContact(contextPeerId)}>{$t('ctx.rename')}</button>{/if}
     <div class="context-separator"></div>
-    <small>Notifiche</small>
+    <small>{$t('ctx.notifications')}</small>
     {#if isConversationMuted(contextConversation)}
-      <button onclick={() => unmuteConversation(contextConversation)}>Riattiva notifiche</button>
+      <button onclick={() => unmuteConversation(contextConversation)}>{$t('ctx.unmute')}</button>
     {:else}
-      <button onclick={() => muteConversation(contextConversation, 60 * 60 * 1000)}>Silenzia per 1 ora</button>
-      <button onclick={() => muteConversation(contextConversation, 8 * 60 * 60 * 1000)}>Silenzia per 8 ore</button>
-      <button onclick={() => muteConversation(contextConversation, null)}>Silenzia sempre</button>
+      <button onclick={() => muteConversation(contextConversation, 60 * 60 * 1000)}>{$t('ctx.mute1h')}</button>
+      <button onclick={() => muteConversation(contextConversation, 8 * 60 * 60 * 1000)}>{$t('ctx.mute8h')}</button>
+      <button onclick={() => muteConversation(contextConversation, null)}>{$t('ctx.muteAlways')}</button>
     {/if}
     {#if contextPeerId}
     <div class="context-separator"></div>
-    <button class="danger-item" onclick={() => { selectContact(contextPeerId); closeContextMenu(); void deleteContact() }}>Elimina contatto</button>
+    <button class="danger-item" onclick={() => { selectContact(contextPeerId); closeContextMenu(); void deleteContact() }}>{$t('ctx.deleteContact')}</button>
     {/if}
   </div>
 {/if}
 
 {#if mediaPreview}
-  <div class="modal-backdrop image-viewer" role="dialog" aria-modal="true" aria-label="Anteprima allegato" tabindex="-1">
-    <button aria-label="Chiudi anteprima" onclick={() => mediaPreview = ''}><X size={20} /></button>
+  <div class="modal-backdrop image-viewer" role="dialog" aria-modal="true" aria-label={$t('media.previewLabel')} tabindex="-1">
+    <button aria-label={$t('media.close')} onclick={() => mediaPreview = ''}><X size={20} /></button>
     {#if mediaPreview.startsWith('data:video/')}
       <!-- svelte-ignore a11y_media_has_caption i file ricevuti non includono una traccia sottotitoli separata -->
-      <video src={mediaPreview} controls autoplay aria-label="Video ricevuto"></video>
+      <video src={mediaPreview} controls autoplay aria-label={$t('media.video')}></video>
     {:else}
-      <img src={mediaPreview} alt="Immagine ricevuta" />
+      <img src={mediaPreview} alt={$t('media.image')} />
     {/if}
   </div>
 {/if}
@@ -2192,12 +2202,12 @@
   {@const offer = incomingAttachmentOffers[0]}
   <div class="modal-backdrop">
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="attachment-offer-title">
-      <p class="step-label">File in arrivo</p>
-      <h2 id="attachment-offer-title">Vuoi ricevere {offer.filename}?</h2>
-      <p>{contacts.find((contact) => contact.peerId === offer.peerId)?.name || 'Un contatto'} vuole inviarti un file da {formatBytes(offer.size)}.</p>
+      <p class="step-label">{$t('offer.incoming')}</p>
+      <h2 id="attachment-offer-title">{$t('offer.question', { filename: offer.filename })}</h2>
+      <p>{$t('offer.body', { name: contacts.find((contact) => contact.peerId === offer.peerId)?.name || $t('offer.aContact'), size: formatBytes(offer.size) })}</p>
       <div class="modal-actions">
-        <button class="secondary-button" onclick={() => answerAttachmentOffer(offer, false)}>Rifiuta</button>
-        <button class="primary-button" onclick={() => answerAttachmentOffer(offer, true)}>Accetta</button>
+        <button class="secondary-button" onclick={() => answerAttachmentOffer(offer, false)}>{$t('offer.decline')}</button>
+        <button class="primary-button" onclick={() => answerAttachmentOffer(offer, true)}>{$t('offer.accept')}</button>
       </div>
     </div>
   </div>
@@ -2205,32 +2215,32 @@
 
 {#if setupOpen}
   <div class="modal-backdrop">
-    <div class="modal-theme-switcher" role="group" aria-label="Tema della finestra">
-      <button class:active={theme === 'light'} onclick={() => setTheme('light')}><Sun size={14} /> Chiaro</button>
-      <button class:active={theme === 'dark'} onclick={() => setTheme('dark')}><Moon size={14} /> Scuro</button>
-      <button class:active={theme === 'system'} onclick={() => setTheme('system')}><Monitor size={14} /> Sistema</button>
+    <div class="modal-theme-switcher" role="group" aria-label={$t('modal.windowTheme')}>
+      <button class:active={theme === 'light'} onclick={() => setTheme('light')}><Sun size={14} /> {$t('theme.light')}</button>
+      <button class:active={theme === 'dark'} onclick={() => setTheme('dark')}><Moon size={14} /> {$t('theme.dark')}</button>
+      <button class:active={theme === 'system'} onclick={() => setTheme('system')}><Monitor size={14} /> {$t('theme.system')}</button>
     </div>
     <div class="modal setup-modal" role="dialog" aria-modal="true" aria-labelledby="setup-title">
-      {#if running}<button class="modal-close" aria-label="Chiudi" onclick={() => setupOpen = false}><X size={18} /></button>{/if}
+      {#if running}<button class="modal-close" aria-label={$t('window.close')} onclick={() => setupOpen = false}><X size={18} /></button>{/if}
       <div class="modal-sky">
         <span class="modal-people" aria-hidden="true"><i></i><i></i></span>
         <div><strong>msnnext</strong><small>messenger</small></div>
       </div>
       <div class="modal-body">
-        <p class="step-label">Prima di andare online</p>
-        <h2 id="setup-title">Come vuoi apparire?</h2>
-        <p>Scegli il nome che vedranno i tuoi amici. Non serve registrarsi.</p>
-        <label>Il tuo nome<input bind:value={displayName} maxlength="64" placeholder="Scrivi il tuo nome" /></label>
+        <p class="step-label">{$t('setup.step')}</p>
+        <h2 id="setup-title">{$t('setup.title')}</h2>
+        <p>{$t('setup.body')}</p>
+        <label>{$t('setup.yourName')}<input bind:value={displayName} maxlength="64" placeholder={$t('setup.namePlaceholder')} /></label>
         <details>
-          <summary>Collegamento diretto avanzato</summary>
-          <label>Indirizzo peer <small>facoltativo</small><input bind:value={directAddress} placeholder="/ip4/…/udp/…/quic-v1/p2p/…" /></label>
-          <label>Relay personalizzato <small>facoltativo</small><input bind:value={relayAddress} maxlength="512" placeholder="Usa il mininodo MSN Next" /></label>
+          <summary>{$t('setup.advanced')}</summary>
+          <label>{$t('setup.peerAddress')} <small>{$t('setup.optional')}</small><input bind:value={directAddress} placeholder="/ip4/…/udp/…/quic-v1/p2p/…" /></label>
+          <label>{$t('setup.customRelay')} <small>{$t('setup.optional')}</small><input bind:value={relayAddress} maxlength="512" placeholder={$t('setup.relayPlaceholder')} /></label>
         </details>
         <button class="primary-button wide" disabled={starting || !displayName.trim()} onclick={() => startNode()}>
-          {starting ? 'Connessione in corso…' : 'Vai online'}
+          {starting ? $t('setup.connecting') : $t('setup.goOnline')}
         </button>
-        <button class="secondary-button wide" onclick={prepareAccountBackupImport}><Upload size={14} /> Ripristina account esistente</button>
-        <small class="modal-foot">Sulla stessa rete gli amici vengono trovati automaticamente.</small>
+        <button class="secondary-button wide" onclick={prepareAccountBackupImport}><Upload size={14} /> {$t('setup.restore')}</button>
+        <small class="modal-foot">{$t('setup.foot')}</small>
       </div>
     </div>
   </div>
@@ -2238,39 +2248,39 @@
 
 {#if connectOpen}
   <div class="modal-backdrop">
-    <div class="modal-theme-switcher" role="group" aria-label="Tema della finestra">
-      <button class:active={theme === 'light'} onclick={() => setTheme('light')}><Sun size={14} /> Chiaro</button>
-      <button class:active={theme === 'dark'} onclick={() => setTheme('dark')}><Moon size={14} /> Scuro</button>
-      <button class:active={theme === 'system'} onclick={() => setTheme('system')}><Monitor size={14} /> Sistema</button>
+    <div class="modal-theme-switcher" role="group" aria-label={$t('modal.windowTheme')}>
+      <button class:active={theme === 'light'} onclick={() => setTheme('light')}><Sun size={14} /> {$t('theme.light')}</button>
+      <button class:active={theme === 'dark'} onclick={() => setTheme('dark')}><Moon size={14} /> {$t('theme.dark')}</button>
+      <button class:active={theme === 'system'} onclick={() => setTheme('system')}><Monitor size={14} /> {$t('theme.system')}</button>
     </div>
     <div class="modal connect-modal" role="dialog" aria-modal="true" aria-labelledby="connect-title">
-      <button class="modal-close" aria-label="Chiudi" onclick={() => connectOpen = false}><X size={18} /></button>
+      <button class="modal-close" aria-label={$t('window.close')} onclick={() => connectOpen = false}><X size={18} /></button>
       <div class="modal-heading">
         <span><UserRoundPlus size={23} /></span>
-        <div><p class="step-label">Aggiungi un contatto</p><h2 id="connect-title">Trova un amico</h2></div>
+        <div><p class="step-label">{$t('connect.step')}</p><h2 id="connect-title">{$t('connect.title')}</h2></div>
       </div>
-      <p>Condividi il tuo QR, oppure usa quello che hai ricevuto.</p>
+      <p>{$t('connect.body')}</p>
 
       <section class="share-section">
-        <header><span><strong>Il tuo contatto</strong><small>Fallo inquadrare o invialo come immagine</small></span><QrCode size={19} /></header>
+        <header><span><strong>{$t('connect.yourContact')}</strong><small>{$t('connect.yourContactHint')}</small></span><QrCode size={19} /></header>
         {#if ownContactQr}
-          <img class="contact-qr" src={ownContactQr} alt="QR del tuo contatto msnnext" />
+          <img class="contact-qr" src={ownContactQr} alt={$t('connect.qrAlt')} />
         {:else}
-          <button class="secondary-button" disabled={linkRequested} onclick={createContactLink}>{linkRequested ? 'Preparo il QR…' : 'Crea il mio QR'}</button>
+          <button class="secondary-button" disabled={linkRequested} onclick={createContactLink}>{linkRequested ? $t('connect.preparingQr') : $t('connect.createQr')}</button>
         {/if}
         {#if ownContactLink}
           <div class="contact-share-actions">
-            <button class="copy-link" onclick={copyOwnLink}><Copy size={15} /> Copia il link</button>
-            <button class="copy-link" onclick={saveContactQr}><QrCode size={15} /> Salva QR grande</button>
+            <button class="copy-link" onclick={copyOwnLink}><Copy size={15} /> {$t('connect.copyLink')}</button>
+            <button class="copy-link" onclick={saveContactQr}><QrCode size={15} /> {$t('connect.saveQr')}</button>
           </div>
         {/if}
       </section>
 
-      <div class="or-divider"><span>oppure aggiungi l’altra persona</span></div>
-      <label>Link ricevuto<input bind:value={contactLink} placeholder="msnnext://add/…" /></label>
-      <button class="scan-button" onclick={scanContactQr}><QrCode size={16} /> Leggi un QR da un’immagine</button>
+      <div class="or-divider"><span>{$t('connect.orAdd')}</span></div>
+      <label>{$t('connect.receivedLink')}<input bind:value={contactLink} placeholder="msnnext://add/…" /></label>
+      <button class="scan-button" onclick={scanContactQr}><QrCode size={16} /> {$t('connect.scanQr')}</button>
       <button class="primary-button wide" disabled={!running || !contactLink.trim()} onclick={importContact}>
-        <Link2 size={16} /> Aggiungi alla lista
+        <Link2 size={16} /> {$t('connect.addToList')}
       </button>
     </div>
   </div>
@@ -2279,22 +2289,22 @@
 {#if groupCreateOpen}
   <div class="modal-backdrop">
     <div class="modal group-create-modal" role="dialog" aria-modal="true" aria-labelledby="group-create-title">
-      <button class="modal-close" aria-label="Chiudi" onclick={() => groupCreateOpen = false}><X size={18} /></button>
+      <button class="modal-close" aria-label={$t('window.close')} onclick={() => groupCreateOpen = false}><X size={18} /></button>
       <div class="modal-heading">
         <span><UsersRound size={23} /></span>
-        <div><p class="step-label">Conversazione condivisa</p><h2 id="group-create-title">Nuova chat di gruppo</h2></div>
+        <div><p class="step-label">{$t('group.step')}</p><h2 id="group-create-title">{$t('group.title')}</h2></div>
       </div>
-      <label>Nome del gruppo<input bind:value={groupName} maxlength="64" placeholder="Per esempio: Amici" /></label>
+      <label>{$t('group.name')}<input bind:value={groupName} maxlength="64" placeholder={$t('group.namePlaceholder')} /></label>
       <fieldset class="group-member-picker">
-        <legend>Scegli almeno due persone</legend>
+        <legend>{$t('group.pickPeople')}</legend>
         {#each contacts as contact (contact.peerId)}
           <label>
             <input type="checkbox" checked={groupMemberIds.includes(contact.peerId)} onchange={() => toggleGroupMember(contact.peerId)} />
-            <span><strong>{contact.name}</strong><small>{contact.secure ? 'Online e protetto' : contact.online ? 'Connessione in preparazione' : 'Non in linea'}</small></span>
+            <span><strong>{contact.name}</strong><small>{contact.secure ? $t('group.onlineProtected') : contact.online ? $t('group.connecting') : $t('group.offline')}</small></span>
           </label>
         {/each}
       </fieldset>
-      <button class="primary-button wide" disabled={!groupName.trim() || groupMemberIds.length < 2 || pendingGroupCreation} onclick={createChatGroup}>{pendingGroupCreation ? 'Creo il gruppo…' : `Crea gruppo con ${groupMemberIds.length + 1} partecipanti`}</button>
+      <button class="primary-button wide" disabled={!groupName.trim() || groupMemberIds.length < 2 || pendingGroupCreation} onclick={createChatGroup}>{pendingGroupCreation ? $t('group.creating') : $t('group.createWith', { count: groupMemberIds.length + 1 })}</button>
     </div>
   </div>
 {/if}
@@ -2302,14 +2312,14 @@
 {#if emoticonCreateOpen}
   <div class="modal-backdrop">
     <div class="modal emoticon-modal" role="dialog" aria-modal="true" aria-labelledby="create-emoticon-title">
-      <button class="modal-close" aria-label="Chiudi" onclick={() => emoticonCreateOpen = false}><X size={18} /></button>
+      <button class="modal-close" aria-label={$t('window.close')} onclick={() => emoticonCreateOpen = false}><X size={18} /></button>
       <div class="modal-heading">
         <span><Smile size={23} /></span>
-        <div><p class="step-label">Emoticon personale</p><h2 id="create-emoticon-title">Crea la tua emoticon</h2></div>
+        <div><p class="step-label">{$t('emoCreate.step')}</p><h2 id="create-emoticon-title">{$t('emoCreate.title')}</h2></div>
       </div>
-      <p>Scegli la scorciatoia che la farà apparire nei messaggi, per esempio <b>:ciao:</b>.</p>
-      <label>Scorciatoia<input bind:value={emoticonTrigger} maxlength="32" placeholder=":mia:" /></label>
-      <button class="primary-button wide" disabled={!emoticonTrigger.trim()} onclick={createCustomEmoticon}>Crea emoticon</button>
+      <p>{$t('emoCreate.body')} <b>:ciao:</b>.</p>
+      <label>{$t('emoCreate.shortcut')}<input bind:value={emoticonTrigger} maxlength="32" placeholder=":mia:" /></label>
+      <button class="primary-button wide" disabled={!emoticonTrigger.trim()} onclick={createCustomEmoticon}>{$t('emoCreate.create')}</button>
     </div>
   </div>
 {/if}
@@ -2317,14 +2327,14 @@
 {#if emoticonSaveOpen && emoticonToSave}
   <div class="modal-backdrop">
     <div class="modal emoticon-modal" role="dialog" aria-modal="true" aria-labelledby="save-emoticon-title">
-      <button class="modal-close" aria-label="Chiudi" onclick={() => emoticonSaveOpen = false}><X size={18} /></button>
+      <button class="modal-close" aria-label={$t('window.close')} onclick={() => emoticonSaveOpen = false}><X size={18} /></button>
       <div class="received-emoticon-preview"><img src={emoticonToSave.dataUrl} alt={emoticonToSave.name} /></div>
-      <p class="step-label">{emoticonToSave.saved ? 'La tua emoticon' : 'Emoticon ricevuta'}</p>
-      <h2 id="save-emoticon-title">{emoticonToSave.saved ? `Modifica ${emoticonToSave.name}` : `Salva ${emoticonToSave.name}`}</h2>
-      <p>{emoticonToSave.saved ? 'Cambia la scorciatoia che la fa apparire nei messaggi.' : 'Puoi mantenere la scorciatoia suggerita o sceglierne una tua.'}</p>
-      <label>Scorciatoia<input bind:value={emoticonTrigger} maxlength="32" placeholder=":emoticon:" /></label>
-      <button class="primary-button wide" disabled={!emoticonTrigger.trim() || !!pendingEmoticonAction} onclick={saveReceivedEmoticon}>{emoticonToSave.saved ? 'Salva modifica' : 'Salva nelle mie emoticon'}</button>
-      {#if emoticonToSave.saved}<button class="danger-button wide" disabled={!!pendingEmoticonAction} onclick={deleteEmoticon}><Trash2 size={15} /> Elimina emoticon</button>{/if}
+      <p class="step-label">{emoticonToSave.saved ? $t('emoSave.yours') : $t('emoSave.received')}</p>
+      <h2 id="save-emoticon-title">{emoticonToSave.saved ? $t('emoSave.edit', { name: emoticonToSave.name }) : $t('emoSave.save', { name: emoticonToSave.name })}</h2>
+      <p>{emoticonToSave.saved ? $t('emoSave.changeHint') : $t('emoSave.keepHint')}</p>
+      <label>{$t('emoCreate.shortcut')}<input bind:value={emoticonTrigger} maxlength="32" placeholder=":emoticon:" /></label>
+      <button class="primary-button wide" disabled={!emoticonTrigger.trim() || !!pendingEmoticonAction} onclick={saveReceivedEmoticon}>{emoticonToSave.saved ? $t('emoSave.saveEdit') : $t('emoSave.saveToMine')}</button>
+      {#if emoticonToSave.saved}<button class="danger-button wide" disabled={!!pendingEmoticonAction} onclick={deleteEmoticon}><Trash2 size={15} /> {$t('emoSave.delete')}</button>{/if}
     </div>
   </div>
 {/if}
@@ -2332,75 +2342,81 @@
 {#if profileOpen}
   <div class="modal-backdrop">
     <div class="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
-      <button class="modal-close" aria-label="Chiudi" onclick={() => profileOpen = false}><X size={18} /></button>
+      <button class="modal-close" aria-label={$t('window.close')} onclick={() => profileOpen = false}><X size={18} /></button>
       <header class="settings-header">
         <div class="settings-avatar avatar-shell">
           {#if avatarDataUrl}<img src={avatarDataUrl} alt="Avatar personale" />{:else}<span>{displayName.slice(0, 1).toUpperCase()}</span>{/if}
         </div>
         <div>
           <p class="step-label">msnnext {appVersion}</p>
-          <h2 id="settings-title">Impostazioni</h2>
+          <h2 id="settings-title">{$t('settings.title')}</h2>
           <small>{displayName}</small>
         </div>
       </header>
 
       <div class="settings-shell">
-        <nav class="settings-navigation" aria-label="Sezioni impostazioni">
-          <button class:active={settingsSection === 'profile'} aria-current={settingsSection === 'profile' ? 'page' : undefined} onclick={() => settingsSection = 'profile'}><UserRound size={17} /><span>Profilo</span></button>
-          <button class:active={settingsSection === 'appearance'} aria-current={settingsSection === 'appearance' ? 'page' : undefined} onclick={() => settingsSection = 'appearance'}><Palette size={17} /><span>Aspetto</span></button>
-          <button class:active={settingsSection === 'devices'} aria-current={settingsSection === 'devices' ? 'page' : undefined} onclick={() => settingsSection = 'devices'}><Monitor size={17} /><span>Dispositivi</span></button>
-          <button class:active={settingsSection === 'data'} aria-current={settingsSection === 'data' ? 'page' : undefined} onclick={() => settingsSection = 'data'}><Database size={17} /><span>Dati</span></button>
+        <nav class="settings-navigation" aria-label={$t('settings.sections')}>
+          <button class:active={settingsSection === 'profile'} aria-current={settingsSection === 'profile' ? 'page' : undefined} onclick={() => settingsSection = 'profile'}><UserRound size={17} /><span>{$t('settings.nav.profile')}</span></button>
+          <button class:active={settingsSection === 'appearance'} aria-current={settingsSection === 'appearance' ? 'page' : undefined} onclick={() => settingsSection = 'appearance'}><Palette size={17} /><span>{$t('settings.nav.appearance')}</span></button>
+          <button class:active={settingsSection === 'devices'} aria-current={settingsSection === 'devices' ? 'page' : undefined} onclick={() => settingsSection = 'devices'}><Monitor size={17} /><span>{$t('settings.nav.devices')}</span></button>
+          <button class:active={settingsSection === 'data'} aria-current={settingsSection === 'data' ? 'page' : undefined} onclick={() => settingsSection = 'data'}><Database size={17} /><span>{$t('settings.nav.data')}</span></button>
           <button class:active={settingsSection === 'updates'} aria-current={settingsSection === 'updates' ? 'page' : undefined} onclick={() => settingsSection = 'updates'}>
-            <RefreshCw size={17} /><span>Aggiornamenti</span>{#if updateCandidate}<i aria-label="Aggiornamento disponibile"></i>{/if}
+            <RefreshCw size={17} /><span>{$t('settings.nav.updates')}</span>{#if updateCandidate}<i aria-label={$t('settings.updateAvailable')}></i>{/if}
           </button>
-          <button class:active={settingsSection === 'network'} aria-current={settingsSection === 'network' ? 'page' : undefined} onclick={() => settingsSection = 'network'}><Radio size={17} /><span>Rete e sicurezza</span></button>
+          <button class:active={settingsSection === 'network'} aria-current={settingsSection === 'network' ? 'page' : undefined} onclick={() => settingsSection = 'network'}><Radio size={17} /><span>{$t('settings.nav.network')}</span></button>
         </nav>
 
         <div class="settings-content">
           {#if settingsSection === 'profile'}
             <section class="settings-panel" aria-labelledby="profile-panel-title">
               <header class="settings-panel-heading">
-                <h3 id="profile-panel-title">Profilo personale</h3>
-                <p>Le persone collegate vedono questo nome e questa immagine.</p>
+                <h3 id="profile-panel-title">{$t('settings.profile.title')}</h3>
+                <p>{$t('settings.profile.body')}</p>
               </header>
               <div class="profile-settings-editor">
                 <div class="profile-editor-avatar avatar-shell">
-                  {#if avatarDataUrl}<img src={avatarDataUrl} alt="Avatar personale" />{:else}<span>{displayName.slice(0, 1).toUpperCase()}</span>{/if}
+                  {#if avatarDataUrl}<img src={avatarDataUrl} alt={$t('settings.profile.picture')} />{:else}<span>{displayName.slice(0, 1).toUpperCase()}</span>{/if}
                 </div>
                 <div class="profile-avatar-copy">
-                  <strong>Immagine del profilo</strong>
-                  <small>PNG, JPEG o WebP</small>
+                  <strong>{$t('settings.profile.picture')}</strong>
+                  <small>{$t('settings.profile.formats')}</small>
                   <div class="profile-avatar-actions">
-                    <button class="secondary-button" onclick={chooseAvatar}>Scegli</button>
-                    {#if avatarDataUrl}<button class="secondary-button" onclick={() => saveProfile(null, true, false)}>Rimuovi</button>{/if}
+                    <button class="secondary-button" onclick={chooseAvatar}>{$t('settings.profile.choose')}</button>
+                    {#if avatarDataUrl}<button class="secondary-button" onclick={() => saveProfile(null, true, false)}>{$t('settings.profile.remove')}</button>{/if}
                   </div>
                 </div>
               </div>
-              <label class="settings-field">Nome visualizzato<input bind:value={displayName} maxlength="64" /></label>
+              <label class="settings-field">{$t('settings.profile.displayName')}<input bind:value={displayName} maxlength="64" /></label>
             </section>
           {:else if settingsSection === 'appearance'}
             <section class="settings-panel" aria-labelledby="appearance-panel-title">
               <header class="settings-panel-heading">
-                <h3 id="appearance-panel-title">Aspetto e comportamento</h3>
-                <p>Personalizza leggibilità, anteprime e avvisi.</p>
+                <h3 id="appearance-panel-title">{$t('settings.appearance.title')}</h3>
+                <p>{$t('settings.appearance.body')}</p>
               </header>
-              <div class="settings-theme-control" role="group" aria-label="Tema dell'app">
-                <button class:active={theme === 'light'} onclick={() => setTheme('light')}><Sun size={16} /> Chiaro</button>
-                <button class:active={theme === 'dark'} onclick={() => setTheme('dark')}><Moon size={16} /> Scuro</button>
-                <button class:active={theme === 'system'} onclick={() => setTheme('system')}><Monitor size={16} /> Sistema</button>
+              <div class="settings-theme-control" role="group" aria-label={$t('settings.appearance.appTheme')}>
+                <button class:active={theme === 'light'} onclick={() => setTheme('light')}><Sun size={16} /> {$t('theme.light')}</button>
+                <button class:active={theme === 'dark'} onclick={() => setTheme('dark')}><Moon size={16} /> {$t('theme.dark')}</button>
+                <button class:active={theme === 'system'} onclick={() => setTheme('system')}><Monitor size={16} /> {$t('theme.system')}</button>
               </div>
               <div class="settings-list">
-                <label class="settings-row"><span><strong>Dimensione testo</strong><small>L'anteprima cambia immediatamente</small></span><select bind:value={fontScale} aria-label="Dimensione testo"><option value={100}>Originale</option><option value={115}>Comoda</option><option value={125}>Grande</option><option value={140}>Molto grande</option></select></label>
-                <label class="settings-row"><span><strong>Immagini inviate</strong><small>Mostrale appena premi invio</small></span><input type="checkbox" bind:checked={previewSentImages} /></label>
-                <label class="settings-row"><span><strong>Immagini ricevute</strong><small>Mostrale senza doverle aprire</small></span><input type="checkbox" bind:checked={previewReceivedImages} /></label>
-                <label class="settings-row"><span><strong>Suono del trillo</strong><small>Riproduci un avviso quando ricevi un trillo</small></span><input type="checkbox" bind:checked={nudgeSound} /></label>
+                <label class="settings-row"><span><strong>{$t('settings.textSize.title')}</strong><small>{$t('settings.textSize.hint')}</small></span><select bind:value={fontScale} aria-label={$t('settings.textSize.title')}><option value={100}>{$t('settings.textSize.original')}</option><option value={115}>{$t('settings.textSize.comfortable')}</option><option value={125}>{$t('settings.textSize.large')}</option><option value={140}>{$t('settings.textSize.xlarge')}</option></select></label>
+                <label class="settings-row"><span><strong>{$t('settings.sentImages.title')}</strong><small>{$t('settings.sentImages.desc')}</small></span><input type="checkbox" bind:checked={previewSentImages} /></label>
+                <label class="settings-row"><span><strong>{$t('settings.recvImages.title')}</strong><small>{$t('settings.recvImages.desc')}</small></span><input type="checkbox" bind:checked={previewReceivedImages} /></label>
+                <label class="settings-row"><span><strong>{$t('settings.nudgeSound.title')}</strong><small>{$t('settings.nudgeSound.desc')}</small></span><input type="checkbox" bind:checked={nudgeSound} /></label>
+                <label class="settings-row"><span><strong>{$t('settings.effectsSounds.title')}</strong><small>{$t('settings.effectsSounds.desc')}</small></span><input type="checkbox" bind:checked={effectsSounds} /></label>
+                <label class="settings-row"><span><strong>{$t('settings.language.title')}</strong><small>{$t('settings.language.desc')}</small></span>
+                  <select bind:value={$locale}>
+                    {#each availableLocales as lang (lang.code)}<option value={lang.code}>{lang.label}</option>{/each}
+                  </select>
+                </label>
               </div>
             </section>
           {:else if settingsSection === 'devices'}
             <section class="settings-panel" aria-labelledby="linked-devices-title">
               <header class="settings-panel-heading">
-                <h3 id="linked-devices-title">Dispositivi collegati</h3>
-                <p>Contatti e cronologia passano direttamente tra i client online.</p>
+                <h3 id="linked-devices-title">{$t('settings.devices.title')}</h3>
+                <p>{$t('settings.devices.body')}</p>
               </header>
               {#if linkedDevices.length}
                 <div class="linked-device-list settings-list">
@@ -2412,46 +2428,46 @@
                   {/each}
                 </div>
               {:else}
-                <div class="settings-empty"><Monitor size={22} /><strong>Solo questo dispositivo</strong><small>Collegane un altro per sincronizzare i dati mentre entrambi sono online.</small></div>
+                <div class="settings-empty"><Monitor size={22} /><strong>{$t('settings.devices.onlyThis.title')}</strong><small>{$t('settings.devices.onlyThis.desc')}</small></div>
               {/if}
               <div class="settings-action-row">
-                <button class="secondary-button" disabled={!running} onclick={shareDevicePairing}><QrCode size={14} /> Mostra codice</button>
-                <button class="secondary-button" disabled={!running} onclick={joinDevicePairing}><Link2 size={14} /> Usa codice</button>
+                <button class="secondary-button" disabled={!running} onclick={shareDevicePairing}><QrCode size={14} /> {$t('settings.devices.showCode')}</button>
+                <button class="secondary-button" disabled={!running} onclick={joinDevicePairing}><Link2 size={14} /> {$t('settings.devices.useCode')}</button>
               </div>
             </section>
           {:else if settingsSection === 'data'}
             <section class="settings-panel" aria-labelledby="data-panel-title">
               <header class="settings-panel-heading">
-                <h3 id="data-panel-title">Dati e contenuti</h3>
-                <p>Gestisci backup di emergenza ed emoticon personali.</p>
+                <h3 id="data-panel-title">{$t('settings.data.title')}</h3>
+                <p>{$t('settings.data.body')}</p>
               </header>
               <div class="settings-subsection">
-                <div class="settings-subsection-heading"><span><strong>Backup cifrato</strong><small>Include account, contatti, messaggi e gruppi, ma non gli allegati.</small></span><ShieldCheck size={18} /></div>
+                <div class="settings-subsection-heading"><span><strong>{$t('settings.data.backup.title')}</strong><small>{$t('settings.data.backup.desc')}</small></span><ShieldCheck size={18} /></div>
                 <div class="settings-action-row">
-                  <button class="secondary-button" disabled={running} onclick={prepareAccountBackupExport}><Download size={14} /> Esporta</button>
-                  <button class="secondary-button" disabled={running} onclick={prepareAccountBackupImport}><Upload size={14} /> Importa</button>
+                  <button class="secondary-button" disabled={running} onclick={prepareAccountBackupExport}><Download size={14} /> {$t('settings.data.export')}</button>
+                  <button class="secondary-button" disabled={running} onclick={prepareAccountBackupImport}><Upload size={14} /> {$t('settings.data.import')}</button>
                 </div>
-                {#if running}<p class="settings-note">Vai offline per esportare o ripristinare un backup.</p>{/if}
+                {#if running}<p class="settings-note">{$t('settings.data.offlineNote')}</p>{/if}
               </div>
               <div class="settings-subsection settings-emoticons-flat">
                 <div class="settings-subsection-heading">
-                  <span><strong>Emoticon personali</strong><small>Disponibili anche quando i contatti sono offline.</small></span>
-                  <button class="secondary-button" onclick={chooseEmoticonFile}><Plus size={14} /> Crea</button>
+                  <span><strong>{$t('settings.data.emoticons.title')}</strong><small>{$t('settings.data.emoticons.desc')}</small></span>
+                  <button class="secondary-button" onclick={chooseEmoticonFile}><Plus size={14} /> {$t('emoji.create')}</button>
                 </div>
                 {#if customEmoticons.length}
                   <div class="emoji-grid custom-emoji-grid">
                     {#each customEmoticons as item (item.assetId)}
-                      <button aria-label={`Modifica ${item.name}`} title="Modifica o elimina" onclick={() => openSaveEmoticon(item)}><img src={item.dataUrl} alt="" /><small>{item.trigger}</small></button>
+                      <button aria-label={$t('emoji.edit', { name: item.name })} title={$t('emoji.editOrDelete')} onclick={() => openSaveEmoticon(item)}><img src={item.dataUrl} alt="" /><small>{item.trigger}</small></button>
                     {/each}
                   </div>
                 {:else}
-                  <div class="settings-empty compact"><Smile size={20} /><strong>Nessuna emoticon personale</strong></div>
+                  <div class="settings-empty compact"><Smile size={20} /><strong>{$t('settings.data.emoticons.none')}</strong></div>
                 {/if}
                 {#if offeredEmoticons.length}
-                  <small class="emoji-section-label">Ricevute da salvare</small>
+                  <small class="emoji-section-label">{$t('emoji.received')}</small>
                   <div class="received-emoji-list">
                     {#each offeredEmoticons as item (item.assetId)}
-                      <div><img src={item.dataUrl} alt={item.name} /><span><strong>{item.name}</strong><small>{item.trigger}</small></span><button onclick={() => openSaveEmoticon(item)}>Salva</button></div>
+                      <div><img src={item.dataUrl} alt={item.name} /><span><strong>{item.name}</strong><small>{item.trigger}</small></span><button onclick={() => openSaveEmoticon(item)}>{$t('emoji.saveShort')}</button></div>
                     {/each}
                   </div>
                 {/if}
@@ -2460,40 +2476,40 @@
           {:else if settingsSection === 'updates'}
             <section class="settings-panel" aria-labelledby="updates-panel-title">
               <header class="settings-panel-heading">
-                <h3 id="updates-panel-title">Aggiornamenti</h3>
-                <p>msnnext controlla automaticamente le nuove versioni ogni cinque ore.</p>
+                <h3 id="updates-panel-title">{$t('settings.updates.title')}</h3>
+                <p>{$t('settings.updates.body')}</p>
               </header>
               <div class:available={!!updateCandidate} class:error={updateStatus === 'error'} class="update-status-panel">
                 <span class:spinning={updateStatus === 'checking'}>
                   {#if updateCandidate}<Download size={22} />{:else if updateStatus === 'current'}<CheckCircle2 size={22} />{:else}<RefreshCw size={22} />{/if}
                 </span>
-                <div><strong>{updateCandidate ? `msnnext ${updateCandidate.version} disponibile` : `msnnext ${appVersion}`}</strong><small>{updateMessage || 'Il controllo automatico è attivo.'}</small></div>
+                <div><strong>{updateCandidate ? $t('settings.updates.available', { version: updateCandidate.version }) : `msnnext ${appVersion}`}</strong><small>{updateMessage || $t('settings.updates.autoActive')}</small></div>
               </div>
               {#if updateStatus === 'downloading' || updateStatus === 'installing'}
-                <div class="update-progress" aria-label={`Aggiornamento al ${updateProgress}%`}><i style={`width: ${updateProgress}%`}></i></div>
+                <div class="update-progress" aria-label={$t('settings.updates.progress', { percent: updateProgress })}><i style={`width: ${updateProgress}%`}></i></div>
               {/if}
-              <div class="update-meta"><span>Versione installata<strong>{appVersion}</strong></span><span>Ultimo controllo<strong>{lastUpdateCheckLabel()}</strong></span></div>
+              <div class="update-meta"><span>{$t('settings.updates.installed')}<strong>{appVersion}</strong></span><span>{$t('settings.updates.lastCheck')}<strong>{lastUpdateCheckLabel()}</strong></span></div>
               <div class="settings-action-row update-actions">
-                <button class="secondary-button" disabled={updateStatus === 'checking' || updateStatus === 'downloading' || updateStatus === 'installing'} onclick={() => checkForUpdates(true)}><RefreshCw size={14} /> Controlla ora</button>
-                {#if updateCandidate}<button class="primary-button" disabled={updateStatus === 'downloading' || updateStatus === 'installing'} onclick={installUpdate}><Download size={14} /> {updateStatus === 'downloading' ? `Download ${updateProgress || '…'}%` : 'Scarica e installa'}</button>{/if}
+                <button class="secondary-button" disabled={updateStatus === 'checking' || updateStatus === 'downloading' || updateStatus === 'installing'} onclick={() => checkForUpdates(true)}><RefreshCw size={14} /> {$t('settings.updates.checkNow')}</button>
+                {#if updateCandidate}<button class="primary-button" disabled={updateStatus === 'downloading' || updateStatus === 'installing'} onclick={installUpdate}><Download size={14} /> {updateStatus === 'downloading' ? $t('settings.updates.download', { percent: updateProgress || '…' }) : $t('settings.updates.downloadInstall')}</button>{/if}
               </div>
             </section>
           {:else}
             <section class="settings-panel" aria-labelledby="network-panel-title">
               <header class="settings-panel-heading">
-                <h3 id="network-panel-title">Rete e sicurezza</h3>
-                <p>Il mininodo aiuta i dispositivi a trovarsi; i dati restano cifrati tra client.</p>
+                <h3 id="network-panel-title">{$t('settings.network.title')}</h3>
+                <p>{$t('settings.network.body')}</p>
               </header>
-              <label class="settings-field">Relay personalizzato<input bind:value={relayAddress} maxlength="512" placeholder="Usa il mininodo msnnext" /><small>Lascia vuoto per usare automaticamente il mininodo pubblico. Riconnettiti dopo averlo cambiato.</small></label>
-              <button class="security-settings-row" onclick={() => securityIntroOpen = true}><ShieldCheck size={19} /><span><strong>Protezione dei tuoi dati</strong><small>Cifratura, identità locale e limiti del modello di sicurezza</small></span><ExternalLink size={15} /></button>
+              <label class="settings-field">{$t('settings.network.relay')}<input bind:value={relayAddress} maxlength="512" placeholder={$t('settings.network.relayPlaceholder')} /><small>{$t('settings.network.relayHint')}</small></label>
+              <button class="security-settings-row" onclick={() => securityIntroOpen = true}><ShieldCheck size={19} /><span><strong>{$t('settings.network.security.title')}</strong><small>{$t('settings.network.security.desc')}</small></span><ExternalLink size={15} /></button>
             </section>
           {/if}
         </div>
       </div>
 
       <footer class="settings-footer">
-        <small>Le modifiche al tema e al testo sono visibili subito.</small>
-        <div><button class="secondary-button" onclick={() => profileOpen = false}>Annulla</button><button class="primary-button" disabled={!displayName.trim()} onclick={() => saveProfile()}>Salva modifiche</button></div>
+        <small>{$t('settings.footer.note')}</small>
+        <div><button class="secondary-button" onclick={() => profileOpen = false}>{$t('settings.footer.cancel')}</button><button class="primary-button" disabled={!displayName.trim()} onclick={() => saveProfile()}>{$t('settings.footer.save')}</button></div>
       </footer>
     </div>
   </div>
@@ -2502,29 +2518,29 @@
 {#if devicePairingOpen}
   <div class="modal-backdrop">
     <div class="modal device-pairing-modal" role="dialog" aria-modal="true" aria-labelledby="device-pairing-title">
-      <button type="button" class="modal-close" aria-label="Chiudi" onclick={() => devicePairingOpen = false}><X size={18} /></button>
+      <button type="button" class="modal-close" aria-label={$t('window.close')} onclick={() => devicePairingOpen = false}><X size={18} /></button>
       <div class="modal-heading">
         <span>{#if devicePairingMode === 'share'}<QrCode size={22} />{:else}<Link2 size={22} />{/if}</span>
-        <div><p class="step-label">Sincronizzazione privata</p><h2 id="device-pairing-title">{devicePairingMode === 'share' ? 'Collega un altro dispositivo' : 'Collega questo dispositivo'}</h2></div>
+        <div><p class="step-label">{$t('pairing.step')}</p><h2 id="device-pairing-title">{devicePairingMode === 'share' ? $t('pairing.shareTitle') : $t('pairing.joinTitle')}</h2></div>
       </div>
       {#if devicePairingMode === 'share'}
-        <p>Apri msnnext sull'altro dispositivo e usa questo codice entro dieci minuti. Entrambi devono restare online.</p>
+        <p>{$t('pairing.shareBody')}</p>
         {#if devicePairingQr}
-          <button class="device-pairing-qr" aria-label="Salva QR dispositivo" title="Salva QR" onclick={saveDevicePairingQr}><img src={devicePairingQr} alt="QR per collegare il dispositivo" /></button>
+          <button class="device-pairing-qr" aria-label={$t('pairing.saveQrLabel')} title={$t('pairing.saveQr')} onclick={saveDevicePairingQr}><img src={devicePairingQr} alt={$t('pairing.qrAlt')} /></button>
           <div class="device-pairing-actions">
-            <button class="secondary-button" onclick={copyDevicePairingLink}><Copy size={14} /> Copia codice</button>
-            <button class="secondary-button" onclick={saveDevicePairingQr}><Download size={14} /> Salva QR</button>
+            <button class="secondary-button" onclick={copyDevicePairingLink}><Copy size={14} /> {$t('pairing.copyCode')}</button>
+            <button class="secondary-button" onclick={saveDevicePairingQr}><Download size={14} /> {$t('pairing.saveQr')}</button>
           </div>
-          <small>Scade alle {new Date(devicePairingExpiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.</small>
+          <small>{$t('pairing.expires', { time: new Date(devicePairingExpiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) })}</small>
         {:else}
-          <div class="device-pairing-loading">Preparazione del collegamento…</div>
+          <div class="device-pairing-loading">{$t('pairing.preparing')}</div>
         {/if}
       {:else}
-        <p>Incolla il codice mostrato dal dispositivo già collegato, oppure apri un'immagine del QR.</p>
-        <label>Codice dispositivo<textarea bind:value={devicePairingLink} rows="4" spellcheck="false" placeholder="msnnext://device/…"></textarea></label>
+        <p>{$t('pairing.joinBody')}</p>
+        <label>{$t('pairing.deviceCode')}<textarea bind:value={devicePairingLink} rows="4" spellcheck="false" placeholder="msnnext://device/…"></textarea></label>
         <div class="device-pairing-actions">
-          <button class="secondary-button" disabled={devicePairingBusy} onclick={scanDevicePairingQr}><QrCode size={14} /> Apri QR</button>
-          <button class="primary-button" disabled={!devicePairingLink.trim() || devicePairingBusy} onclick={importDevicePairing}>{devicePairingBusy ? 'Collegamento…' : 'Collega'}</button>
+          <button class="secondary-button" disabled={devicePairingBusy} onclick={scanDevicePairingQr}><QrCode size={14} /> {$t('pairing.openQr')}</button>
+          <button class="primary-button" disabled={!devicePairingLink.trim() || devicePairingBusy} onclick={importDevicePairing}>{devicePairingBusy ? $t('pairing.linking') : $t('pairing.link')}</button>
         </div>
       {/if}
     </div>
@@ -2534,17 +2550,17 @@
 {#if accountBackupOpen}
   <div class="modal-backdrop">
     <div class="modal account-backup-modal" role="dialog" aria-modal="true" aria-labelledby="account-backup-title">
-      <button type="button" class="modal-close" aria-label="Chiudi" onclick={() => accountBackupOpen = false}><X size={18} /></button>
+      <button type="button" class="modal-close" aria-label={$t('window.close')} onclick={() => accountBackupOpen = false}><X size={18} /></button>
       <form onsubmit={(event) => { event.preventDefault(); void submitAccountBackup() }}>
         <div class="modal-heading">
           <span>{#if accountBackupMode === 'export'}<Download size={22} />{:else}<Upload size={22} />{/if}</span>
-          <div><p class="step-label">Account msnnext</p><h2 id="account-backup-title">{accountBackupMode === 'export' ? 'Proteggi il backup' : 'Ripristina il tuo account'}</h2></div>
+          <div><p class="step-label">{$t('backup.step')}</p><h2 id="account-backup-title">{accountBackupMode === 'export' ? $t('backup.exportTitle') : $t('backup.importTitle')}</h2></div>
         </div>
-        <p>{accountBackupMode === 'export' ? 'Identità, contatti e cronologia saranno cifrati. Scegli una password da usare sul nuovo PC.' : 'Inserisci la password per ripristinare identità, contatti e cronologia.'}</p>
-        <label>Password<input type="password" bind:value={accountBackupPassword} minlength="12" autocomplete={accountBackupMode === 'export' ? 'new-password' : 'current-password'} /></label>
-        <small>Almeno 12 caratteri. La password non può essere recuperata.</small>
+        <p>{accountBackupMode === 'export' ? $t('backup.exportBody') : $t('backup.importBody')}</p>
+        <label>{$t('backup.password')}<input type="password" bind:value={accountBackupPassword} minlength="12" autocomplete={accountBackupMode === 'export' ? 'new-password' : 'current-password'} /></label>
+        <small>{$t('backup.passwordHint')}</small>
         <button class="primary-button wide" disabled={accountBackupPassword.length < 12 || accountBackupBusy}>
-          {accountBackupBusy ? 'Attendi…' : accountBackupMode === 'export' ? 'Crea backup cifrato' : 'Ripristina account'}
+          {accountBackupBusy ? $t('backup.wait') : accountBackupMode === 'export' ? $t('backup.createEncrypted') : $t('backup.restore')}
         </button>
       </form>
     </div>
@@ -2556,16 +2572,16 @@
     <div class="modal security-intro-modal" role="dialog" aria-modal="true" aria-labelledby="security-intro-title">
       <div class="modal-heading">
         <span><ShieldCheck size={24} /></span>
-        <div><p class="step-label">Prima di iniziare</p><h2 id="security-intro-title">Quanto è sicuro msnnext?</h2></div>
+        <div><p class="step-label">{$t('security.step')}</p><h2 id="security-intro-title">{$t('security.title')}</h2></div>
       </div>
-      <p class="security-intro-lead">È progettato per proteggere conversazioni e file senza affidarli a un server centrale.</p>
+      <p class="security-intro-lead">{$t('security.lead')}</p>
       <ul class="security-intro-list">
-        <li><LockKeyhole size={18} /><span><strong>Cifratura tra dispositivi</strong><small>Messaggi, trilli e file sono cifrati con XChaCha20-Poly1305; eventuali nodi di inoltro non possono leggerne il contenuto.</small></span></li>
-        <li><Sparkles size={18} /><span><strong>Protezione ibrida post-quantum</strong><small>Lo scambio delle chiavi combina X25519 e ML-KEM-768: se una delle due protezioni resta sicura, la sessione resta protetta.</small></span></li>
-        <li><ShieldCheck size={18} /><span><strong>Dati locali protetti</strong><small>Cronologia e allegati ricevuti sono cifrati sul dispositivo; la chiave d’identità è custodita dal sistema operativo.</small></span></li>
+        <li><LockKeyhole size={18} /><span><strong>{$t('security.item1.title')}</strong><small>{$t('security.item1.desc')}</small></span></li>
+        <li><Sparkles size={18} /><span><strong>{$t('security.item2.title')}</strong><small>{$t('security.item2.desc')}</small></span></li>
+        <li><ShieldCheck size={18} /><span><strong>{$t('security.item3.title')}</strong><small>{$t('security.item3.desc')}</small></span></li>
       </ul>
-      <div class="security-caveat"><Info size={16} /><p><strong>Nessun software è sicuro al 100%.</strong> L’indirizzo IP e gli orari delle connessioni possono essere visibili ai partecipanti; questa versione è ancora in sviluppo e non ha ricevuto un audit indipendente.</p></div>
-      <button class="primary-button wide" onclick={closeSecurityIntro}>Ho capito, iniziamo</button>
+      <div class="security-caveat"><Info size={16} /><p><strong>{$t('security.caveatTitle')}</strong> {$t('security.caveatBody')}</p></div>
+      <button class="primary-button wide" onclick={closeSecurityIntro}>{$t('security.gotIt')}</button>
     </div>
   </div>
 {/if}

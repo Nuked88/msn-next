@@ -1,4 +1,6 @@
 param(
+    [ValidateSet('major','minor','patch','keep','')]
+    [string]$Bump = '',
     [switch]$SkipInstall,
     [switch]$Msi
 )
@@ -12,6 +14,9 @@ try {
         npm ci
         if ($LASTEXITCODE) { throw "npm ci non riuscito" }
     }
+    $bumpScript = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\bump-version.mjs'
+    if ($Bump) { node $bumpScript $Bump } else { node $bumpScript }
+    if ($LASTEXITCODE) { throw "bump versione non riuscito" }
     npm run check
     if ($LASTEXITCODE) { throw "controlli non riusciti" }
     npm run release:windows

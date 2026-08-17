@@ -32,7 +32,7 @@ jobs:
             os: macos-latest
             artifact: macos-universal
             rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
-            bundles: --target universal-apple-darwin --bundles dmg
+            bundles: --target universal-apple-darwin --bundles app,dmg
             files: target/universal-apple-darwin/release/bundle/dmg/*.dmg
 
     runs-on: ${{ matrix.os }}
