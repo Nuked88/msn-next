@@ -165,7 +165,7 @@
   "setup.connecting": "Connecting…",
   "setup.goOnline": "Go online",
   "setup.restore": "Restore an existing account",
-  "setup.foot": "On the same network friends are found automatically.",
+  "setup.foot": "On the same network your saved contacts reconnect automatically.",
   "connect.step": "Add a contact",
   "connect.title": "Find a friend",
   "connect.body": "Share your QR, or use the one you received.",

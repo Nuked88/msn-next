@@ -2630,10 +2630,14 @@ pub async fn run(
                         swarm.behaviour_mut().kad.add_address(&peer_id, base.clone());
                         let is_device = known_devices.contains_key(&peer_id)
                             || pending_pair_targets.contains_key(&peer_id);
+                        // Privacy: sulla LAN ci si connette solo ai device in
+                        // pairing e ai contatti GIÀ noti. Mai auto-aggiungere o
+                        // dialare uno sconosciuto trovato via mDNS: la presence
+                        // scambiata lo trasformerebbe in contatto senza consenso.
                         if !args.relay_server
                             && peer_id != local_peer_id
                             && !infrastructure_peers.contains(&peer_id)
-                            && (is_device || !ignored_contacts.contains(&peer_id))
+                            && (is_device || known_contacts.contains(&peer_id))
                             && if is_device {
                                 !online_devices.contains(&peer_id)
                             } else {
@@ -2641,9 +2645,6 @@ pub async fn run(
                             }
                             && mdns_dialing.insert(peer_id)
                         {
-                            if !is_device {
-                                known_contacts.insert(peer_id);
-                            }
                             dialing.insert(peer_id);
                             println!("peer LAN trovato: {peer_id}");
                             let address = base.with(Protocol::P2p(peer_id));
