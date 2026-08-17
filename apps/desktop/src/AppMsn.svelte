@@ -224,6 +224,25 @@
     : localStorage.getItem(effectsSoundsKey) !== '0'
   $: if (typeof localStorage !== 'undefined') localStorage.setItem(effectsSoundsKey, effectsSounds ? '1' : '0')
 
+  // Auto-accept media: estensioni consentite (stringa comma/spazio separata).
+  const autoAcceptExtKey = 'msnnext-auto-accept-ext-v1'
+  let autoAcceptExtensions = typeof localStorage === 'undefined'
+    ? ''
+    : (localStorage.getItem(autoAcceptExtKey) || '')
+  function parseExtensions(value: string): string[] {
+    return value.split(/[\s,]+/).map((ext) => ext.trim().replace(/^\./, '').toLowerCase()).filter(Boolean)
+  }
+  async function applyAutoAccept() {
+    if (!isTauri()) return
+    try { await invoke('node_set_auto_accept_extensions', { extensions: parseExtensions(autoAcceptExtensions) }) }
+    catch (error) { console.warn('auto-accept non impostato', error) }
+  }
+  $: {
+    autoAcceptExtensions
+    if (typeof localStorage !== 'undefined') localStorage.setItem(autoAcceptExtKey, autoAcceptExtensions)
+    void applyAutoAccept()
+  }
+
   function loadNotificationMutes() {
     if (typeof localStorage === 'undefined') return {} as Record<string, number>
     try {
@@ -668,6 +687,7 @@
       running = true
       setupOpen = false
       if (effectsSounds) sounds.signIn()
+      void applyAutoAccept()
       return
     }
     if (event.type === 'contactUpdated') {
@@ -2544,6 +2564,10 @@
                   <button class="secondary-button" disabled={running} onclick={prepareAccountBackupImport}><Upload size={14} /> {$t('settings.data.import')}</button>
                 </div>
                 {#if running}<p class="settings-note">{$t('settings.data.offlineNote')}</p>{/if}
+              </div>
+              <div class="settings-subsection">
+                <div class="settings-subsection-heading"><span><strong>{$t('settings.autoAccept.title')}</strong><small>{$t('settings.autoAccept.desc')}</small></span><Download size={18} /></div>
+                <label class="settings-field">{$t('settings.autoAccept.label')}<input bind:value={autoAcceptExtensions} placeholder="jpg, png, gif, webp, mp4" /><small>{$t('settings.autoAccept.hint')}</small></label>
               </div>
               <div class="settings-subsection settings-emoticons-flat">
                 <div class="settings-subsection-heading">

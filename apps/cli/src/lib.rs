@@ -159,6 +159,9 @@ pub enum ClientCommand {
         peer: PeerId,
         event_id: String,
     },
+    SetAutoAcceptExtensions {
+        extensions: Vec<String>,
+    },
     SetNotificationMute {
         conversation: String,
         muted: bool,
@@ -189,6 +192,7 @@ impl ClientCommand {
             | Self::ClearConversation { peer } => Some(*peer),
             Self::CreateEmoticon { .. }
             | Self::DeleteMessageForMe { .. }
+            | Self::SetAutoAcceptExtensions { .. }
             | Self::SaveEmoticon { .. }
             | Self::UpdateEmoticon { .. }
             | Self::DeleteEmoticon { .. }
@@ -734,6 +738,8 @@ pub async fn run(
     let mut outbox = HashMap::<PeerId, VecDeque<ChatEvent>>::new();
     let mut pending_messages =
         HashMap::<request_response::OutboundRequestId, (PeerId, ChatEvent, u8)>::new();
+    // Estensioni (minuscole, senza punto) accettate automaticamente. Vuoto = off.
+    let mut auto_accept_extensions = HashSet::<String>::new();
     let mut pending_inbound_handshakes =
         HashMap::<request_response::InboundRequestId, (PeerId, SessionKey)>::new();
     let mut sessions = HashMap::<PeerId, RatchetSession>::new();
@@ -1415,7 +1421,11 @@ pub async fn run(
                     }
                     match build_manifest(&path) {
                         Ok(manifest) => {
-                            record(&history, &peer, "out", "file", &manifest.filename);
+                            // Salva anche il file inviato nel vault: così è cliccabile
+                            // e riapribile come quelli ricevuti (id in cronologia).
+                            let _ = attachment_receiver.store_local(&manifest, &path);
+                            record(&history, &peer, "out", "file", &encode_attachment(&manifest));
+                            let attachment_hex = hex_asset_id(&manifest.attachment_id);
                             if let Some(request_id) = send_event(
                                 &mut swarm,
                                 &mut sessions,
@@ -1432,7 +1442,7 @@ pub async fn run(
                                         body: manifest.filename.clone(),
                                         timestamp_ms: now_ms(),
                                         emoticons: Vec::new(),
-                                        attachment_id: None,
+                                        attachment_id: Some(attachment_hex),
                                         attachment_mime: Some(manifest.mime.clone()),
                                         event_id: None,
                                     },
@@ -1629,6 +1639,13 @@ pub async fn run(
                         Ok(None) => { let _ = events.send(ClientEvent::Error { message: "messaggio non trovato".into() }); }
                         Err(error) => { let _ = events.send(ClientEvent::Error { message: error.to_string() }); }
                     }
+                }
+                Some(ClientCommand::SetAutoAcceptExtensions { extensions }) => {
+                    auto_accept_extensions = extensions
+                        .into_iter()
+                        .map(|ext| ext.trim().trim_start_matches('.').to_ascii_lowercase())
+                        .filter(|ext| !ext.is_empty())
+                        .collect();
                 }
                 Some(ClientCommand::CreateChatGroup { name, members }) => {
                     let name = name.trim();
@@ -2220,6 +2237,29 @@ pub async fn run(
                                         &history,
                                     ) {
                                         Ok(Some((manifest, group_id))) => {
+                                            if extension_auto_accepted(&manifest.filename, &auto_accept_extensions) {
+                                                // Estensione consentita: accetta senza chiedere.
+                                                let client_event = client_event_from_chat(peer, &envelope.event, "in", true, peer_names.get(&peer).map(String::as_str));
+                                                let resp = receive_event(peer, &envelope.event, &mut Incoming {
+                                                    pending_emoticons: &mut pending_emoticons,
+                                                    events: &events,
+                                                    nudge_limits: &mut incoming_nudge_limits,
+                                                    attachments: &mut attachment_receiver,
+                                                    history: &history,
+                                                    notifications: args.notifications,
+                                                    notification_mutes: &notification_mutes,
+                                                    peer_names: &mut peer_names,
+                                                    local_peer_id,
+                                                    incoming_attachments: &mut incoming_attachments,
+                                                });
+                                                if !matches!(&resp, ProtocolResponse::Rejected(_)) {
+                                                    if let Some(event) = client_event {
+                                                        let _ = events.send(event);
+                                                    }
+                                                }
+                                                swarm.behaviour_mut().secure_chat.send_response(channel, resp).ok();
+                                                continue;
+                                            }
                                             if pending_inbound_offers.len() >= MAX_PENDING_INBOUND_OFFERS {
                                                 swarm.behaviour_mut().secure_chat.send_response(
                                                     channel,
@@ -4022,6 +4062,16 @@ fn admin_group_update_allowed(
         && definition.owner_peer == existing.owner_peer
         && definition.members == existing.members
         && definition.admins == existing.admins
+}
+
+fn extension_auto_accepted(filename: &str, allowed: &HashSet<String>) -> bool {
+    if allowed.is_empty() {
+        return false;
+    }
+    filename
+        .rsplit_once('.')
+        .map(|(_, ext)| !ext.is_empty() && allowed.contains(&ext.to_ascii_lowercase()))
+        .unwrap_or(false)
 }
 
 fn parse_message_id(hex: &str) -> Option<[u8; 16]> {
