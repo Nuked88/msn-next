@@ -459,6 +459,72 @@ button:disabled {
   background: var(--green);
 }
 
+.avatar-shell > i[data-status="busy"] { background: #d64545; }
+.avatar-shell > i[data-status="away"] { background: #e0a83e; }
+
+/* Trigger stato sul profilo: pulsante trasparente che occupa la riga profilo. */
+.profile-status-trigger {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  text-align: left;
+  color: inherit;
+  cursor: pointer;
+}
+
+.profile-status-trigger > svg { flex: 0 0 auto; opacity: 0.6; }
+.profile-status-trigger:hover > svg { opacity: 1; }
+
+.status-menu {
+  position: absolute;
+  z-index: 40;
+  left: 13px;
+  top: 78px;
+  min-width: 190px;
+  display: flex;
+  flex-direction: column;
+  padding: 5px;
+  border: 1px solid var(--selected-border);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  box-shadow: var(--shadow);
+  animation: panel-in 150ms ease-out both;
+}
+
+.status-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: var(--text-strong);
+  font-size: 0.6875rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.status-menu button:hover { background: var(--selected); }
+.status-menu .danger-item { color: #d64545; }
+.status-sep { height: 1px; margin: 4px 2px; background: var(--line); }
+
+.status-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: var(--faint);
+}
+.status-dot[data-status="online"] { background: var(--green); }
+.status-dot[data-status="busy"] { background: #d64545; }
+.status-dot[data-status="away"] { background: #e0a83e; }
+
 .avatar-shell.me {
   width: 49px;
   height: 49px;

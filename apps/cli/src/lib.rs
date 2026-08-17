@@ -162,6 +162,9 @@ pub enum ClientCommand {
     SetAutoAcceptExtensions {
         extensions: Vec<String>,
     },
+    SetPresenceStatus {
+        status: String,
+    },
     SetNotificationMute {
         conversation: String,
         muted: bool,
@@ -193,6 +196,7 @@ impl ClientCommand {
             Self::CreateEmoticon { .. }
             | Self::DeleteMessageForMe { .. }
             | Self::SetAutoAcceptExtensions { .. }
+            | Self::SetPresenceStatus { .. }
             | Self::SaveEmoticon { .. }
             | Self::UpdateEmoticon { .. }
             | Self::DeleteEmoticon { .. }
@@ -359,6 +363,10 @@ pub enum ClientEvent {
     MessageDeleted {
         peer_id: String,
         event_id: String,
+    },
+    ContactStatus {
+        peer_id: String,
+        status: String,
     },
     ConversationLoaded {
         peer_id: String,
@@ -740,6 +748,8 @@ pub async fn run(
         HashMap::<request_response::OutboundRequestId, (PeerId, ChatEvent, u8)>::new();
     // Estensioni (minuscole, senza punto) accettate automaticamente. Vuoto = off.
     let mut auto_accept_extensions = HashSet::<String>::new();
+    // Stato di presenza comunicato ai contatti: "online" | "busy" | "away".
+    let mut presence_status = String::from("online");
     let mut pending_inbound_handshakes =
         HashMap::<request_response::InboundRequestId, (PeerId, SessionKey)>::new();
     let mut sessions = HashMap::<PeerId, RatchetSession>::new();
@@ -1234,7 +1244,7 @@ pub async fn run(
                             &peers,
                             local_peer_id,
                             &mut sent_numbers,
-                            ChatEvent::Presence(PresenceUpdate { display_name: display_name.clone(), online: true }),
+                            ChatEvent::Presence(PresenceUpdate { display_name: display_name.clone(), online: true, status: presence_status.clone() }),
                         );
                     }
                 }
@@ -1596,7 +1606,7 @@ pub async fn run(
                         }});
                         // Ricambia la presence e avvia il canale cifrato.
                         send_event(&mut swarm, &mut sessions, peer, local_peer_id, &mut sent_numbers,
-                            ChatEvent::Presence(PresenceUpdate { display_name: display_name.clone(), online: true }));
+                            ChatEvent::Presence(PresenceUpdate { display_name: display_name.clone(), online: true, status: presence_status.clone() }));
                         maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
                     }
                 }
@@ -1646,6 +1656,20 @@ pub async fn run(
                         .map(|ext| ext.trim().trim_start_matches('.').to_ascii_lowercase())
                         .filter(|ext| !ext.is_empty())
                         .collect();
+                }
+                Some(ClientCommand::SetPresenceStatus { status }) => {
+                    presence_status = match status.as_str() {
+                        "busy" | "away" => status,
+                        _ => "online".to_string(),
+                    };
+                    let update = PresenceUpdate {
+                        display_name: display_name.clone(),
+                        online: true,
+                        status: presence_status.clone(),
+                    };
+                    for &peer in &peers {
+                        send_event(&mut swarm, &mut sessions, peer, local_peer_id, &mut sent_numbers, ChatEvent::Presence(update.clone()));
+                    }
                 }
                 Some(ClientCommand::CreateChatGroup { name, members }) => {
                     let name = name.trim();
@@ -2074,7 +2098,7 @@ pub async fn run(
                                 fingerprint: peer_fingerprint(peer_id),
                             },
                         });
-                        send_event(&mut swarm, &mut sessions, peer_id, local_peer_id, &mut sent_numbers, ChatEvent::Presence(PresenceUpdate { display_name: display_name.clone(), online: true }));
+                        send_event(&mut swarm, &mut sessions, peer_id, local_peer_id, &mut sent_numbers, ChatEvent::Presence(PresenceUpdate { display_name: display_name.clone(), online: true, status: presence_status.clone() }));
                     }
                 }
                 SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
@@ -2180,6 +2204,7 @@ pub async fn run(
                                 {
                                     let _ = events.send(event);
                                 }
+                                emit_contact_status(&events, peer, &request.event);
                                 if should_classify_application_peer(
                                     true,
                                     infrastructure_peers.contains(&peer),
@@ -2197,6 +2222,7 @@ pub async fn run(
                                         ChatEvent::Presence(PresenceUpdate {
                                             display_name: display_name.clone(),
                                             online: true,
+                                            status: presence_status.clone(),
                                         }),
                                     );
                                 }
@@ -2328,6 +2354,7 @@ pub async fn run(
                                     if let Some(event) = client_event {
                                         let _ = events.send(event);
                                     }
+                                    emit_contact_status(&events, peer, &envelope.event);
                                     response
                                 }
                                 Err(error) => ProtocolResponse::Rejected(error.into()),
@@ -2896,6 +2923,21 @@ pub async fn run(
     }
     let _ = events.send(ClientEvent::Stopped);
     Ok(())
+}
+
+fn emit_contact_status(
+    events: &mpsc::UnboundedSender<ClientEvent>,
+    peer: PeerId,
+    event: &ChatEvent,
+) {
+    if let ChatEvent::Presence(presence) = event {
+        if !presence.status.is_empty() {
+            let _ = events.send(ClientEvent::ContactStatus {
+                peer_id: peer.to_string(),
+                status: presence.status.clone(),
+            });
+        }
+    }
 }
 
 fn client_event_from_chat(
@@ -5508,6 +5550,7 @@ mod tests {
         let presence = ChatEvent::Presence(PresenceUpdate {
             display_name: "Alice".into(),
             online: true,
+            status: String::new(),
         });
         let text = ChatEvent::Text(TextMessage {
             text: "ciao".into(),

@@ -17,6 +17,7 @@
     Activity,
     BellOff,
     CheckCircle2,
+    ChevronDown,
     Copy,
     Database,
     Download,
@@ -147,6 +148,7 @@
     | { type: 'contactUpdated'; contact: Omit<Contact, 'unread'> }
     | { type: 'contactRequest'; peerId: string; name: string }
     | { type: 'messageDeleted'; peerId: string; eventId: string }
+    | { type: 'contactStatus'; peerId: string; status: string }
     | { type: 'conversationLoaded'; peerId: string; messages: ClientMessage[] }
     | { type: 'message'; message: ClientMessage }
     | { type: 'emoticonCatalog'; emoticons: ClientEmoticon[] }
@@ -344,6 +346,12 @@
   let contactRequests: { peerId: string; name: string }[] = []
   const deleteEveryoneWindowMs = 15 * 60 * 1000
   let messageMenu: { message: ChatMessage; x: number; y: number } | null = null
+  let contactStatuses: Record<string, string> = {}
+  let presenceStatus = 'online'
+  let statusMenuOpen = false
+  // Composizione IME/tastiera mobile: alcune riportano isComposing male, così
+  // l'Invio non spediva e lasciava un a-capo. Tracciamo lo stato esplicitamente.
+  let composing = false
   let toastTimer: ReturnType<typeof setTimeout>
   let messageList: HTMLDivElement
   let messageEditor: HTMLDivElement
@@ -688,6 +696,7 @@
       setupOpen = false
       if (effectsSounds) sounds.signIn()
       void applyAutoAccept()
+      if (presenceStatus !== 'online') void invoke('node_set_presence_status', { status: presenceStatus })
       return
     }
     if (event.type === 'contactUpdated') {
@@ -703,6 +712,10 @@
     }
     if (event.type === 'messageDeleted') {
       markMessageDeleted(event.eventId)
+      return
+    }
+    if (event.type === 'contactStatus') {
+      contactStatuses = { ...contactStatuses, [event.peerId]: event.status }
       return
     }
     if (event.type === 'conversationLoaded') {
@@ -1871,6 +1884,14 @@
     catch (error) { showToast(String(error)) }
   }
 
+  async function setPresenceStatus(status: string) {
+    presenceStatus = status
+    statusMenuOpen = false
+    if (!isTauri() || !running) return
+    try { await invoke('node_set_presence_status', { status }) }
+    catch (error) { showToast(String(error)) }
+  }
+
   async function acceptContactRequest(peerId: string) {
     contactRequests = contactRequests.filter((request) => request.peerId !== peerId)
     try { await invoke('node_accept_contact_request', { peerId }) }
@@ -1930,18 +1951,35 @@
   <div class="workspace">
     <aside class="contacts-pane">
       <header class="my-profile">
-        <div class="avatar-shell me">
-          {#if avatarDataUrl}<img src={avatarDataUrl} alt="" />{:else}<span>{displayName.slice(0, 1).toUpperCase()}</span>{/if}
-          <i class:online={running}></i>
-        </div>
-        <div class="profile-copy">
-          <strong>{displayName}</strong>
-          <span>{running ? $t('profile.available') : $t('profile.offline')}</span>
-          <small>{running ? $t('profile.ready') : $t('profile.start')}</small>
-        </div>
+        <button class="profile-status-trigger" onclick={() => statusMenuOpen = !statusMenuOpen} aria-haspopup="menu" aria-expanded={statusMenuOpen}>
+          <div class="avatar-shell me" data-status={running ? presenceStatus : 'offline'}>
+            {#if avatarDataUrl}<img src={avatarDataUrl} alt="" />{:else}<span>{displayName.slice(0, 1).toUpperCase()}</span>{/if}
+            <i class:online={running} data-status={running ? presenceStatus : 'offline'}></i>
+          </div>
+          <div class="profile-copy">
+            <strong>{displayName}</strong>
+            <span>{running ? $t(`status.${presenceStatus}`) : $t('profile.offline')}</span>
+            <small>{running ? $t('profile.ready') : $t('profile.start')}</small>
+          </div>
+          <ChevronDown size={14} />
+        </button>
         <button aria-label={$t('settings.open')} title={$t('settings.open')} onclick={() => openSettings()}>
           <Settings2 size={17} />
         </button>
+        {#if statusMenuOpen}
+          <button class="context-scrim" aria-label={$t('ctx.close')} onclick={() => statusMenuOpen = false}></button>
+          <div class="status-menu" role="menu">
+            {#if running}
+              <button role="menuitem" onclick={() => setPresenceStatus('online')}><i class="status-dot" data-status="online"></i>{$t('status.online')}</button>
+              <button role="menuitem" onclick={() => setPresenceStatus('busy')}><i class="status-dot" data-status="busy"></i>{$t('status.busy')}</button>
+              <button role="menuitem" onclick={() => setPresenceStatus('away')}><i class="status-dot" data-status="away"></i>{$t('status.away')}</button>
+              <div class="status-sep"></div>
+              <button role="menuitem" class="danger-item" onclick={() => { statusMenuOpen = false; void stopNode() }}>{$t('action.disconnect')}</button>
+            {:else}
+              <button role="menuitem" onclick={() => { statusMenuOpen = false; void startNode(false) }}>{$t('action.connect')}</button>
+            {/if}
+          </div>
+        {/if}
       </header>
 
       <div class="roster-actions">
@@ -1976,7 +2014,7 @@
             >
               <span class:offline={!contact.online} class="avatar-shell contact-avatar">
                 <span>{contact.name.slice(0, 1).toUpperCase()}</span>
-                <i class:online={contact.online}></i>
+                <i class:online={contact.online} data-status={contact.online ? (contactStatuses[contact.peerId] || 'online') : 'offline'}></i>
               </span>
               <span class="contact-copy"><strong>{contact.name}</strong><small>{contactSubtitle(contact)}</small></span>
               <span class="roster-indicators">{#if isConversationMuted(peerConversationKey(contact.peerId))}<BellOff class="muted-conversation" size={13} />{/if}{#if contact.unread}<b class="unread">{contact.unread}</b>{/if}</span>
@@ -2259,8 +2297,10 @@
             oninput={syncDraft}
             onpaste={pasteDraft}
             ondrop={(event) => event.preventDefault()}
+            oncompositionstart={() => composing = true}
+            oncompositionend={() => composing = false}
             onkeydown={(event) => {
-              if (event.key === 'Enter' && !event.isComposing) {
+              if (event.key === 'Enter' && !composing && !event.isComposing) {
                 event.preventDefault()
                 if (event.shiftKey) {
                   insertAtDraftCaret('\n')

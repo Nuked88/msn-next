@@ -851,6 +851,11 @@ fn node_set_auto_accept_extensions(
 }
 
 #[tauri::command]
+fn node_set_presence_status(state: State<'_, NodeState>, status: String) -> Result<(), String> {
+    send_command(&state, ClientCommand::SetPresenceStatus { status })
+}
+
+#[tauri::command]
 fn node_clear_conversation(state: State<'_, NodeState>, peer_id: String) -> Result<(), String> {
     send_command(
         &state,
@@ -1375,6 +1380,7 @@ pub fn run() {
             node_delete_message_for_me,
             node_delete_message_for_everyone,
             node_set_auto_accept_extensions,
+            node_set_presence_status,
             node_clear_conversation,
             node_create_chat_group,
             node_moderate_group,
