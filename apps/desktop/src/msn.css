@@ -462,23 +462,9 @@ button:disabled {
 .avatar-shell > i[data-status="busy"] { background: #d64545; }
 .avatar-shell > i[data-status="away"] { background: #e0a83e; }
 
-/* Trigger stato sul profilo: pulsante trasparente che occupa la riga profilo. */
-.profile-status-trigger {
-  flex: 1 1 auto;
-  display: flex;
-  align-items: center;
-  gap: 11px;
-  min-width: 0;
-  padding: 0;
-  border: 0;
-  background: none;
-  text-align: left;
-  color: inherit;
-  cursor: pointer;
-}
-
-.profile-status-trigger > svg { flex: 0 0 auto; opacity: 0.6; }
-.profile-status-trigger:hover > svg { opacity: 1; }
+/* Caret del menu stato: eredita lo stile dei bottoni del profilo. */
+.profile-status-btn { opacity: 0.75; }
+.profile-status-btn:hover { opacity: 1; }
 
 .status-menu {
   position: absolute;
@@ -3318,7 +3304,10 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
 }
 
 @media (max-width: 720px) {
+  /* Su Android il webview non sempre espone env(safe-area-inset-top): usa un
+     minimo fisso per liberare statusbar/notch. --mobile-top = altezza titlebar. */
   .app-titlebar {
+    padding-top: max(env(safe-area-inset-top, 0px), 44px);
     padding-left: 10px;
   }
 
@@ -3334,7 +3323,7 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
   .contacts-pane {
     position: fixed;
     z-index: 35;
-    top: 42px;
+    top: calc(42px + max(env(safe-area-inset-top, 0px), 44px));
     bottom: 0;
     left: 0;
     width: min(310px, 88vw);
@@ -3349,7 +3338,7 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
   .roster-scrim {
     position: fixed;
     z-index: 34;
-    inset: 42px 0 0;
+    inset: calc(42px + max(env(safe-area-inset-top, 0px), 44px)) 0 0;
     display: block;
     border: 0;
     background: var(--scrim);

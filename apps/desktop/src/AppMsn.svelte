@@ -1951,17 +1951,17 @@
   <div class="workspace">
     <aside class="contacts-pane">
       <header class="my-profile">
-        <button class="profile-status-trigger" onclick={() => statusMenuOpen = !statusMenuOpen} aria-haspopup="menu" aria-expanded={statusMenuOpen}>
-          <div class="avatar-shell me" data-status={running ? presenceStatus : 'offline'}>
-            {#if avatarDataUrl}<img src={avatarDataUrl} alt="" />{:else}<span>{displayName.slice(0, 1).toUpperCase()}</span>{/if}
-            <i class:online={running} data-status={running ? presenceStatus : 'offline'}></i>
-          </div>
-          <div class="profile-copy">
-            <strong>{displayName}</strong>
-            <span>{running ? $t(`status.${presenceStatus}`) : $t('profile.offline')}</span>
-            <small>{running ? $t('profile.ready') : $t('profile.start')}</small>
-          </div>
-          <ChevronDown size={14} />
+        <div class="avatar-shell me" data-status={running ? presenceStatus : 'offline'}>
+          {#if avatarDataUrl}<img src={avatarDataUrl} alt="" />{:else}<span>{displayName.slice(0, 1).toUpperCase()}</span>{/if}
+          <i class:online={running} data-status={running ? presenceStatus : 'offline'}></i>
+        </div>
+        <div class="profile-copy">
+          <strong>{displayName}</strong>
+          <span>{running ? $t(`status.${presenceStatus}`) : $t('profile.offline')}</span>
+          <small>{running ? $t('profile.ready') : $t('profile.start')}</small>
+        </div>
+        <button class="profile-status-btn" onclick={() => statusMenuOpen = !statusMenuOpen} aria-haspopup="menu" aria-expanded={statusMenuOpen} aria-label={$t('status.online')} title={$t(`status.${presenceStatus}`)}>
+          <ChevronDown size={16} />
         </button>
         <button aria-label={$t('settings.open')} title={$t('settings.open')} onclick={() => openSettings()}>
           <Settings2 size={17} />
