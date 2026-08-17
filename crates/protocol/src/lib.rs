@@ -80,6 +80,10 @@ pub struct GroupAttachmentOffer {
 pub struct PresenceUpdate {
     pub display_name: String,
     pub online: bool,
+    /// Stato mostrato ai contatti: "online" | "busy" | "away". `default` per
+    /// compatibilità con i client più vecchi (che non lo inviano).
+    #[serde(default)]
+    pub status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

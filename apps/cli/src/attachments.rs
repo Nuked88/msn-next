@@ -246,6 +246,24 @@ impl Receiver {
         self.root.join(format!("{id}.vault"))
     }
 
+    /// Ingerisce nel vault un file locale (es. un allegato appena inviato) così
+    /// che possa essere riletto/esportato come quelli ricevuti.
+    pub fn store_local(
+        &mut self,
+        manifest: &AttachmentManifest,
+        path: &Path,
+    ) -> Result<(), Box<dyn Error>> {
+        let (missing, done) = self.accept_offer(manifest.clone())?;
+        if done.is_some() {
+            return Ok(());
+        }
+        for index in missing {
+            let chunk = read_chunk(path, manifest, index)?;
+            self.accept_chunk(&chunk)?;
+        }
+        Ok(())
+    }
+
     pub fn read(&self, id: &[u8; 32]) -> Result<Vec<u8>, Box<dyn Error>> {
         if let Ok(bytes) = self.read_legacy(id) {
             return Ok(bytes);

@@ -17,6 +17,7 @@
     Activity,
     BellOff,
     CheckCircle2,
+    ChevronDown,
     Copy,
     Database,
     Download,
@@ -147,6 +148,7 @@
     | { type: 'contactUpdated'; contact: Omit<Contact, 'unread'> }
     | { type: 'contactRequest'; peerId: string; name: string }
     | { type: 'messageDeleted'; peerId: string; eventId: string }
+    | { type: 'contactStatus'; peerId: string; status: string }
     | { type: 'conversationLoaded'; peerId: string; messages: ClientMessage[] }
     | { type: 'message'; message: ClientMessage }
     | { type: 'emoticonCatalog'; emoticons: ClientEmoticon[] }
@@ -223,6 +225,25 @@
     ? true
     : localStorage.getItem(effectsSoundsKey) !== '0'
   $: if (typeof localStorage !== 'undefined') localStorage.setItem(effectsSoundsKey, effectsSounds ? '1' : '0')
+
+  // Auto-accept media: estensioni consentite (stringa comma/spazio separata).
+  const autoAcceptExtKey = 'msnnext-auto-accept-ext-v1'
+  let autoAcceptExtensions = typeof localStorage === 'undefined'
+    ? ''
+    : (localStorage.getItem(autoAcceptExtKey) || '')
+  function parseExtensions(value: string): string[] {
+    return value.split(/[\s,]+/).map((ext) => ext.trim().replace(/^\./, '').toLowerCase()).filter(Boolean)
+  }
+  async function applyAutoAccept() {
+    if (!isTauri()) return
+    try { await invoke('node_set_auto_accept_extensions', { extensions: parseExtensions(autoAcceptExtensions) }) }
+    catch (error) { console.warn('auto-accept non impostato', error) }
+  }
+  $: {
+    autoAcceptExtensions
+    if (typeof localStorage !== 'undefined') localStorage.setItem(autoAcceptExtKey, autoAcceptExtensions)
+    void applyAutoAccept()
+  }
 
   function loadNotificationMutes() {
     if (typeof localStorage === 'undefined') return {} as Record<string, number>
@@ -325,6 +346,12 @@
   let contactRequests: { peerId: string; name: string }[] = []
   const deleteEveryoneWindowMs = 15 * 60 * 1000
   let messageMenu: { message: ChatMessage; x: number; y: number } | null = null
+  let contactStatuses: Record<string, string> = {}
+  let presenceStatus = 'online'
+  let statusMenuOpen = false
+  // Composizione IME/tastiera mobile: alcune riportano isComposing male, così
+  // l'Invio non spediva e lasciava un a-capo. Tracciamo lo stato esplicitamente.
+  let composing = false
   let toastTimer: ReturnType<typeof setTimeout>
   let messageList: HTMLDivElement
   let messageEditor: HTMLDivElement
@@ -408,6 +435,7 @@
         if (focused) {
           markActiveConversationRead()
           void appWindow.requestUserAttention(null)
+          if (selectedPeerId || selectedGroupId) void focusComposer()
         }
       }).then((stop) => unlistenFocus = stop)
     }
@@ -667,6 +695,8 @@
       running = true
       setupOpen = false
       if (effectsSounds) sounds.signIn()
+      void applyAutoAccept()
+      if (presenceStatus !== 'online') void invoke('node_set_presence_status', { status: presenceStatus })
       return
     }
     if (event.type === 'contactUpdated') {
@@ -682,6 +712,10 @@
     }
     if (event.type === 'messageDeleted') {
       markMessageDeleted(event.eventId)
+      return
+    }
+    if (event.type === 'contactStatus') {
+      contactStatuses = { ...contactStatuses, [event.peerId]: event.status }
       return
     }
     if (event.type === 'conversationLoaded') {
@@ -1002,6 +1036,7 @@
     if (message.kind === 'nudge' && !next.mine && !isConversationMuted(conversationKey)) {
       void shakeWindow()
       playNudgeSound()
+      if (typeof navigator !== 'undefined' && navigator.vibrate) navigator.vibrate([120, 60, 120])
     } else if (message.direction === 'in' && message.kind !== 'nudge' && effectsSounds && !isConversationMuted(conversationKey)) {
       sounds.messageIn()
     }
@@ -1016,6 +1051,13 @@
     if (!previews.length) delete pendingSentPreviews[key]
   }
 
+  async function focusComposer() {
+    await tick()
+    if (messageEditor && messageEditor.getAttribute('contenteditable') === 'true') {
+      messageEditor.focus()
+    }
+  }
+
   function selectContact(id: string) {
     selectedPeerId = id
     selectedGroupId = ''
@@ -1026,6 +1068,7 @@
       contact.peerId === id ? { ...contact, unread: 0 } : contact
     )
     scrollMessages()
+    void focusComposer()
   }
 
   function selectGroup(id: string) {
@@ -1035,6 +1078,7 @@
     rosterOpen = false
     chatGroups = chatGroups.map((group) => group.id === id ? { ...group, unread: 0 } : group)
     scrollMessages()
+    void focusComposer()
   }
 
   function senderName(message: ChatMessage) {
@@ -1840,6 +1884,14 @@
     catch (error) { showToast(String(error)) }
   }
 
+  async function setPresenceStatus(status: string) {
+    presenceStatus = status
+    statusMenuOpen = false
+    if (!isTauri() || !running) return
+    try { await invoke('node_set_presence_status', { status }) }
+    catch (error) { showToast(String(error)) }
+  }
+
   async function acceptContactRequest(peerId: string) {
     contactRequests = contactRequests.filter((request) => request.peerId !== peerId)
     try { await invoke('node_accept_contact_request', { peerId }) }
@@ -1899,18 +1951,35 @@
   <div class="workspace">
     <aside class="contacts-pane">
       <header class="my-profile">
-        <div class="avatar-shell me">
-          {#if avatarDataUrl}<img src={avatarDataUrl} alt="" />{:else}<span>{displayName.slice(0, 1).toUpperCase()}</span>{/if}
-          <i class:online={running}></i>
-        </div>
-        <div class="profile-copy">
-          <strong>{displayName}</strong>
-          <span>{running ? $t('profile.available') : $t('profile.offline')}</span>
-          <small>{running ? $t('profile.ready') : $t('profile.start')}</small>
-        </div>
+        <button class="profile-status-trigger" onclick={() => statusMenuOpen = !statusMenuOpen} aria-haspopup="menu" aria-expanded={statusMenuOpen}>
+          <div class="avatar-shell me" data-status={running ? presenceStatus : 'offline'}>
+            {#if avatarDataUrl}<img src={avatarDataUrl} alt="" />{:else}<span>{displayName.slice(0, 1).toUpperCase()}</span>{/if}
+            <i class:online={running} data-status={running ? presenceStatus : 'offline'}></i>
+          </div>
+          <div class="profile-copy">
+            <strong>{displayName}</strong>
+            <span>{running ? $t(`status.${presenceStatus}`) : $t('profile.offline')}</span>
+            <small>{running ? $t('profile.ready') : $t('profile.start')}</small>
+          </div>
+          <ChevronDown size={14} />
+        </button>
         <button aria-label={$t('settings.open')} title={$t('settings.open')} onclick={() => openSettings()}>
           <Settings2 size={17} />
         </button>
+        {#if statusMenuOpen}
+          <button class="context-scrim" aria-label={$t('ctx.close')} onclick={() => statusMenuOpen = false}></button>
+          <div class="status-menu" role="menu">
+            {#if running}
+              <button role="menuitem" onclick={() => setPresenceStatus('online')}><i class="status-dot" data-status="online"></i>{$t('status.online')}</button>
+              <button role="menuitem" onclick={() => setPresenceStatus('busy')}><i class="status-dot" data-status="busy"></i>{$t('status.busy')}</button>
+              <button role="menuitem" onclick={() => setPresenceStatus('away')}><i class="status-dot" data-status="away"></i>{$t('status.away')}</button>
+              <div class="status-sep"></div>
+              <button role="menuitem" class="danger-item" onclick={() => { statusMenuOpen = false; void stopNode() }}>{$t('action.disconnect')}</button>
+            {:else}
+              <button role="menuitem" onclick={() => { statusMenuOpen = false; void startNode(false) }}>{$t('action.connect')}</button>
+            {/if}
+          </div>
+        {/if}
       </header>
 
       <div class="roster-actions">
@@ -1945,7 +2014,7 @@
             >
               <span class:offline={!contact.online} class="avatar-shell contact-avatar">
                 <span>{contact.name.slice(0, 1).toUpperCase()}</span>
-                <i class:online={contact.online}></i>
+                <i class:online={contact.online} data-status={contact.online ? (contactStatuses[contact.peerId] || 'online') : 'offline'}></i>
               </span>
               <span class="contact-copy"><strong>{contact.name}</strong><small>{contactSubtitle(contact)}</small></span>
               <span class="roster-indicators">{#if isConversationMuted(peerConversationKey(contact.peerId))}<BellOff class="muted-conversation" size={13} />{/if}{#if contact.unread}<b class="unread">{contact.unread}</b>{/if}</span>
@@ -2027,7 +2096,7 @@
             </div>
           {:else}
             <div class="session-start"><span>{$t('msg.sessionStart')}</span></div>
-            {#each messages as message (message.id)}
+            {#each messages as message, index (message.id)}
               {#if message.kind === 'nudge'}
                 <div class="nudge-message">
                   <span><Zap size={18} /></span>
@@ -2035,9 +2104,11 @@
                   <time>{message.time}</time>
                 </div>
               {:else}
-                <article class:mine={message.mine} class:file-message={message.kind === 'file'} class:deleted={message.deleted} class="message-line" oncontextmenu={(event) => openMessageMenu(event, message)}>
+                {@const prev = messages[index - 1]}
+                {@const sameSender = !!prev && prev.kind !== 'nudge' && prev.mine === message.mine && (prev.senderPeerId || '') === (message.senderPeerId || '')}
+                <article class:mine={message.mine} class:file-message={message.kind === 'file'} class:deleted={message.deleted} class:continued={sameSender} class="message-line" oncontextmenu={(event) => openMessageMenu(event, message)}>
                   <header>
-                  <strong>{senderName(message)}</strong>
+                    {#if !sameSender}<strong>{senderName(message)}</strong>{/if}
                     <time>{message.time}</time>
                   </header>
                   {#if message.deleted}
@@ -2226,8 +2297,10 @@
             oninput={syncDraft}
             onpaste={pasteDraft}
             ondrop={(event) => event.preventDefault()}
+            oncompositionstart={() => composing = true}
+            oncompositionend={() => composing = false}
             onkeydown={(event) => {
-              if (event.key === 'Enter' && !event.isComposing) {
+              if (event.key === 'Enter' && !composing && !event.isComposing) {
                 event.preventDefault()
                 if (event.shiftKey) {
                   insertAtDraftCaret('\n')
@@ -2531,6 +2604,10 @@
                   <button class="secondary-button" disabled={running} onclick={prepareAccountBackupImport}><Upload size={14} /> {$t('settings.data.import')}</button>
                 </div>
                 {#if running}<p class="settings-note">{$t('settings.data.offlineNote')}</p>{/if}
+              </div>
+              <div class="settings-subsection">
+                <div class="settings-subsection-heading"><span><strong>{$t('settings.autoAccept.title')}</strong><small>{$t('settings.autoAccept.desc')}</small></span><Download size={18} /></div>
+                <label class="settings-field">{$t('settings.autoAccept.label')}<input bind:value={autoAcceptExtensions} placeholder="jpg, png, gif, webp, mp4" /><small>{$t('settings.autoAccept.hint')}</small></label>
               </div>
               <div class="settings-subsection settings-emoticons-flat">
                 <div class="settings-subsection-heading">

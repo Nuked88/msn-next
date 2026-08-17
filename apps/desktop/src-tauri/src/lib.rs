@@ -18,10 +18,12 @@ use chacha20poly1305::{
 };
 use msnnext_core::{ClientCommand, ClientConfig, ClientEvent, GroupModeration};
 use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
+#[cfg(desktop)]
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, RunEvent, State, WindowEvent,
+    WindowEvent,
 };
 use tokio::sync::mpsc;
 
@@ -140,18 +142,55 @@ fn parse_peer(value: &str) -> Result<libp2p_identity::PeerId, String> {
     msnnext_core::parse_peer_id(value)
 }
 
-fn desktop_identity(data_dir: &Path) -> Result<StoredIdentity, String> {
+// Secret storage is per-platform: OS keychain on desktop, app-private file on
+// mobile (Android sandboxes app storage; not yet Keystore-encrypted — Phase 1).
+#[cfg(desktop)]
+fn load_identity_secret(_data_dir: &Path) -> Result<Option<Vec<u8>>, String> {
+    match identity_entry()?.get_secret() {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(format!("failed to read keystore: {error}")),
+    }
+}
+
+#[cfg(desktop)]
+fn save_identity_secret(_data_dir: &Path, bytes: &[u8]) -> Result<(), String> {
     let entry = identity_entry()?;
+    entry
+        .set_secret(bytes)
+        .map_err(|error| format!("failed to save to keystore: {error}"))?;
+    if entry.get_secret().map_err(|error| error.to_string())? != bytes {
+        return Err("keystore verification failed".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(desktop))]
+fn load_identity_secret(data_dir: &Path) -> Result<Option<Vec<u8>>, String> {
+    let path = data_dir.join("identity.v1.json");
+    if path.exists() {
+        Ok(Some(std::fs::read(path).map_err(|error| error.to_string())?))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(not(desktop))]
+fn save_identity_secret(data_dir: &Path, bytes: &[u8]) -> Result<(), String> {
+    // ponytail: mobile secret sits unencrypted in app-private storage; wrap it
+    // with an Android Keystore-held key in Phase 1.
+    std::fs::write(data_dir.join("identity.v1.json"), bytes).map_err(|error| error.to_string())
+}
+
+fn desktop_identity(data_dir: &Path) -> Result<StoredIdentity, String> {
     let legacy_path = data_dir.join("identity.key");
-    let identity = match entry.get_secret() {
-        Ok(bytes) => match serde_json::from_slice::<StoredIdentity>(&bytes) {
+    let identity = match load_identity_secret(data_dir)? {
+        Some(bytes) => match serde_json::from_slice::<StoredIdentity>(&bytes) {
             Ok(identity) if matches!(identity.version, 1 | 2) => {
                 let migrated = normalize_identity(identity);
                 let encoded = serde_json::to_vec(&migrated).map_err(|error| error.to_string())?;
                 if encoded != bytes {
-                    entry
-                        .set_secret(&encoded)
-                        .map_err(|error| format!("failed to update keystore: {error}"))?;
+                    save_identity_secret(data_dir, &encoded)?;
                 }
                 migrated
             }
@@ -164,13 +203,14 @@ fn desktop_identity(data_dir: &Path) -> Result<StoredIdentity, String> {
                     ml_dsa_seed: msnnext_core::generate_secret(),
                     account_key: Some(msnnext_core::generate_secret()),
                 };
-                entry
-                    .set_secret(&serde_json::to_vec(&identity).map_err(|error| error.to_string())?)
-                    .map_err(|error| format!("failed to update keystore: {error}"))?;
+                save_identity_secret(
+                    data_dir,
+                    &serde_json::to_vec(&identity).map_err(|error| error.to_string())?,
+                )?;
                 identity
             }
         },
-        Err(keyring::Error::NoEntry) => {
+        None => {
             let bytes = if legacy_path.exists() {
                 std::fs::read(&legacy_path).map_err(|error| error.to_string())?
             } else {
@@ -187,15 +227,9 @@ fn desktop_identity(data_dir: &Path) -> Result<StoredIdentity, String> {
                 account_key: Some(msnnext_core::generate_secret()),
             };
             let encoded = serde_json::to_vec(&identity).map_err(|error| error.to_string())?;
-            entry
-                .set_secret(&encoded)
-                .map_err(|error| format!("failed to save to keystore: {error}"))?;
-            if entry.get_secret().map_err(|error| error.to_string())? != encoded {
-                return Err("keystore verification failed".into());
-            }
+            save_identity_secret(data_dir, &encoded)?;
             identity
         }
-        Err(error) => return Err(format!("failed to read keystore: {error}")),
     };
     libp2p_identity::Keypair::from_protobuf_encoding(&identity.classic)
         .map_err(|error| format!("invalid identity in keystore: {error}"))?;
@@ -219,30 +253,19 @@ fn normalize_identity(mut identity: StoredIdentity) -> StoredIdentity {
     identity
 }
 
-fn store_account_key(account_key: [u8; 32]) -> Result<(), String> {
-    let entry = identity_entry()?;
-    let encoded = entry
-        .get_secret()
-        .map_err(|error| format!("failed to read keystore: {error}"))?;
+fn store_account_key(data_dir: &Path, account_key: [u8; 32]) -> Result<(), String> {
+    let encoded = load_identity_secret(data_dir)?
+        .ok_or_else(|| "identity not initialized".to_owned())?;
     let mut identity: StoredIdentity = serde_json::from_slice(&encoded)
         .map(normalize_identity)
         .map_err(|_| "invalid identity in keystore".to_owned())?;
     identity.account_key = Some(account_key);
     identity.version = 2;
     let encoded = serde_json::to_vec(&identity).map_err(|error| error.to_string())?;
-    entry
-        .set_secret(&encoded)
-        .map_err(|error| format!("failed to save to keystore: {error}"))?;
-    if entry
-        .get_secret()
-        .map_err(|error| format!("keystore verification failed: {error}"))?
-        != encoded
-    {
-        return Err("keystore verification failed".into());
-    }
-    Ok(())
+    save_identity_secret(data_dir, &encoded)
 }
 
+#[cfg(desktop)]
 fn identity_entry() -> Result<keyring::Entry, String> {
     keyring::Entry::new("app.msnnext.desktop", "identity-v1")
         .map_err(|error| format!("keystore unavailable: {error}"))
@@ -455,6 +478,7 @@ fn worker_is_current(current_generation: Option<u64>, worker_generation: u64) ->
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
+        #[cfg(desktop)]
         let _ = window.unminimize();
         let _ = window.set_focus();
     }
@@ -530,9 +554,12 @@ async fn node_start(
     let account_key = identity
         .account_key
         .ok_or_else(|| "account key unavailable".to_owned())?;
+    let account_key_dir = data_dir.clone();
     let client_config = ClientConfig::desktop(config.name, data_dir, config.connect, config.relay)
         .and_then(|config| config.with_identity_bytes(identity.classic, identity.ml_dsa_seed))
-        .map(|config| config.with_account_key(account_key, store_account_key))
+        .map(|config| {
+            config.with_account_key(account_key, move |key| store_account_key(&account_key_dir, key))
+        })
         .map_err(|error| error.to_string())?;
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -813,6 +840,19 @@ fn node_delete_message_for_everyone(
             event_id,
         },
     )
+}
+
+#[tauri::command]
+fn node_set_auto_accept_extensions(
+    state: State<'_, NodeState>,
+    extensions: Vec<String>,
+) -> Result<(), String> {
+    send_command(&state, ClientCommand::SetAutoAcceptExtensions { extensions })
+}
+
+#[tauri::command]
+fn node_set_presence_status(state: State<'_, NodeState>, status: String) -> Result<(), String> {
+    send_command(&state, ClientCommand::SetPresenceStatus { status })
 }
 
 #[tauri::command]
@@ -1180,7 +1220,6 @@ fn account_backup_import(
         return Ok(());
     }
 
-    let entry = identity_changed.then(identity_entry).transpose()?;
     let current_encoded = identity_changed
         .then(|| serde_json::to_vec(&current).map_err(|error| error.to_string()))
         .transpose()?;
@@ -1189,22 +1228,9 @@ fn account_backup_import(
         .transpose()?;
     let archived = archive_identity_data(&data_dir, identity_changed)?;
 
-    let update_result = if let (Some(entry), Some(imported_encoded)) =
-        (entry.as_ref(), imported_encoded.as_ref())
-    {
-        entry
-            .set_secret(imported_encoded)
-            .map_err(|error| format!("failed to restore keystore: {error}"))
-            .and_then(|_| {
-                entry
-                    .get_secret()
-                    .map_err(|error| format!("keystore verification failed: {error}"))
-            })
-            .and_then(|stored| {
-                (stored.as_slice() == imported_encoded.as_slice())
-                    .then_some(())
-                    .ok_or_else(|| "keystore verification failed".to_owned())
-            })
+    let update_result = if let Some(imported_encoded) = imported_encoded.as_ref() {
+        // save_identity_secret scrive e verifica sul backend della piattaforma.
+        save_identity_secret(&data_dir, imported_encoded)
     } else {
         Ok(())
     }
@@ -1225,10 +1251,9 @@ fn account_backup_import(
     });
 
     if let Err(error) = update_result {
-        let rollback_error = entry
+        let rollback_error = current_encoded
             .as_ref()
-            .zip(current_encoded.as_ref())
-            .and_then(|(entry, current)| entry.set_secret(current).err());
+            .and_then(|current| save_identity_secret(&data_dir, current).err());
         if let Some(archive) = archived.as_deref() {
             restore_archived_identity_data(archive, &data_dir);
         }
@@ -1275,7 +1300,7 @@ fn node_stop(state: State<'_, NodeState>) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .manage(NodeState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
@@ -1288,44 +1313,53 @@ pub fn run() {
                         .build(),
                 )?;
             }
-            let open = MenuItem::with_id(app, "tray-open", "Open msnnext", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "tray-quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open, &quit])?;
-            let mut tray = TrayIconBuilder::with_id("main")
-                .menu(&menu)
-                .show_menu_on_left_click(false)
-                .tooltip("msnnext")
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    "tray-open" => show_main_window(app),
-                    "tray-quit" => app.exit(0),
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if matches!(
-                        event,
-                        TrayIconEvent::Click {
-                            button: MouseButton::Left,
-                            button_state: MouseButtonState::Up,
-                            ..
+            // Tray e chiusura-in-tray sono solo desktop; su mobile non esistono.
+            #[cfg(desktop)]
+            {
+                let open =
+                    MenuItem::with_id(app, "tray-open", "Open msnnext", true, None::<&str>)?;
+                let quit = MenuItem::with_id(app, "tray-quit", "Quit", true, None::<&str>)?;
+                let menu = Menu::with_items(app, &[&open, &quit])?;
+                let mut tray = TrayIconBuilder::with_id("main")
+                    .menu(&menu)
+                    .show_menu_on_left_click(false)
+                    .tooltip("msnnext")
+                    .on_menu_event(|app, event| match event.id().as_ref() {
+                        "tray-open" => show_main_window(app),
+                        "tray-quit" => app.exit(0),
+                        _ => {}
+                    })
+                    .on_tray_icon_event(|tray, event| {
+                        if matches!(
+                            event,
+                            TrayIconEvent::Click {
+                                button: MouseButton::Left,
+                                button_state: MouseButtonState::Up,
+                                ..
+                            }
+                        ) {
+                            show_main_window(tray.app_handle());
                         }
-                    ) {
-                        show_main_window(tray.app_handle());
-                    }
-                });
-            if let Some(icon) = app.default_window_icon() {
-                tray = tray.icon(icon.clone());
-            }
-            tray.build(app)?;
-            Ok(())
-        })
-        .on_window_event(|window, event| {
-            if window.label() == "main" {
-                if let WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
-                    let _ = window.hide();
+                    });
+                if let Some(icon) = app.default_window_icon() {
+                    tray = tray.icon(icon.clone());
                 }
+                tray.build(app)?;
             }
-        })
+            Ok(())
+        });
+
+    #[cfg(desktop)]
+    let builder = builder.on_window_event(|window, event| {
+        if window.label() == "main" {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        }
+    });
+
+    builder
         .invoke_handler(tauri::generate_handler![
             node_start,
             node_send_text,
@@ -1345,6 +1379,8 @@ pub fn run() {
             node_reject_contact_request,
             node_delete_message_for_me,
             node_delete_message_for_everyone,
+            node_set_auto_accept_extensions,
+            node_set_presence_status,
             node_clear_conversation,
             node_create_chat_group,
             node_moderate_group,

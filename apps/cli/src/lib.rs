@@ -159,6 +159,12 @@ pub enum ClientCommand {
         peer: PeerId,
         event_id: String,
     },
+    SetAutoAcceptExtensions {
+        extensions: Vec<String>,
+    },
+    SetPresenceStatus {
+        status: String,
+    },
     SetNotificationMute {
         conversation: String,
         muted: bool,
@@ -189,6 +195,8 @@ impl ClientCommand {
             | Self::ClearConversation { peer } => Some(*peer),
             Self::CreateEmoticon { .. }
             | Self::DeleteMessageForMe { .. }
+            | Self::SetAutoAcceptExtensions { .. }
+            | Self::SetPresenceStatus { .. }
             | Self::SaveEmoticon { .. }
             | Self::UpdateEmoticon { .. }
             | Self::DeleteEmoticon { .. }
@@ -355,6 +363,10 @@ pub enum ClientEvent {
     MessageDeleted {
         peer_id: String,
         event_id: String,
+    },
+    ContactStatus {
+        peer_id: String,
+        status: String,
     },
     ConversationLoaded {
         peer_id: String,
@@ -729,6 +741,15 @@ pub async fn run(
         HashMap::<request_response::OutboundRequestId, PendingTransfer>::new();
     let mut pending_handshakes =
         HashMap::<request_response::OutboundRequestId, (PeerId, HybridInitiator)>::new();
+    // Affidabilità messaggi: coda per-peer quando la sessione non è pronta, e
+    // tracciamento (peer, evento, tentativi) per il retry sui fallimenti.
+    let mut outbox = HashMap::<PeerId, VecDeque<ChatEvent>>::new();
+    let mut pending_messages =
+        HashMap::<request_response::OutboundRequestId, (PeerId, ChatEvent, u8)>::new();
+    // Estensioni (minuscole, senza punto) accettate automaticamente. Vuoto = off.
+    let mut auto_accept_extensions = HashSet::<String>::new();
+    // Stato di presenza comunicato ai contatti: "online" | "busy" | "away".
+    let mut presence_status = String::from("online");
     let mut pending_inbound_handshakes =
         HashMap::<request_response::InboundRequestId, (PeerId, SessionKey)>::new();
     let mut sessions = HashMap::<PeerId, RatchetSession>::new();
@@ -1223,7 +1244,7 @@ pub async fn run(
                             &peers,
                             local_peer_id,
                             &mut sent_numbers,
-                            ChatEvent::Presence(PresenceUpdate { display_name: display_name.clone(), online: true }),
+                            ChatEvent::Presence(PresenceUpdate { display_name: display_name.clone(), online: true, status: presence_status.clone() }),
                         );
                     }
                 }
@@ -1322,30 +1343,37 @@ pub async fn run(
                     };
                     let client_emoticons = client_emoticon_spans(&message);
                     let event = ChatEvent::Text(message.clone());
-                    if send_event(
-                        &mut swarm,
-                        &mut sessions,
-                        peer,
-                        local_peer_id,
-                        &mut sent_numbers,
-                        event,
-                    ).is_some() {
-                        let timestamp_ms = now_ms();
-                        record_text(&history, &peer, "out", &message);
-                        let _ = events.send(ClientEvent::Message {
-                            message: ClientMessage {
-                                peer_id: peer.to_string(),
-                                direction: "out".into(),
-                                kind: "text".into(),
-                                body: text,
-                                timestamp_ms,
-                                emoticons: client_emoticons,
-                                attachment_id: None,
-                                attachment_mime: None,
-                                event_id: Some(hex_group_id(&message_id)),
-                            },
-                        });
+                    // Affidabilità: se la sessione cifrata è pronta invia e traccia
+                    // per il retry; altrimenti accoda e avvia l'handshake — il
+                    // messaggio parte al completamento (niente drop silenziosi).
+                    if sessions.contains_key(&peer) {
+                        match send_event(&mut swarm, &mut sessions, peer, local_peer_id, &mut sent_numbers, event.clone()) {
+                            Some(request_id) => {
+                                pending_messages.insert(request_id, (peer, event, 0));
+                            }
+                            None => {
+                                outbox.entry(peer).or_default().push_back(event);
+                            }
+                        }
+                    } else {
+                        outbox.entry(peer).or_default().push_back(event);
+                        maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
                     }
+                    let timestamp_ms = now_ms();
+                    record_text(&history, &peer, "out", &message);
+                    let _ = events.send(ClientEvent::Message {
+                        message: ClientMessage {
+                            peer_id: peer.to_string(),
+                            direction: "out".into(),
+                            kind: "text".into(),
+                            body: text,
+                            timestamp_ms,
+                            emoticons: client_emoticons,
+                            attachment_id: None,
+                            attachment_mime: None,
+                            event_id: Some(hex_group_id(&message_id)),
+                        },
+                    });
                 }
                 Some(ClientCommand::SendNudge { peer }) => {
                     nudge_counter += 1;
@@ -1403,7 +1431,11 @@ pub async fn run(
                     }
                     match build_manifest(&path) {
                         Ok(manifest) => {
-                            record(&history, &peer, "out", "file", &manifest.filename);
+                            // Salva anche il file inviato nel vault: così è cliccabile
+                            // e riapribile come quelli ricevuti (id in cronologia).
+                            let _ = attachment_receiver.store_local(&manifest, &path);
+                            record(&history, &peer, "out", "file", &encode_attachment(&manifest));
+                            let attachment_hex = hex_asset_id(&manifest.attachment_id);
                             if let Some(request_id) = send_event(
                                 &mut swarm,
                                 &mut sessions,
@@ -1420,7 +1452,7 @@ pub async fn run(
                                         body: manifest.filename.clone(),
                                         timestamp_ms: now_ms(),
                                         emoticons: Vec::new(),
-                                        attachment_id: None,
+                                        attachment_id: Some(attachment_hex),
                                         attachment_mime: Some(manifest.mime.clone()),
                                         event_id: None,
                                     },
@@ -1574,7 +1606,7 @@ pub async fn run(
                         }});
                         // Ricambia la presence e avvia il canale cifrato.
                         send_event(&mut swarm, &mut sessions, peer, local_peer_id, &mut sent_numbers,
-                            ChatEvent::Presence(PresenceUpdate { display_name: display_name.clone(), online: true }));
+                            ChatEvent::Presence(PresenceUpdate { display_name: display_name.clone(), online: true, status: presence_status.clone() }));
                         maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
                     }
                 }
@@ -1616,6 +1648,27 @@ pub async fn run(
                         }
                         Ok(None) => { let _ = events.send(ClientEvent::Error { message: "messaggio non trovato".into() }); }
                         Err(error) => { let _ = events.send(ClientEvent::Error { message: error.to_string() }); }
+                    }
+                }
+                Some(ClientCommand::SetAutoAcceptExtensions { extensions }) => {
+                    auto_accept_extensions = extensions
+                        .into_iter()
+                        .map(|ext| ext.trim().trim_start_matches('.').to_ascii_lowercase())
+                        .filter(|ext| !ext.is_empty())
+                        .collect();
+                }
+                Some(ClientCommand::SetPresenceStatus { status }) => {
+                    presence_status = match status.as_str() {
+                        "busy" | "away" => status,
+                        _ => "online".to_string(),
+                    };
+                    let update = PresenceUpdate {
+                        display_name: display_name.clone(),
+                        online: true,
+                        status: presence_status.clone(),
+                    };
+                    for &peer in &peers {
+                        send_event(&mut swarm, &mut sessions, peer, local_peer_id, &mut sent_numbers, ChatEvent::Presence(update.clone()));
                     }
                 }
                 Some(ClientCommand::CreateChatGroup { name, members }) => {
@@ -2045,7 +2098,7 @@ pub async fn run(
                                 fingerprint: peer_fingerprint(peer_id),
                             },
                         });
-                        send_event(&mut swarm, &mut sessions, peer_id, local_peer_id, &mut sent_numbers, ChatEvent::Presence(PresenceUpdate { display_name: display_name.clone(), online: true }));
+                        send_event(&mut swarm, &mut sessions, peer_id, local_peer_id, &mut sent_numbers, ChatEvent::Presence(PresenceUpdate { display_name: display_name.clone(), online: true, status: presence_status.clone() }));
                     }
                 }
                 SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
@@ -2151,6 +2204,7 @@ pub async fn run(
                                 {
                                     let _ = events.send(event);
                                 }
+                                emit_contact_status(&events, peer, &request.event);
                                 if should_classify_application_peer(
                                     true,
                                     infrastructure_peers.contains(&peer),
@@ -2168,6 +2222,7 @@ pub async fn run(
                                         ChatEvent::Presence(PresenceUpdate {
                                             display_name: display_name.clone(),
                                             online: true,
+                                            status: presence_status.clone(),
                                         }),
                                     );
                                 }
@@ -2208,6 +2263,29 @@ pub async fn run(
                                         &history,
                                     ) {
                                         Ok(Some((manifest, group_id))) => {
+                                            if extension_auto_accepted(&manifest.filename, &auto_accept_extensions) {
+                                                // Estensione consentita: accetta senza chiedere.
+                                                let client_event = client_event_from_chat(peer, &envelope.event, "in", true, peer_names.get(&peer).map(String::as_str));
+                                                let resp = receive_event(peer, &envelope.event, &mut Incoming {
+                                                    pending_emoticons: &mut pending_emoticons,
+                                                    events: &events,
+                                                    nudge_limits: &mut incoming_nudge_limits,
+                                                    attachments: &mut attachment_receiver,
+                                                    history: &history,
+                                                    notifications: args.notifications,
+                                                    notification_mutes: &notification_mutes,
+                                                    peer_names: &mut peer_names,
+                                                    local_peer_id,
+                                                    incoming_attachments: &mut incoming_attachments,
+                                                });
+                                                if !matches!(&resp, ProtocolResponse::Rejected(_)) {
+                                                    if let Some(event) = client_event {
+                                                        let _ = events.send(event);
+                                                    }
+                                                }
+                                                swarm.behaviour_mut().secure_chat.send_response(channel, resp).ok();
+                                                continue;
+                                            }
                                             if pending_inbound_offers.len() >= MAX_PENDING_INBOUND_OFFERS {
                                                 swarm.behaviour_mut().secure_chat.send_response(
                                                     channel,
@@ -2276,6 +2354,7 @@ pub async fn run(
                                     if let Some(event) = client_event {
                                         let _ = events.send(event);
                                     }
+                                    emit_contact_status(&events, peer, &envelope.event);
                                     response
                                 }
                                 Err(error) => ProtocolResponse::Rejected(error.into()),
@@ -2360,6 +2439,9 @@ pub async fn run(
                                     let _ = events.send(ClientEvent::Error { message: "risposta non valida durante il trasferimento".into() });
                                 }
                             }
+                        } else {
+                            // Messaggio di testo consegnato (Ack): smetti di tracciarlo.
+                            pending_messages.remove(&request_id);
                         }
                     }
                 },
@@ -2403,6 +2485,21 @@ pub async fn run(
                         } else {
                             eprintln!("trasferimento file fallito definitivamente per {peer}: {error}");
                             let _ = events.send(ClientEvent::Error { message: format!("trasferimento file fallito: {error}") });
+                        }
+                    } else if let Some((msg_peer, event, retries)) = pending_messages.remove(&request_id) {
+                        // Retry di un messaggio di testo fallito in transito.
+                        if let Some(next) = next_request_retry(retries) {
+                            match send_event(&mut swarm, &mut sessions, msg_peer, local_peer_id, &mut sent_numbers, event.clone()) {
+                                Some(new_id) => {
+                                    pending_messages.insert(new_id, (msg_peer, event, next));
+                                }
+                                None => {
+                                    outbox.entry(msg_peer).or_default().push_back(event);
+                                }
+                            }
+                        } else {
+                            eprintln!("messaggio non consegnato definitivamente a {peer}: {error}");
+                            let _ = events.send(ClientEvent::Error { message: "un messaggio non è stato consegnato".into() });
                         }
                     } else {
                         eprintln!("invio cifrato fallito per {peer}: {error}");
@@ -2482,6 +2579,7 @@ pub async fn run(
                                         local_peer_id,
                                         peer,
                                     );
+                                    flush_outbox(&mut swarm, &mut sessions, &mut sent_numbers, &mut pending_messages, &mut outbox, local_peer_id, peer);
                                 }
                                 Err(error) => eprintln!("handshake ibrido fallito con {peer}: {error}"),
                             },
@@ -2527,6 +2625,7 @@ pub async fn run(
                                 local_peer_id,
                                 peer,
                             );
+                            flush_outbox(&mut swarm, &mut sessions, &mut sent_numbers, &mut pending_messages, &mut outbox, local_peer_id, peer);
                         }
                     }
                 }
@@ -2826,6 +2925,21 @@ pub async fn run(
     Ok(())
 }
 
+fn emit_contact_status(
+    events: &mpsc::UnboundedSender<ClientEvent>,
+    peer: PeerId,
+    event: &ChatEvent,
+) {
+    if let ChatEvent::Presence(presence) = event {
+        if !presence.status.is_empty() {
+            let _ = events.send(ClientEvent::ContactStatus {
+                peer_id: peer.to_string(),
+                status: presence.status.clone(),
+            });
+        }
+    }
+}
+
 fn client_event_from_chat(
     peer: PeerId,
     event: &ChatEvent,
@@ -3115,6 +3229,32 @@ fn broadcast(
             sent_numbers,
             event.clone(),
         );
+    }
+}
+
+// Svuota la coda dei messaggi accodati per `peer` ora che la sessione è pronta.
+#[allow(clippy::too_many_arguments)]
+fn flush_outbox(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    sessions: &mut HashMap<PeerId, RatchetSession>,
+    sent_numbers: &mut HashMap<PeerId, u64>,
+    pending_messages: &mut HashMap<request_response::OutboundRequestId, (PeerId, ChatEvent, u8)>,
+    outbox: &mut HashMap<PeerId, VecDeque<ChatEvent>>,
+    local_peer_id: PeerId,
+    peer: PeerId,
+) {
+    let Some(queue) = outbox.remove(&peer) else {
+        return;
+    };
+    for event in queue {
+        match send_event(swarm, sessions, peer, local_peer_id, sent_numbers, event.clone()) {
+            Some(request_id) => {
+                pending_messages.insert(request_id, (peer, event, 0));
+            }
+            None => {
+                outbox.entry(peer).or_default().push_back(event);
+            }
+        }
     }
 }
 
@@ -3964,6 +4104,16 @@ fn admin_group_update_allowed(
         && definition.owner_peer == existing.owner_peer
         && definition.members == existing.members
         && definition.admins == existing.admins
+}
+
+fn extension_auto_accepted(filename: &str, allowed: &HashSet<String>) -> bool {
+    if allowed.is_empty() {
+        return false;
+    }
+    filename
+        .rsplit_once('.')
+        .map(|(_, ext)| !ext.is_empty() && allowed.contains(&ext.to_ascii_lowercase()))
+        .unwrap_or(false)
 }
 
 fn parse_message_id(hex: &str) -> Option<[u8; 16]> {
@@ -5400,6 +5550,7 @@ mod tests {
         let presence = ChatEvent::Presence(PresenceUpdate {
             display_name: "Alice".into(),
             online: true,
+            status: String::new(),
         });
         let text = ChatEvent::Text(TextMessage {
             text: "ciao".into(),

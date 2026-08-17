@@ -5,3 +5,6 @@
 .DS_Store
 .superpowers/
 apps/desktop/.playwright-cli/
+
+# Tauri mobile generated projects
+apps/desktop/src-tauri/gen/
