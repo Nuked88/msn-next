@@ -52,6 +52,16 @@ pub enum SyncOperation {
         peer: String,
         changed_at_ms: u64,
     },
+    /// Cancella un singolo messaggio solo su questo account/dispositivi.
+    DeleteEvent {
+        event_id: String,
+        changed_at_ms: u64,
+    },
+    /// Segna un messaggio come eliminato "per tutti" (mostra un segnaposto).
+    TombstoneEvent {
+        event_id: String,
+        changed_at_ms: u64,
+    },
     UpsertGroup {
         group: GroupChatEntry,
         changed_at_ms: u64,
@@ -141,6 +151,11 @@ impl History {
             peer TEXT PRIMARY KEY,
             remote_seq INTEGER NOT NULL DEFAULT 0,
             sent_seq INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS deleted_events (
+            event_id TEXT PRIMARY KEY,
+            tombstone INTEGER NOT NULL,
+            changed_at_ms INTEGER NOT NULL
         );",
         )?;
         if !column_exists(&connection, "events", "event_id")? {
@@ -180,6 +195,69 @@ impl History {
         };
         self.commit_local(SyncOperation::RecordEvent(event))?;
         Ok(())
+    }
+
+    /// Come `record` ma con un `event_id` esplicito e condiviso tra i peer,
+    /// necessario per referenziare il messaggio nella cancellazione.
+    pub fn record_with_id(
+        &self,
+        event_id: &str,
+        peer: &str,
+        direction: &str,
+        kind: &str,
+        body: &str,
+        timestamp_ms: u64,
+    ) -> Result<(), Box<dyn Error>> {
+        let event = Entry {
+            event_id: event_id.to_owned(),
+            peer: peer.to_owned(),
+            direction: direction.to_owned(),
+            kind: kind.to_owned(),
+            body: body.to_owned(),
+            timestamp_ms,
+        };
+        self.commit_local(SyncOperation::RecordEvent(event))?;
+        Ok(())
+    }
+
+    /// Cancella un messaggio solo localmente (e sugli altri dispositivi propri).
+    pub fn delete_event(&self, event_id: &str, changed_at_ms: u64) -> Result<(), Box<dyn Error>> {
+        self.commit_local(SyncOperation::DeleteEvent {
+            event_id: event_id.to_owned(),
+            changed_at_ms,
+        })?;
+        Ok(())
+    }
+
+    /// Segna un messaggio come eliminato "per tutti" (segnaposto su entrambi).
+    pub fn tombstone_event(&self, event_id: &str, changed_at_ms: u64) -> Result<(), Box<dyn Error>> {
+        self.commit_local(SyncOperation::TombstoneEvent {
+            event_id: event_id.to_owned(),
+            changed_at_ms,
+        })?;
+        Ok(())
+    }
+
+    /// Metadati di un messaggio per validare una cancellazione in ingresso:
+    /// `(peer, direction, timestamp_ms)`.
+    pub fn event_meta(
+        &self,
+        event_id: &str,
+    ) -> Result<Option<(String, String, u64)>, Box<dyn Error>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT peer, direction, timestamp_ms FROM events WHERE event_id = ?1",
+                [event_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u64>(2)?,
+                    ))
+                },
+            )
+            .optional()?)
     }
 
     pub fn latest(&self, limit: usize) -> Result<Vec<Entry>, Box<dyn Error>> {
@@ -522,7 +600,10 @@ impl History {
             if self.apply_operation(&record.op_id, &record.operation)? {
                 result.applied += 1;
                 match record.operation {
-                    SyncOperation::RecordEvent(_) | SyncOperation::ClearConversation { .. } => {
+                    SyncOperation::RecordEvent(_)
+                    | SyncOperation::ClearConversation { .. }
+                    | SyncOperation::DeleteEvent { .. }
+                    | SyncOperation::TombstoneEvent { .. } => {
                         result.conversations_changed = true;
                     }
                     SyncOperation::UpsertContact { .. } | SyncOperation::DeleteContact { .. } => {
@@ -571,18 +652,69 @@ impl History {
                 if cleared_at.is_some_and(|(timestamp, _)| timestamp >= event.timestamp_ms) {
                     return Ok(false);
                 }
+                // Un messaggio già cancellato non deve "resuscitare" via sync.
+                let deleted: Option<i64> = self
+                    .connection
+                    .query_row(
+                        "SELECT tombstone FROM deleted_events WHERE event_id = ?1",
+                        [&event.event_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match deleted {
+                    Some(0) => return Ok(false),
+                    Some(_) => self.connection.execute(
+                        "INSERT OR IGNORE INTO events (event_id, peer, direction, kind, body, timestamp_ms)
+                         VALUES (?1, ?2, ?3, 'deleted', ?4, ?5)",
+                        params![
+                            event.event_id,
+                            event.peer,
+                            event.direction,
+                            self.seal(b"")?,
+                            event.timestamp_ms,
+                        ],
+                    )? > 0,
+                    None => self.connection.execute(
+                        "INSERT OR IGNORE INTO events (event_id, peer, direction, kind, body, timestamp_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            event.event_id,
+                            event.peer,
+                            event.direction,
+                            event.kind,
+                            self.seal(event.body.as_bytes())?,
+                            event.timestamp_ms,
+                        ],
+                    )? > 0,
+                }
+            }
+            SyncOperation::DeleteEvent {
+                event_id,
+                changed_at_ms,
+            } => {
+                self.connection
+                    .execute("DELETE FROM events WHERE event_id = ?1", [event_id])?;
                 self.connection.execute(
-                    "INSERT OR IGNORE INTO events (event_id, peer, direction, kind, body, timestamp_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        event.event_id,
-                        event.peer,
-                        event.direction,
-                        event.kind,
-                        self.seal(event.body.as_bytes())?,
-                        event.timestamp_ms,
-                    ],
-                )? > 0
+                    "INSERT INTO deleted_events (event_id, tombstone, changed_at_ms) VALUES (?1, 0, ?2)
+                     ON CONFLICT(event_id) DO UPDATE SET tombstone = 0, changed_at_ms = ?2",
+                    params![event_id, changed_at_ms],
+                )?;
+                true
+            }
+            SyncOperation::TombstoneEvent {
+                event_id,
+                changed_at_ms,
+            } => {
+                self.connection.execute(
+                    "UPDATE events SET kind = 'deleted', body = ?2 WHERE event_id = ?1",
+                    params![event_id, self.seal(b"")?],
+                )?;
+                self.connection.execute(
+                    "INSERT INTO deleted_events (event_id, tombstone, changed_at_ms) VALUES (?1, 1, ?2)
+                     ON CONFLICT(event_id) DO UPDATE SET tombstone = 1, changed_at_ms = ?2",
+                    params![event_id, changed_at_ms],
+                )?;
+                true
             }
             SyncOperation::UpsertContact {
                 contact,

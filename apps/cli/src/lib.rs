@@ -32,9 +32,9 @@ use libp2p::{
 };
 use msnnext_protocol::{
     resolve_emoticons, validate_text_message, validate_triggers, AttachmentManifest, ChatEvent,
-    Emoticon, EmoticonOffer, Envelope, GroupAttachmentOffer, GroupBan, GroupDefinition,
-    GroupTextMessage, Mime, Nudge, NudgeRateLimit, PresenceUpdate, ProtocolResponse, TextMessage,
-    Trigger, PROTOCOL_VERSION,
+    DeleteRequest, Emoticon, EmoticonOffer, Envelope, GroupAttachmentOffer, GroupBan,
+    GroupDefinition, GroupTextMessage, Mime, Nudge, NudgeRateLimit, PresenceUpdate,
+    ProtocolResponse, TextMessage, Trigger, PROTOCOL_VERSION,
 };
 use serde::Serialize;
 use std::{
@@ -152,6 +152,13 @@ pub enum ClientCommand {
     RejectContactRequest {
         peer: PeerId,
     },
+    DeleteMessageForMe {
+        event_id: String,
+    },
+    DeleteMessageForEveryone {
+        peer: PeerId,
+        event_id: String,
+    },
     SetNotificationMute {
         conversation: String,
         muted: bool,
@@ -178,8 +185,10 @@ impl ClientCommand {
             | Self::DeleteContact { peer }
             | Self::AcceptContactRequest { peer }
             | Self::RejectContactRequest { peer }
+            | Self::DeleteMessageForEveryone { peer, .. }
             | Self::ClearConversation { peer } => Some(*peer),
             Self::CreateEmoticon { .. }
+            | Self::DeleteMessageForMe { .. }
             | Self::SaveEmoticon { .. }
             | Self::UpdateEmoticon { .. }
             | Self::DeleteEmoticon { .. }
@@ -265,6 +274,10 @@ pub struct ClientMessage {
     pub emoticons: Vec<ClientEmoticonSpan>,
     pub attachment_id: Option<String>,
     pub attachment_mime: Option<String>,
+    /// Id condiviso del messaggio (per la cancellazione). `None` per eventi
+    /// legacy senza id.
+    #[serde(default)]
+    pub event_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -338,6 +351,10 @@ pub enum ClientEvent {
     ContactRequest {
         peer_id: String,
         name: String,
+    },
+    MessageDeleted {
+        peer_id: String,
+        event_id: String,
     },
     ConversationLoaded {
         peer_id: String,
@@ -805,6 +822,7 @@ pub async fn run(
                     emoticons: text.as_ref().map(client_emoticon_spans).unwrap_or_default(),
                     attachment_id: attachment.as_ref().map(|item| item.0.clone()),
                     attachment_mime: attachment.map(|item| item.1),
+                    event_id: Some(entry.event_id),
                 }
             })
             .collect();
@@ -1052,7 +1070,9 @@ pub async fn run(
                     let text = line[5..].to_owned();
                     let emoticons = resolve_emoticons(&text, &triggers)
                         .map_err(|error| format!("trigger emoticon non valido: {error:?}"))?;
-                    let message = TextMessage { text, emoticons };
+                    let mut message_id = [0u8; 16];
+                    OsRng.fill_bytes(&mut message_id);
+                    let message = TextMessage { text, emoticons, id: message_id };
                     for peer in &peers { record_text(&history, peer, "out", &message); }
                     let event = ChatEvent::Text(message);
                     broadcast(&mut swarm, &mut sessions, &peers, local_peer_id, &mut sent_numbers, event);
@@ -1293,9 +1313,12 @@ pub async fn run(
                             }
                         }
                     }
+                    let mut message_id = [0u8; 16];
+                    OsRng.fill_bytes(&mut message_id);
                     let message = TextMessage {
                         text: text.clone(),
                         emoticons,
+                        id: message_id,
                     };
                     let client_emoticons = client_emoticon_spans(&message);
                     let event = ChatEvent::Text(message.clone());
@@ -1319,6 +1342,7 @@ pub async fn run(
                                 emoticons: client_emoticons,
                                 attachment_id: None,
                                 attachment_mime: None,
+                                event_id: Some(hex_group_id(&message_id)),
                             },
                         });
                     }
@@ -1350,6 +1374,7 @@ pub async fn run(
                                         emoticons: Vec::new(),
                                         attachment_id: None,
                                         attachment_mime: None,
+                                        event_id: None,
                                     },
                                 });
                             }
@@ -1397,6 +1422,7 @@ pub async fn run(
                                         emoticons: Vec::new(),
                                         attachment_id: None,
                                         attachment_mime: Some(manifest.mime.clone()),
+                                        event_id: None,
                                     },
                                 });
                                 pending_offers.insert(request_id, PendingOffer {
@@ -1561,6 +1587,37 @@ pub async fn run(
                     let _ = swarm.disconnect_peer_id(peer);
                     let _ = events.send(ClientEvent::ContactRemoved { peer_id: peer.to_string() });
                 }
+                Some(ClientCommand::DeleteMessageForMe { event_id }) => {
+                    if let Err(error) = history.delete_event(&event_id, now_ms()) {
+                        let _ = events.send(ClientEvent::Error { message: error.to_string() });
+                    }
+                }
+                Some(ClientCommand::DeleteMessageForEveryone { peer, event_id }) => {
+                    const DELETE_WINDOW_MS: u64 = 15 * 60 * 1000;
+                    // Solo un mio messaggio (direction "out") verso questo peer e
+                    // dentro la finestra può essere cancellato per tutti.
+                    match history.event_meta(&event_id) {
+                        Ok(Some((stored_peer, direction, timestamp_ms))) => {
+                            if stored_peer != peer.to_string() || direction != "out" {
+                                let _ = events.send(ClientEvent::Error { message: "puoi cancellare per tutti solo i tuoi messaggi".into() });
+                            } else if now_ms().saturating_sub(timestamp_ms) > DELETE_WINDOW_MS {
+                                let _ = events.send(ClientEvent::Error { message: "tempo scaduto per la cancellazione per tutti".into() });
+                            } else if let Some(id) = parse_message_id(&event_id) {
+                                send_event(&mut swarm, &mut sessions, peer, local_peer_id, &mut sent_numbers,
+                                    ChatEvent::DeleteMessage(DeleteRequest { id, group_id: None }));
+                                if let Err(error) = history.tombstone_event(&event_id, now_ms()) {
+                                    let _ = events.send(ClientEvent::Error { message: error.to_string() });
+                                } else {
+                                    let _ = events.send(ClientEvent::MessageDeleted { peer_id: peer.to_string(), event_id });
+                                }
+                            } else {
+                                let _ = events.send(ClientEvent::Error { message: "id messaggio non valido".into() });
+                            }
+                        }
+                        Ok(None) => { let _ = events.send(ClientEvent::Error { message: "messaggio non trovato".into() }); }
+                        Err(error) => { let _ = events.send(ClientEvent::Error { message: error.to_string() }); }
+                    }
+                }
                 Some(ClientCommand::CreateChatGroup { name, members }) => {
                     let name = name.trim();
                     let mut members = members.into_iter().filter(|peer| *peer != local_peer_id).collect::<HashSet<_>>();
@@ -1652,7 +1709,9 @@ pub async fn run(
                         Ok(emoticons) => emoticons,
                         Err(error) => { let _ = events.send(ClientEvent::Error { message: format!("trigger emoticon non valido: {error:?}") }); continue; }
                     };
-                    let message = TextMessage { text: text.clone(), emoticons: emoticons.clone() };
+                    let mut group_message_id = [0u8; 16];
+                    OsRng.fill_bytes(&mut group_message_id);
+                    let message = TextMessage { text: text.clone(), emoticons: emoticons.clone(), id: group_message_id };
                     let group_event = ChatEvent::GroupText(GroupTextMessage {
                         group_id: parsed_id,
                         message: message.clone(),
@@ -2803,6 +2862,7 @@ fn client_event_from_chat(
                     .collect(),
                 attachment_id: None,
                 attachment_mime: None,
+                event_id: (message.id != [0u8; 16]).then(|| hex_group_id(&message.id)),
             },
         }),
         ChatEvent::Nudge(nudge) => Some(ClientEvent::Message {
@@ -2815,6 +2875,7 @@ fn client_event_from_chat(
                 emoticons: Vec::new(),
                 attachment_id: None,
                 attachment_mime: None,
+                event_id: None,
             },
         }),
         ChatEvent::AttachmentOffer(manifest) => Some(ClientEvent::Message {
@@ -2827,10 +2888,12 @@ fn client_event_from_chat(
                 emoticons: Vec::new(),
                 attachment_id: Some(hex_asset_id(&manifest.attachment_id)),
                 attachment_mime: Some(manifest.mime.clone()),
+                event_id: None,
             },
         }),
         ChatEvent::EmoticonOffer(_) => None,
         ChatEvent::AttachmentChunk(_) => None,
+        ChatEvent::DeleteMessage(_) => None,
         ChatEvent::GroupDefinition(_)
         | ChatEvent::GroupText(_)
         | ChatEvent::GroupAttachmentOffer(_) => None,
@@ -3295,6 +3358,39 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
             );
             ProtocolResponse::Ack
         }
+        ChatEvent::DeleteMessage(request) => {
+            // Cancellazione "per tutti" in ingresso. Arriva solo sul canale
+            // cifrato (il chat in chiaro accetta solo Presence), quindi è
+            // autenticata come proveniente da `peer`.
+            if request.group_id.is_some() {
+                return ProtocolResponse::Rejected("cancellazione di gruppo non supportata".into());
+            }
+            const DELETE_WINDOW_MS: u64 = 15 * 60 * 1000;
+            const DELETE_GRACE_MS: u64 = 5 * 60 * 1000;
+            let event_id = hex_group_id(&request.id);
+            match context.history.event_meta(&event_id) {
+                Ok(Some((stored_peer, direction, timestamp_ms))) => {
+                    // Solo il mittente originale può cancellare il proprio
+                    // messaggio: dev'essere uno ricevuto DA questo peer.
+                    if stored_peer != peer.to_string() || direction != "in" {
+                        return ProtocolResponse::Rejected("cancellazione non autorizzata".into());
+                    }
+                    if now_ms().saturating_sub(timestamp_ms) > DELETE_WINDOW_MS + DELETE_GRACE_MS {
+                        return ProtocolResponse::Rejected("finestra di cancellazione scaduta".into());
+                    }
+                    if let Err(error) = context.history.tombstone_event(&event_id, now_ms()) {
+                        return ProtocolResponse::Rejected(error.to_string());
+                    }
+                    let _ = context.events.send(ClientEvent::MessageDeleted {
+                        peer_id: peer.to_string(),
+                        event_id,
+                    });
+                    ProtocolResponse::Ack
+                }
+                Ok(None) => ProtocolResponse::Ack,
+                Err(error) => ProtocolResponse::Rejected(error.to_string()),
+            }
+        }
         ChatEvent::GroupDefinition(definition) => {
             let sender = peer.to_string();
             if !definition
@@ -3626,7 +3722,26 @@ fn record(history: &History, peer: &PeerId, direction: &str, kind: &str, body: &
 
 fn record_text(history: &History, peer: &PeerId, direction: &str, message: &TextMessage) {
     match encode_text_history(message) {
-        Ok(body) => record(history, peer, direction, "text", &body),
+        Ok(body) => {
+            // Usa l'id condiviso come event_id così mittente e destinatario
+            // referenziano lo stesso messaggio per la cancellazione. I messaggi
+            // legacy (id azzerato) mantengono un id casuale locale.
+            let result = if message.id == [0u8; 16] {
+                history.record(&peer.to_string(), direction, "text", &body, now_ms())
+            } else {
+                history.record_with_id(
+                    &hex_group_id(&message.id),
+                    &peer.to_string(),
+                    direction,
+                    "text",
+                    &body,
+                    now_ms(),
+                )
+            };
+            if let Err(error) = result {
+                eprintln!("cronologia non aggiornata: {error}");
+            }
+        }
         Err(error) => eprintln!("cronologia non aggiornata: {error}"),
     }
 }
@@ -3644,6 +3759,7 @@ fn decode_text_history(body: &str) -> TextMessage {
         .unwrap_or_else(|| TextMessage {
             text: body.to_owned(),
             emoticons: Vec::new(),
+            id: [0; 16],
         })
 }
 
@@ -3848,6 +3964,17 @@ fn admin_group_update_allowed(
         && definition.owner_peer == existing.owner_peer
         && definition.members == existing.members
         && definition.admins == existing.admins
+}
+
+fn parse_message_id(hex: &str) -> Option<[u8; 16]> {
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (index, slot) in out.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(hex.get(index * 2..index * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 fn hex_group_id(id: &[u8; 16]) -> String {
@@ -4070,6 +4197,7 @@ fn refresh_synced_state(
                     emoticons: text.as_ref().map(client_emoticon_spans).unwrap_or_default(),
                     attachment_id: attachment.as_ref().map(|item| item.0.clone()),
                     attachment_mime: attachment.map(|item| item.1),
+                    event_id: Some(entry.event_id),
                 }
             })
             .collect();
@@ -4701,6 +4829,7 @@ mod tests {
                 end: 8,
                 asset_id,
             }],
+            id: [0; 16],
         });
 
         let ClientEvent::Message { message } =
@@ -4781,6 +4910,7 @@ mod tests {
             event: ChatEvent::Text(TextMessage {
                 text: "ciao".into(),
                 emoticons: vec![],
+                id: [0; 16],
             }),
         };
         assert_eq!(validate_envelope(bob, alice, &envelope), Ok(()));
@@ -4950,6 +5080,7 @@ mod tests {
             event: ChatEvent::Text(TextMessage {
                 text: "segreto".into(),
                 emoticons: vec![],
+                id: [0; 16],
             }),
         };
 
@@ -5003,6 +5134,7 @@ mod tests {
                 end: 8,
                 asset_id: [4; 32],
             }],
+            id: [0; 16],
         };
 
         assert_eq!(
@@ -5272,6 +5404,7 @@ mod tests {
         let text = ChatEvent::Text(TextMessage {
             text: "ciao".into(),
             emoticons: vec![],
+            id: [0; 16],
         });
 
         assert!(event_authorizes_handshake(&presence));

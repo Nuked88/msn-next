@@ -78,6 +78,7 @@
     emoticons: ClientEmoticonSpan[]
     attachmentId?: string
     attachmentMime?: string
+    eventId?: string
   }
 
   type ClientEmoticonSpan = { start: number; end: number; assetId: string }
@@ -102,6 +103,9 @@
     attachmentMime?: string
     attachmentDataUrl?: string
     senderPeerId?: string
+    eventId?: string
+    deleted?: boolean
+    timestampMs?: number
   }
 
   type GroupChat = {
@@ -142,6 +146,7 @@
     | { type: 'started'; peerId: string; displayName: string; fingerprint: string }
     | { type: 'contactUpdated'; contact: Omit<Contact, 'unread'> }
     | { type: 'contactRequest'; peerId: string; name: string }
+    | { type: 'messageDeleted'; peerId: string; eventId: string }
     | { type: 'conversationLoaded'; peerId: string; messages: ClientMessage[] }
     | { type: 'message'; message: ClientMessage }
     | { type: 'emoticonCatalog'; emoticons: ClientEmoticon[] }
@@ -318,6 +323,8 @@
   let linkRequested = false
   let toastText = ''
   let contactRequests: { peerId: string; name: string }[] = []
+  const deleteEveryoneWindowMs = 15 * 60 * 1000
+  let messageMenu: { message: ChatMessage; x: number; y: number } | null = null
   let toastTimer: ReturnType<typeof setTimeout>
   let messageList: HTMLDivElement
   let messageEditor: HTMLDivElement
@@ -673,6 +680,10 @@
       }
       return
     }
+    if (event.type === 'messageDeleted') {
+      markMessageDeleted(event.eventId)
+      return
+    }
     if (event.type === 'conversationLoaded') {
       conversations = {
         ...conversations,
@@ -921,7 +932,7 @@
 
   function toChatMessage(message: ClientMessage): ChatMessage {
     return {
-      id: `${message.timestampMs}-${crypto.randomUUID()}`,
+      id: message.eventId || `${message.timestampMs}-${crypto.randomUUID()}`,
       kind: message.kind === 'nudge'
         ? 'nudge'
         : message.kind === 'file'
@@ -930,6 +941,9 @@
             ? 'outgoing'
             : 'incoming',
       body: message.body,
+      deleted: message.kind === 'deleted',
+      eventId: message.eventId,
+      timestampMs: message.timestampMs,
       emoticons: message.emoticons || [],
       attachmentId: message.attachmentId,
       attachmentMime: message.attachmentMime,
@@ -1781,6 +1795,51 @@
     toastTimer = setTimeout(() => toastText = '', 3200)
   }
 
+  function openMessageMenu(event: MouseEvent, message: ChatMessage) {
+    if (message.deleted || message.kind === 'nudge') return
+    event.preventDefault()
+    messageMenu = { message, x: event.clientX, y: event.clientY }
+  }
+
+  function closeMessageMenu() {
+    messageMenu = null
+  }
+
+  function canDeleteForEveryone(message: ChatMessage) {
+    return message.mine && !!message.eventId && !message.deleted
+      && (message.timestampMs === undefined || Date.now() - message.timestampMs < deleteEveryoneWindowMs)
+  }
+
+  function markMessageDeleted(eventId: string) {
+    const next: Record<string, ChatMessage[]> = {}
+    for (const [key, list] of Object.entries(conversations)) {
+      next[key] = list.map((message) => message.eventId === eventId
+        ? { ...message, deleted: true, body: '', emoticons: [], attachmentId: undefined, attachmentDataUrl: undefined }
+        : message)
+    }
+    conversations = next
+  }
+
+  async function deleteMessageForMe(message: ChatMessage) {
+    closeMessageMenu()
+    const next: Record<string, ChatMessage[]> = {}
+    for (const [key, list] of Object.entries(conversations)) {
+      next[key] = list.filter((item) => item.id !== message.id)
+    }
+    conversations = next
+    if (!message.eventId) return
+    try { await invoke('node_delete_message_for_me', { eventId: message.eventId }) }
+    catch (error) { showToast(String(error)) }
+  }
+
+  async function deleteMessageForEveryone(message: ChatMessage) {
+    closeMessageMenu()
+    if (!message.eventId || !selectedPeerId) return
+    markMessageDeleted(message.eventId)
+    try { await invoke('node_delete_message_for_everyone', { peerId: selectedPeerId, eventId: message.eventId }) }
+    catch (error) { showToast(String(error)) }
+  }
+
   async function acceptContactRequest(peerId: string) {
     contactRequests = contactRequests.filter((request) => request.peerId !== peerId)
     try { await invoke('node_accept_contact_request', { peerId }) }
@@ -1976,12 +2035,14 @@
                   <time>{message.time}</time>
                 </div>
               {:else}
-                <article class:mine={message.mine} class:file-message={message.kind === 'file'} class="message-line">
+                <article class:mine={message.mine} class:file-message={message.kind === 'file'} class:deleted={message.deleted} class="message-line" oncontextmenu={(event) => openMessageMenu(event, message)}>
                   <header>
                   <strong>{senderName(message)}</strong>
                     <time>{message.time}</time>
                   </header>
-                  {#if message.kind === 'file'}
+                  {#if message.deleted}
+                    <p class="deleted-message"><Trash2 size={13} /> {message.mine ? $t('msg.deletedByYou') : $t('msg.deletedMessage')}</p>
+                  {:else if message.kind === 'file'}
                     <button class="file-line" disabled={!message.attachmentId} onclick={() => openAttachment(message)}>
                       {#if message.attachmentDataUrl}
                         <img src={message.attachmentDataUrl} alt={message.body} />
@@ -2605,6 +2666,17 @@
       <div class="security-caveat"><Info size={16} /><p><strong>{$t('security.caveatTitle')}</strong> {$t('security.caveatBody')}</p></div>
       <button class="primary-button wide" onclick={closeSecurityIntro}>{$t('security.gotIt')}</button>
     </div>
+  </div>
+{/if}
+
+{#if messageMenu}
+  {@const menu = messageMenu}
+  <button class="context-scrim" aria-label={$t('ctx.close')} onclick={closeMessageMenu}></button>
+  <div class="contact-context-menu" style={`left:${menu.x}px;top:${menu.y}px`} role="menu">
+    <button onclick={() => deleteMessageForMe(menu.message)}>{$t('msg.deleteForMe')}</button>
+    {#if canDeleteForEveryone(menu.message)}
+      <button class="danger-item" onclick={() => deleteMessageForEveryone(menu.message)}>{$t('msg.deleteForEveryone')}</button>
+    {/if}
   </div>
 {/if}
 

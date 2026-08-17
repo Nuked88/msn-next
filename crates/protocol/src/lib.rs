@@ -27,6 +27,18 @@ pub enum ChatEvent {
     GroupAttachmentOffer(GroupAttachmentOffer),
     AttachmentChunk(AttachmentChunk),
     Presence(PresenceUpdate),
+    /// Cancellazione "per tutti": elimina il messaggio con questo id anche dal
+    /// destinatario. Solo il mittente originale può inviarla (verificato dal
+    /// destinatario) ed entro una finestra temporale.
+    DeleteMessage(DeleteRequest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteRequest {
+    pub id: [u8; 16],
+    /// `Some` se il messaggio appartiene a una chat di gruppo.
+    #[serde(default)]
+    pub group_id: Option<[u8; 16]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +116,10 @@ pub struct EmoticonOffer {
 pub struct TextMessage {
     pub text: String,
     pub emoticons: Vec<EmoticonSpan>,
+    /// Identificatore condiviso del messaggio (uguale su mittente e destinatario),
+    /// usato per la cancellazione. `default` per compatibilità con i vecchi client.
+    #[serde(default)]
+    pub id: [u8; 16],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,7 +371,8 @@ mod tests {
         assert_eq!(
             validate_text_message(&TextMessage {
                 text: text.into(),
-                emoticons: spans
+                emoticons: spans,
+                id: [0; 16],
             }),
             Ok(())
         );
@@ -370,6 +387,7 @@ mod tests {
                 end: 2,
                 asset_id: [1; 32],
             }],
+            id: [0; 16],
         };
         assert_eq!(validate_text_message(&message), Err(TextError::InvalidSpan));
     }
