@@ -135,7 +135,10 @@ button:disabled {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 0 0 15px;
+  /* Safe-area: riempi statusbar/notch con lo sfondo della titlebar (mobile).
+     Su desktop gli env() valgono 0. */
+  padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) 0
+    calc(15px + env(safe-area-inset-left, 0px));
   border-bottom: 1px solid var(--line-strong);
   color: var(--title-ink);
   background:
@@ -1167,6 +1170,15 @@ button:disabled {
   animation: message-in 180ms ease-out both;
 }
 
+/* Messaggi consecutivi dello stesso mittente: compattati, senza nick ripetuto. */
+.message-line.continued {
+  margin-top: -8px;
+}
+
+.message-line.continued header {
+  margin-bottom: 1px;
+}
+
 .message-line header {
   display: flex;
   align-items: baseline;
@@ -1520,7 +1532,9 @@ button:disabled {
 .composer-wrap {
   position: relative;
   z-index: 7;
-  padding: 0 13px 9px;
+  padding: 0 calc(13px + env(safe-area-inset-right, 0px))
+    calc(9px + env(safe-area-inset-bottom, 0px))
+    calc(13px + env(safe-area-inset-left, 0px));
   border-top: 1px solid var(--line-strong);
   background:
     linear-gradient(180deg, var(--surface-soft), var(--surface));

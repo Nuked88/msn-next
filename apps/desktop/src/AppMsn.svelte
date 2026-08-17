@@ -408,6 +408,7 @@
         if (focused) {
           markActiveConversationRead()
           void appWindow.requestUserAttention(null)
+          if (selectedPeerId || selectedGroupId) void focusComposer()
         }
       }).then((stop) => unlistenFocus = stop)
     }
@@ -1002,6 +1003,7 @@
     if (message.kind === 'nudge' && !next.mine && !isConversationMuted(conversationKey)) {
       void shakeWindow()
       playNudgeSound()
+      if (typeof navigator !== 'undefined' && navigator.vibrate) navigator.vibrate([120, 60, 120])
     } else if (message.direction === 'in' && message.kind !== 'nudge' && effectsSounds && !isConversationMuted(conversationKey)) {
       sounds.messageIn()
     }
@@ -1016,6 +1018,13 @@
     if (!previews.length) delete pendingSentPreviews[key]
   }
 
+  async function focusComposer() {
+    await tick()
+    if (messageEditor && messageEditor.getAttribute('contenteditable') === 'true') {
+      messageEditor.focus()
+    }
+  }
+
   function selectContact(id: string) {
     selectedPeerId = id
     selectedGroupId = ''
@@ -1026,6 +1035,7 @@
       contact.peerId === id ? { ...contact, unread: 0 } : contact
     )
     scrollMessages()
+    void focusComposer()
   }
 
   function selectGroup(id: string) {
@@ -1035,6 +1045,7 @@
     rosterOpen = false
     chatGroups = chatGroups.map((group) => group.id === id ? { ...group, unread: 0 } : group)
     scrollMessages()
+    void focusComposer()
   }
 
   function senderName(message: ChatMessage) {
@@ -2027,7 +2038,7 @@
             </div>
           {:else}
             <div class="session-start"><span>{$t('msg.sessionStart')}</span></div>
-            {#each messages as message (message.id)}
+            {#each messages as message, index (message.id)}
               {#if message.kind === 'nudge'}
                 <div class="nudge-message">
                   <span><Zap size={18} /></span>
@@ -2035,9 +2046,11 @@
                   <time>{message.time}</time>
                 </div>
               {:else}
-                <article class:mine={message.mine} class:file-message={message.kind === 'file'} class:deleted={message.deleted} class="message-line" oncontextmenu={(event) => openMessageMenu(event, message)}>
+                {@const prev = messages[index - 1]}
+                {@const sameSender = !!prev && prev.kind !== 'nudge' && prev.mine === message.mine && (prev.senderPeerId || '') === (message.senderPeerId || '')}
+                <article class:mine={message.mine} class:file-message={message.kind === 'file'} class:deleted={message.deleted} class:continued={sameSender} class="message-line" oncontextmenu={(event) => openMessageMenu(event, message)}>
                   <header>
-                  <strong>{senderName(message)}</strong>
+                    {#if !sameSender}<strong>{senderName(message)}</strong>{/if}
                     <time>{message.time}</time>
                   </header>
                   {#if message.deleted}
