@@ -729,6 +729,11 @@ pub async fn run(
         HashMap::<request_response::OutboundRequestId, PendingTransfer>::new();
     let mut pending_handshakes =
         HashMap::<request_response::OutboundRequestId, (PeerId, HybridInitiator)>::new();
+    // Affidabilità messaggi: coda per-peer quando la sessione non è pronta, e
+    // tracciamento (peer, evento, tentativi) per il retry sui fallimenti.
+    let mut outbox = HashMap::<PeerId, VecDeque<ChatEvent>>::new();
+    let mut pending_messages =
+        HashMap::<request_response::OutboundRequestId, (PeerId, ChatEvent, u8)>::new();
     let mut pending_inbound_handshakes =
         HashMap::<request_response::InboundRequestId, (PeerId, SessionKey)>::new();
     let mut sessions = HashMap::<PeerId, RatchetSession>::new();
@@ -1322,30 +1327,37 @@ pub async fn run(
                     };
                     let client_emoticons = client_emoticon_spans(&message);
                     let event = ChatEvent::Text(message.clone());
-                    if send_event(
-                        &mut swarm,
-                        &mut sessions,
-                        peer,
-                        local_peer_id,
-                        &mut sent_numbers,
-                        event,
-                    ).is_some() {
-                        let timestamp_ms = now_ms();
-                        record_text(&history, &peer, "out", &message);
-                        let _ = events.send(ClientEvent::Message {
-                            message: ClientMessage {
-                                peer_id: peer.to_string(),
-                                direction: "out".into(),
-                                kind: "text".into(),
-                                body: text,
-                                timestamp_ms,
-                                emoticons: client_emoticons,
-                                attachment_id: None,
-                                attachment_mime: None,
-                                event_id: Some(hex_group_id(&message_id)),
-                            },
-                        });
+                    // Affidabilità: se la sessione cifrata è pronta invia e traccia
+                    // per il retry; altrimenti accoda e avvia l'handshake — il
+                    // messaggio parte al completamento (niente drop silenziosi).
+                    if sessions.contains_key(&peer) {
+                        match send_event(&mut swarm, &mut sessions, peer, local_peer_id, &mut sent_numbers, event.clone()) {
+                            Some(request_id) => {
+                                pending_messages.insert(request_id, (peer, event, 0));
+                            }
+                            None => {
+                                outbox.entry(peer).or_default().push_back(event);
+                            }
+                        }
+                    } else {
+                        outbox.entry(peer).or_default().push_back(event);
+                        maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
                     }
+                    let timestamp_ms = now_ms();
+                    record_text(&history, &peer, "out", &message);
+                    let _ = events.send(ClientEvent::Message {
+                        message: ClientMessage {
+                            peer_id: peer.to_string(),
+                            direction: "out".into(),
+                            kind: "text".into(),
+                            body: text,
+                            timestamp_ms,
+                            emoticons: client_emoticons,
+                            attachment_id: None,
+                            attachment_mime: None,
+                            event_id: Some(hex_group_id(&message_id)),
+                        },
+                    });
                 }
                 Some(ClientCommand::SendNudge { peer }) => {
                     nudge_counter += 1;
@@ -2360,6 +2372,9 @@ pub async fn run(
                                     let _ = events.send(ClientEvent::Error { message: "risposta non valida durante il trasferimento".into() });
                                 }
                             }
+                        } else {
+                            // Messaggio di testo consegnato (Ack): smetti di tracciarlo.
+                            pending_messages.remove(&request_id);
                         }
                     }
                 },
@@ -2403,6 +2418,21 @@ pub async fn run(
                         } else {
                             eprintln!("trasferimento file fallito definitivamente per {peer}: {error}");
                             let _ = events.send(ClientEvent::Error { message: format!("trasferimento file fallito: {error}") });
+                        }
+                    } else if let Some((msg_peer, event, retries)) = pending_messages.remove(&request_id) {
+                        // Retry di un messaggio di testo fallito in transito.
+                        if let Some(next) = next_request_retry(retries) {
+                            match send_event(&mut swarm, &mut sessions, msg_peer, local_peer_id, &mut sent_numbers, event.clone()) {
+                                Some(new_id) => {
+                                    pending_messages.insert(new_id, (msg_peer, event, next));
+                                }
+                                None => {
+                                    outbox.entry(msg_peer).or_default().push_back(event);
+                                }
+                            }
+                        } else {
+                            eprintln!("messaggio non consegnato definitivamente a {peer}: {error}");
+                            let _ = events.send(ClientEvent::Error { message: "un messaggio non è stato consegnato".into() });
                         }
                     } else {
                         eprintln!("invio cifrato fallito per {peer}: {error}");
@@ -2482,6 +2512,7 @@ pub async fn run(
                                         local_peer_id,
                                         peer,
                                     );
+                                    flush_outbox(&mut swarm, &mut sessions, &mut sent_numbers, &mut pending_messages, &mut outbox, local_peer_id, peer);
                                 }
                                 Err(error) => eprintln!("handshake ibrido fallito con {peer}: {error}"),
                             },
@@ -2527,6 +2558,7 @@ pub async fn run(
                                 local_peer_id,
                                 peer,
                             );
+                            flush_outbox(&mut swarm, &mut sessions, &mut sent_numbers, &mut pending_messages, &mut outbox, local_peer_id, peer);
                         }
                     }
                 }
@@ -3115,6 +3147,32 @@ fn broadcast(
             sent_numbers,
             event.clone(),
         );
+    }
+}
+
+// Svuota la coda dei messaggi accodati per `peer` ora che la sessione è pronta.
+#[allow(clippy::too_many_arguments)]
+fn flush_outbox(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    sessions: &mut HashMap<PeerId, RatchetSession>,
+    sent_numbers: &mut HashMap<PeerId, u64>,
+    pending_messages: &mut HashMap<request_response::OutboundRequestId, (PeerId, ChatEvent, u8)>,
+    outbox: &mut HashMap<PeerId, VecDeque<ChatEvent>>,
+    local_peer_id: PeerId,
+    peer: PeerId,
+) {
+    let Some(queue) = outbox.remove(&peer) else {
+        return;
+    };
+    for event in queue {
+        match send_event(swarm, sessions, peer, local_peer_id, sent_numbers, event.clone()) {
+            Some(request_id) => {
+                pending_messages.insert(request_id, (peer, event, 0));
+            }
+            None => {
+                outbox.entry(peer).or_default().push_back(event);
+            }
+        }
     }
 }
 
