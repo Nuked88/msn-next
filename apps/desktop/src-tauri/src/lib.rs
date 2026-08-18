@@ -1303,6 +1303,7 @@ pub fn run() {
     let builder = tauri::Builder::default()
         .manage(NodeState::default())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {

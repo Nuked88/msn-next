@@ -7,6 +7,7 @@
   import { Image } from '@tauri-apps/api/image'
   import { PhysicalPosition } from '@tauri-apps/api/dpi'
   import { open, save } from '@tauri-apps/plugin-dialog'
+  import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
   import { relaunch } from '@tauri-apps/plugin-process'
   import { check, type Update } from '@tauri-apps/plugin-updater'
   import QRCode from 'qrcode'
@@ -224,6 +225,30 @@
     ? true
     : localStorage.getItem(effectsSoundsKey) !== '0'
   $: if (typeof localStorage !== 'undefined') localStorage.setItem(effectsSoundsKey, effectsSounds ? '1' : '0')
+
+  // Notifiche di sistema (desktop + Android), disabilitabili.
+  const notificationsEnabledKey = 'msnnext-notifications-v1'
+  let notificationsEnabled = typeof localStorage === 'undefined'
+    ? true
+    : localStorage.getItem(notificationsEnabledKey) !== '0'
+  $: if (typeof localStorage !== 'undefined') localStorage.setItem(notificationsEnabledKey, notificationsEnabled ? '1' : '0')
+  let notifPermissionGranted = false
+
+  async function ensureNotifPermission(): Promise<boolean> {
+    if (!isTauri()) return false
+    if (notifPermissionGranted) return true
+    try {
+      notifPermissionGranted = await isPermissionGranted()
+      if (!notifPermissionGranted) notifPermissionGranted = (await requestPermission()) === 'granted'
+    } catch { notifPermissionGranted = false }
+    return notifPermissionGranted
+  }
+
+  async function osNotify(title: string, body: string) {
+    if (!notificationsEnabled) return
+    if (!(await ensureNotifPermission())) return
+    try { sendNotification({ title, body }) } catch (error) { console.warn('notifica non inviata', error) }
+  }
 
   // Auto-accept media: estensioni consentite (stringa comma/spazio separata).
   const autoAcceptExtKey = 'msnnext-auto-accept-ext-v1'
@@ -645,9 +670,17 @@
     }
   }
 
-  function notifyTaskbar(conversation: string) {
+  function notifyTaskbar(conversation: string, title?: string, body?: string) {
     if (windowFocused || isConversationMuted(conversation)) return
     void appWindow?.requestUserAttention(UserAttentionType.Informational)
+    if (title) void osNotify(title, body || '')
+  }
+
+  function notificationPreview(kind: string, body: string): string {
+    if (kind === 'nudge') return $t('notif.nudge')
+    if (kind === 'file') return $t('notif.file')
+    const text = body.trim()
+    return text.length > 140 ? `${text.slice(0, 140)}…` : text
   }
 
   function unreadOverlayPixels(count: number) {
@@ -893,7 +926,10 @@
         chatGroups = chatGroups.map((group) => group.id === event.message.groupId
           ? { ...group, unread: group.unread + 1 }
           : group)
-        notifyTaskbar(groupConversationKey(event.message.groupId))
+        const groupName = chatGroups.find((group) => group.id === event.message.groupId)?.name || $t('notif.newMessage')
+        const author = senderName(next)
+        const preview = notificationPreview(event.message.kind, event.message.body)
+        notifyTaskbar(groupConversationKey(event.message.groupId), groupName, author ? `${author}: ${preview}` : preview)
       }
       scrollMessages()
       return
@@ -1037,7 +1073,8 @@
           ? { ...contact, unread: contact.unread + 1 }
           : contact
       )
-      notifyTaskbar(conversationKey)
+      const senderName = contacts.find((contact) => contact.peerId === message.peerId)?.name || $t('notif.newMessage')
+      notifyTaskbar(conversationKey, senderName, notificationPreview(message.kind, message.body))
     }
     if (message.kind === 'nudge' && !next.mine && !isConversationMuted(conversationKey)) {
       void shakeWindow()
@@ -2573,6 +2610,7 @@
                 <label class="settings-row"><span><strong>{$t('settings.recvImages.title')}</strong><small>{$t('settings.recvImages.desc')}</small></span><input type="checkbox" bind:checked={previewReceivedImages} /></label>
                 <label class="settings-row"><span><strong>{$t('settings.nudgeSound.title')}</strong><small>{$t('settings.nudgeSound.desc')}</small></span><input type="checkbox" bind:checked={nudgeSound} /></label>
                 <label class="settings-row"><span><strong>{$t('settings.effectsSounds.title')}</strong><small>{$t('settings.effectsSounds.desc')}</small></span><input type="checkbox" bind:checked={effectsSounds} /></label>
+                <label class="settings-row"><span><strong>{$t('settings.notifications.title')}</strong><small>{$t('settings.notifications.desc')}</small></span><input type="checkbox" bind:checked={notificationsEnabled} onchange={() => { if (notificationsEnabled) void ensureNotifPermission() }} /></label>
                 <label class="settings-row"><span><strong>{$t('settings.language.title')}</strong><small>{$t('settings.language.desc')}</small></span>
                   <select bind:value={$locale}>
                     {#each availableLocales as lang (lang.code)}<option value={lang.code}>{lang.label}</option>{/each}
