@@ -46,6 +46,13 @@ pub enum DeviceRequest {
         after_seq: u64,
         records: Vec<SyncRecord>,
     },
+    /// Chiede a un dispositivo collegato di consegnare un messaggio di testo a
+    /// un contatto che il dispositivo mittente non riesce a raggiungere.
+    RelayText {
+        target: String,
+        id: [u8; 16],
+        text: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -63,6 +70,8 @@ pub enum DeviceResponse {
         accepted_through: u64,
     },
     Rejected(String),
+    /// Esito di una richiesta RelayText: consegnato/accodato dal dispositivo.
+    RelayResult { id: [u8; 16], delivered: bool },
 }
 
 pub fn create_pairing_link(

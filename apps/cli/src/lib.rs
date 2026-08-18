@@ -286,6 +286,10 @@ pub struct ClientMessage {
     /// legacy senza id.
     #[serde(default)]
     pub event_id: Option<String>,
+    /// Vero se inviato tramite un dispositivo collegato perché il canale
+    /// cifrato diretto con il contatto non era disponibile.
+    #[serde(default)]
+    pub relayed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -510,6 +514,7 @@ struct PendingInboundOffer {
 enum PendingDeviceRequest {
     Pair { peer: PeerId, key: [u8; 32] },
     Sync { peer: PeerId },
+    Relay { peer: PeerId },
 }
 
 struct PendingPairing {
@@ -852,6 +857,7 @@ pub async fn run(
                     attachment_id: attachment.as_ref().map(|item| item.0.clone()),
                     attachment_mime: attachment.map(|item| item.1),
                     event_id: Some(entry.event_id),
+                    relayed: false,
                 }
             })
             .collect();
@@ -965,7 +971,8 @@ pub async fn run(
                     })
                     .filter(|peer| !pending_device_requests.values().any(|pending| match pending {
                         PendingDeviceRequest::Pair { peer: pending_peer, .. }
-                        | PendingDeviceRequest::Sync { peer: pending_peer } => pending_peer == peer,
+                        | PendingDeviceRequest::Sync { peer: pending_peer }
+                        | PendingDeviceRequest::Relay { peer: pending_peer } => pending_peer == peer,
                     }))
                     .collect::<Vec<_>>();
                 for peer in available {
@@ -1319,9 +1326,41 @@ pub async fn run(
                 }
                 Some(ClientCommand::SendText { peer, text }) => {
                     if !peers.contains(&peer) {
-                        let _ = events.send(ClientEvent::Error {
-                            message: "contatto non collegato".into(),
+                        // Canale diretto col contatto non disponibile: se ho un
+                        // dispositivo collegato online, gli chiedo di consegnare il
+                        // messaggio (relay). Il contatto resta comunque "non protetto"
+                        // lato UI finché il canale diretto non è stabilito.
+                        if online_devices.is_empty() {
+                            let _ = events.send(ClientEvent::Error {
+                                message: "contatto non collegato".into(),
+                            });
+                            continue;
+                        }
+                        let mut message_id = [0u8; 16];
+                        OsRng.fill_bytes(&mut message_id);
+                        let emoticons = resolve_emoticons(&text, &triggers).unwrap_or_default();
+                        let message = TextMessage { text: text.clone(), emoticons, id: message_id };
+                        let client_emoticons = client_emoticon_spans(&message);
+                        record_text(&history, &peer, "out", &message);
+                        let _ = events.send(ClientEvent::Message {
+                            message: ClientMessage {
+                                peer_id: peer.to_string(),
+                                direction: "out".into(),
+                                kind: "text".into(),
+                                body: text.clone(),
+                                timestamp_ms: now_ms(),
+                                emoticons: client_emoticons,
+                                attachment_id: None,
+                                attachment_mime: None,
+                                event_id: Some(hex_group_id(&message_id)),
+                                relayed: true,
+                            },
                         });
+                        for device in online_devices.iter().copied().collect::<Vec<_>>() {
+                            if let Err(error) = send_relay_text(&mut swarm, &account_key, &mut pending_device_requests, device, &peer, message_id, text.clone()) {
+                                eprintln!("relay verso dispositivo fallito: {error}");
+                            }
+                        }
                         continue;
                     }
                     let emoticons = resolve_emoticons(&text, &triggers)
@@ -1397,6 +1436,7 @@ pub async fn run(
                             attachment_id: None,
                             attachment_mime: None,
                             event_id: Some(hex_group_id(&message_id)),
+                            relayed: false,
                         },
                     });
                 }
@@ -1428,6 +1468,7 @@ pub async fn run(
                                         attachment_id: None,
                                         attachment_mime: None,
                                         event_id: None,
+                                        relayed: false,
                                     },
                                 });
                             }
@@ -1480,6 +1521,7 @@ pub async fn run(
                                         attachment_id: Some(attachment_hex),
                                         attachment_mime: Some(manifest.mime.clone()),
                                         event_id: None,
+                                        relayed: false,
                                     },
                                 });
                                 pending_offers.insert(request_id, PendingOffer {
@@ -2064,7 +2106,8 @@ pub async fn run(
                     let device_request_pending = pending_device_requests.values().any(|pending| {
                         match pending {
                             PendingDeviceRequest::Pair { peer, .. }
-                            | PendingDeviceRequest::Sync { peer } => *peer == peer_id,
+                            | PendingDeviceRequest::Sync { peer }
+                            | PendingDeviceRequest::Relay { peer } => *peer == peer_id,
                         }
                     });
                     if let Some(pairing) = pending_pair_targets
@@ -2774,6 +2817,47 @@ pub async fn run(
                                     });
                                     devices::seal(&key, &payload)?
                                 }
+                                Ok(DeviceRequest::RelayText { target, id, text })
+                                    if pairing_key.is_none() && known_devices.contains_key(&peer) =>
+                                {
+                                    // Un dispositivo collegato ci chiede di consegnare un
+                                    // messaggio a un suo contatto che non riesce a raggiungere.
+                                    // Consegniamo solo verso contatti noti (mai sconosciuti).
+                                    let delivered = match target.parse::<PeerId>() {
+                                        Ok(target_peer) if known_contacts.contains(&target_peer) => {
+                                            let emoticons = resolve_emoticons(&text, &triggers).unwrap_or_default();
+                                            let message = TextMessage { text: text.clone(), emoticons, id };
+                                            let event = ChatEvent::Text(message.clone());
+                                            if sessions.contains_key(&target_peer) {
+                                                match send_event(&mut swarm, &mut sessions, target_peer, local_peer_id, &mut sent_numbers, event.clone()) {
+                                                    Some(request_id) => { pending_messages.insert(request_id, (target_peer, event, 0)); }
+                                                    None => { outbox.entry(target_peer).or_default().push_back(event); }
+                                                }
+                                            } else {
+                                                outbox.entry(target_peer).or_default().push_back(event);
+                                                maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, target_peer);
+                                            }
+                                            record_text(&history, &target_peer, "out", &message);
+                                            let _ = events.send(ClientEvent::Message {
+                                                message: ClientMessage {
+                                                    peer_id: target_peer.to_string(),
+                                                    direction: "out".into(),
+                                                    kind: "text".into(),
+                                                    body: text,
+                                                    timestamp_ms: now_ms(),
+                                                    emoticons: client_emoticon_spans(&message),
+                                                    attachment_id: None,
+                                                    attachment_mime: None,
+                                                    event_id: Some(hex_group_id(&id)),
+                                                    relayed: false,
+                                                },
+                                            });
+                                            true
+                                        }
+                                        _ => false,
+                                    };
+                                    devices::seal(&key, &DeviceResponse::RelayResult { id, delivered })?
+                                }
                                 _ => devices::seal(&key, &DeviceResponse::Rejected("richiesta dispositivo non valida".into()))?,
                             },
                             None => devices::seal(&[0u8; 32], &DeviceResponse::Rejected("codice non riconosciuto".into()))?,
@@ -2784,9 +2868,27 @@ pub async fn run(
                         let Some(pending) = pending_device_requests.remove(&request_id) else {
                             continue;
                         };
+                        // La risposta a un RelayText conferma solo la consegna: nessuno
+                        // stato da aggiornare qui (il messaggio è già mostrato e verrà
+                        // sincronizzato dal dispositivo che l'ha inoltrato).
+                        if let PendingDeviceRequest::Relay { peer: relay_peer } = pending {
+                            if relay_peer == peer {
+                                if let Ok(DeviceResponse::RelayResult { delivered, .. }) =
+                                    devices::open::<DeviceResponse>(&account_key, &response)
+                                {
+                                    if !delivered {
+                                        let _ = events.send(ClientEvent::Error {
+                                            message: "il dispositivo collegato non ha potuto consegnare il messaggio".into(),
+                                        });
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         let (expected_peer, key, pairing) = match pending {
                             PendingDeviceRequest::Pair { peer, key } => (peer, key, true),
                             PendingDeviceRequest::Sync { peer } => (peer, account_key, false),
+                            PendingDeviceRequest::Relay { .. } => continue,
                         };
                         if expected_peer != peer {
                             continue;
@@ -3023,6 +3125,7 @@ fn client_event_from_chat(
                 attachment_id: None,
                 attachment_mime: None,
                 event_id: (message.id != [0u8; 16]).then(|| hex_group_id(&message.id)),
+                relayed: false,
             },
         }),
         ChatEvent::Nudge(nudge) => Some(ClientEvent::Message {
@@ -3036,6 +3139,7 @@ fn client_event_from_chat(
                 attachment_id: None,
                 attachment_mime: None,
                 event_id: None,
+                relayed: false,
             },
         }),
         ChatEvent::AttachmentOffer(manifest) => Some(ClientEvent::Message {
@@ -3049,6 +3153,7 @@ fn client_event_from_chat(
                 attachment_id: Some(hex_asset_id(&manifest.attachment_id)),
                 attachment_mime: Some(manifest.mime.clone()),
                 event_id: None,
+                relayed: false,
             },
         }),
         ChatEvent::EmoticonOffer(_) => None,
@@ -4292,6 +4397,26 @@ fn send_devices(
     let _ = events.send(ClientEvent::DevicesUpdated { devices });
 }
 
+fn send_relay_text(
+    swarm: &mut Swarm<Behaviour>,
+    account_key: &[u8; 32],
+    pending: &mut HashMap<request_response::OutboundRequestId, PendingDeviceRequest>,
+    device: PeerId,
+    target: &PeerId,
+    id: [u8; 16],
+    text: String,
+) -> Result<(), Box<dyn Error>> {
+    let request = DeviceRequest::RelayText {
+        target: target.to_string(),
+        id,
+        text,
+    };
+    let sealed = devices::seal(account_key, &request)?;
+    let request_id = swarm.behaviour_mut().devices.send_request(&device, sealed);
+    pending.insert(request_id, PendingDeviceRequest::Relay { peer: device });
+    Ok(())
+}
+
 fn send_device_sync(
     swarm: &mut Swarm<Behaviour>,
     history: &History,
@@ -4431,6 +4556,7 @@ fn refresh_synced_state(
                     attachment_id: attachment.as_ref().map(|item| item.0.clone()),
                     attachment_mime: attachment.map(|item| item.1),
                     event_id: Some(entry.event_id),
+                    relayed: false,
                 }
             })
             .collect();

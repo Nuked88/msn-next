@@ -1291,6 +1291,13 @@ button:disabled {
   font-weight: 750;
 }
 
+.relayed-badge {
+  display: inline-flex;
+  align-items: center;
+  color: var(--faint);
+  cursor: help;
+}
+
 :root[data-theme="dark"] .message-line header strong {
   color: #62d6ee;
 }

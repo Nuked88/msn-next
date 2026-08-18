@@ -40,6 +40,7 @@
     RefreshCw,
     Send,
     Settings2,
+    Share2,
     ShieldCheck,
     Smile,
     Sparkles,
@@ -80,6 +81,7 @@
     attachmentId?: string
     attachmentMime?: string
     eventId?: string
+    relayed?: boolean
   }
 
   type ClientEmoticonSpan = { start: number; end: number; assetId: string }
@@ -107,6 +109,7 @@
     eventId?: string
     deleted?: boolean
     timestampMs?: number
+    relayed?: boolean
   }
 
   type GroupChat = {
@@ -419,7 +422,10 @@
   $: ready = activeGroup ? groupOnline > 0 : Boolean(activeContact?.online && activeContact?.secure)
   $: groupCanSend = !activeGroup
     || (!activeGroup.silenced.includes(peerId) && !memberBan(activeGroup, peerId))
-  $: canSend = ready && groupCanSend
+  // Relay: se il canale diretto col contatto non è pronto ma ho un dispositivo
+  // collegato online, posso inviare comunque (verrà inoltrato).
+  $: relayAvailable = !activeGroup && Boolean(activeContact) && linkedDevices.some((device) => device.online)
+  $: canSend = groupCanSend && (ready || relayAvailable)
   $: totalUnread = contacts.reduce((total, contact) => total + contact.unread, 0)
     + chatGroups.reduce((total, group) => total + group.unread, 0)
   $: void updateTaskbarBadge(totalUnread)
@@ -1020,6 +1026,7 @@
       deleted: message.kind === 'deleted',
       eventId: message.eventId,
       timestampMs: message.timestampMs,
+      relayed: message.relayed,
       emoticons: message.emoticons || [],
       attachmentId: message.attachmentId,
       attachmentMime: message.attachmentMime,
@@ -2159,6 +2166,7 @@
                   <header>
                     {#if !sameSender}<strong>{senderName(message)}</strong>{/if}
                     <time>{message.time}</time>
+                    {#if message.relayed}<span class="relayed-badge" title={$t('msg.relayedHint')}><Share2 size={11} /></span>{/if}
                   </header>
                   {#if message.deleted}
                     <p class="deleted-message"><Trash2 size={13} /> {message.mine ? $t('msg.deletedByYou') : $t('msg.deletedMessage')}</p>
@@ -2342,7 +2350,7 @@
             aria-label={$t('composer.message')}
             aria-multiline="true"
             aria-disabled={!canSend}
-            data-placeholder={!groupCanSend ? $t('composer.cantWrite') : ready ? $t('composer.writeTo', { name: activeGroup?.name || activeContact?.name || '' }) : activeGroup ? $t('composer.noParticipants') : activeContact ? $t('composer.contactUnavailable') : $t('composer.chooseConv')}
+            data-placeholder={!groupCanSend ? $t('composer.cantWrite') : ready ? $t('composer.writeTo', { name: activeGroup?.name || activeContact?.name || '' }) : relayAvailable ? $t('composer.relayHint') : activeGroup ? $t('composer.noParticipants') : activeContact ? $t('composer.contactUnavailable') : $t('composer.chooseConv')}
             oninput={syncDraft}
             onpaste={pasteDraft}
             ondrop={(event) => event.preventDefault()}
