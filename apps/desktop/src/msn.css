@@ -462,9 +462,28 @@ button:disabled {
 .avatar-shell > i[data-status="busy"] { background: #d64545; }
 .avatar-shell > i[data-status="away"] { background: #e0a83e; }
 
-/* Caret del menu stato: eredita lo stile dei bottoni del profilo. */
-.profile-status-btn { opacity: 0.75; }
-.profile-status-btn:hover { opacity: 1; }
+/* L'avatar è il trigger del menu stato: cliccalo per cambiare presenza. */
+.avatar-shell.status-trigger {
+  cursor: pointer;
+  transition: transform 150ms cubic-bezier(0.34, 1.56, 0.64, 1), box-shadow 150ms ease;
+}
+.avatar-shell.status-trigger:hover {
+  transform: translateY(-1px) scale(1.04);
+  box-shadow: 0 3px 10px color-mix(in srgb, var(--blue) 35%, transparent);
+}
+.avatar-shell.status-trigger:active { transform: scale(0.97); }
+.avatar-shell.status-trigger:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+/* Pulsazione del pallino quando online, per invitare al click. */
+.avatar-shell.status-trigger > i.online {
+  animation: status-pulse 2.4s ease-in-out infinite;
+}
+@keyframes status-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--green) 60%, transparent); }
+  50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--green) 0%, transparent); }
+}
 
 .status-menu {
   position: absolute;
@@ -567,15 +586,18 @@ button:disabled {
   color: var(--muted);
   background: transparent;
   cursor: pointer;
+  transition: color 130ms ease, background 130ms ease, transform 130ms ease;
 }
 
 .my-profile > button:hover {
   color: var(--blue);
   background: var(--blue-soft);
+  transform: rotate(30deg);
 }
 
 .roster-actions {
   display: flex;
+  align-items: stretch;
   gap: 6px;
   padding: 10px;
   border-bottom: 1px solid var(--line-soft);
@@ -595,13 +617,15 @@ button:disabled {
   clip: rect(0, 0, 0, 0);
 }
 
+/* Lente centrata verticalmente: resta allineata anche con font molto grandi. */
 .search-field::before {
   position: absolute;
   z-index: 1;
-  top: 8px;
+  top: 50%;
   left: 10px;
   width: 11px;
   height: 11px;
+  margin-top: -7px;
   border: 1.5px solid var(--faint);
   border-radius: 50%;
   content: "";
@@ -610,10 +634,11 @@ button:disabled {
 .search-field::after {
   position: absolute;
   z-index: 1;
-  top: 19px;
+  top: 50%;
   left: 20px;
   width: 6px;
   height: 1.5px;
+  margin-top: 4px;
   content: "";
   background: var(--faint);
   transform: rotate(45deg);
@@ -621,7 +646,8 @@ button:disabled {
 
 .search-field input {
   width: 100%;
-  height: 31px;
+  height: 100%;
+  min-height: 31px;
   padding: 0 9px 0 30px;
   border: 1px solid var(--line);
   border-radius: 5px;
@@ -643,8 +669,9 @@ button:disabled {
 }
 
 .add-contact {
+  flex: 0 0 auto;
   width: 32px;
-  height: 31px;
+  min-height: 31px;
   display: grid;
   place-items: center;
   border: 1px solid var(--line);
@@ -652,12 +679,15 @@ button:disabled {
   color: var(--blue-strong);
   background: var(--surface-raised);
   cursor: pointer;
+  transition: transform 130ms ease, background 130ms ease, border-color 130ms ease;
 }
 
 .add-contact:hover {
   border-color: var(--selected-border);
   background: var(--blue-soft);
+  transform: translateY(-1px);
 }
+.add-contact:active { transform: scale(0.94); }
 
 .contact-list {
   min-height: 0;

@@ -21,6 +21,7 @@
   "status.online": "Online",
   "status.busy": "Busy",
   "status.away": "Away",
+  "status.change": "Change status",
   "profile.ready": "Ready to chat",
   "profile.start": "Start messenger to connect",
   "settings.open": "Settings",

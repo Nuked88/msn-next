@@ -17,7 +17,6 @@
     Activity,
     BellOff,
     CheckCircle2,
-    ChevronDown,
     Copy,
     Database,
     Download,
@@ -1958,18 +1957,24 @@
   <div class="workspace">
     <aside class="contacts-pane">
       <header class="my-profile">
-        <div class="avatar-shell me" data-status={running ? presenceStatus : 'offline'}>
+        <div
+          class="avatar-shell me status-trigger"
+          data-status={running ? presenceStatus : 'offline'}
+          role="button"
+          tabindex="0"
+          aria-haspopup="menu"
+          aria-expanded={statusMenuOpen}
+          title={$t('status.change')}
+          onclick={() => statusMenuOpen = !statusMenuOpen}
+          onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); statusMenuOpen = !statusMenuOpen } }}
+        >
           {#if avatarDataUrl}<img src={avatarDataUrl} alt="" />{:else}<span>{displayName.slice(0, 1).toUpperCase()}</span>{/if}
           <i class:online={running} data-status={running ? presenceStatus : 'offline'}></i>
         </div>
         <div class="profile-copy">
           <strong>{displayName}</strong>
           <span>{running ? $t(`status.${presenceStatus}`) : $t('profile.offline')}</span>
-          <small>{running ? $t('profile.ready') : $t('profile.start')}</small>
         </div>
-        <button class="profile-status-btn" onclick={() => statusMenuOpen = !statusMenuOpen} aria-haspopup="menu" aria-expanded={statusMenuOpen} aria-label={$t('status.online')} title={$t(`status.${presenceStatus}`)}>
-          <ChevronDown size={16} />
-        </button>
         <button aria-label={$t('settings.open')} title={$t('settings.open')} onclick={() => openSettings()}>
           <Settings2 size={17} />
         </button>
