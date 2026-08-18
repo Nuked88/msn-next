@@ -4110,6 +4110,9 @@ fn extension_auto_accepted(filename: &str, allowed: &HashSet<String>) -> bool {
     if allowed.is_empty() {
         return false;
     }
+    if allowed.contains("*") {
+        return true;
+    }
     filename
         .rsplit_once('.')
         .map(|(_, ext)| !ext.is_empty() && allowed.contains(&ext.to_ascii_lowercase()))

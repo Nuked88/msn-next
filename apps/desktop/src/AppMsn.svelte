@@ -228,20 +228,27 @@
 
   // Auto-accept media: estensioni consentite (stringa comma/spazio separata).
   const autoAcceptExtKey = 'msnnext-auto-accept-ext-v1'
+  const autoAcceptAllKey = 'msnnext-auto-accept-all-v1'
   let autoAcceptExtensions = typeof localStorage === 'undefined'
     ? ''
     : (localStorage.getItem(autoAcceptExtKey) || '')
+  let autoAcceptAll = typeof localStorage !== 'undefined' && localStorage.getItem(autoAcceptAllKey) === '1'
   function parseExtensions(value: string): string[] {
     return value.split(/[\s,]+/).map((ext) => ext.trim().replace(/^\./, '').toLowerCase()).filter(Boolean)
   }
   async function applyAutoAccept() {
     if (!isTauri()) return
-    try { await invoke('node_set_auto_accept_extensions', { extensions: parseExtensions(autoAcceptExtensions) }) }
+    const extensions = autoAcceptAll ? ['*'] : parseExtensions(autoAcceptExtensions)
+    try { await invoke('node_set_auto_accept_extensions', { extensions }) }
     catch (error) { console.warn('auto-accept non impostato', error) }
   }
   $: {
     autoAcceptExtensions
-    if (typeof localStorage !== 'undefined') localStorage.setItem(autoAcceptExtKey, autoAcceptExtensions)
+    autoAcceptAll
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(autoAcceptExtKey, autoAcceptExtensions)
+      localStorage.setItem(autoAcceptAllKey, autoAcceptAll ? '1' : '0')
+    }
     void applyAutoAccept()
   }
 
@@ -2607,7 +2614,8 @@
               </div>
               <div class="settings-subsection">
                 <div class="settings-subsection-heading"><span><strong>{$t('settings.autoAccept.title')}</strong><small>{$t('settings.autoAccept.desc')}</small></span><Download size={18} /></div>
-                <label class="settings-field">{$t('settings.autoAccept.label')}<input bind:value={autoAcceptExtensions} placeholder="jpg, png, gif, webp, mp4" /><small>{$t('settings.autoAccept.hint')}</small></label>
+                <label class="settings-row"><span><strong>{$t('settings.autoAccept.all')}</strong><small>{$t('settings.autoAccept.allDesc')}</small></span><input type="checkbox" bind:checked={autoAcceptAll} /></label>
+                <label class="settings-field">{$t('settings.autoAccept.label')}<input bind:value={autoAcceptExtensions} placeholder="jpg, png, gif, webp, mp4" disabled={autoAcceptAll} /><small>{$t('settings.autoAccept.hint')}</small></label>
               </div>
               <div class="settings-subsection settings-emoticons-flat">
                 <div class="settings-subsection-heading">

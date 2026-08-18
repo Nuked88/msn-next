@@ -266,6 +266,8 @@
   "settings.data.emoticons.none": "Nessuna emoticon personale",
   "settings.autoAccept.title": "Accetta media automaticamente",
   "settings.autoAccept.desc": "I file in arrivo con queste estensioni vengono accettati senza chiedere.",
+  "settings.autoAccept.all": "Accetta tutti i file",
+  "settings.autoAccept.allDesc": "Accetta automaticamente ogni file in arrivo, di qualsiasi tipo.",
   "settings.autoAccept.label": "Estensioni consentite",
   "settings.autoAccept.hint": "Separate da virgola (es. jpg, png, mp4). Vuoto = chiedi sempre.",
   "settings.updates.title": "Aggiornamenti",
