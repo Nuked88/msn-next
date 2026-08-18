@@ -10,8 +10,8 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chacha20poly1305::aead::rand_core::{OsRng, RngCore};
 use connectivity::{relay_route, split_peer_address, FallbackPlanner, Recovery};
 use crypto::{
-    accepts_inbound, needs_outbound_handshake, respond as respond_hybrid, HybridInitiator,
-    HybridResponse, RatchetMessage, RatchetSession, SessionKey,
+    accepts_inbound, needs_outbound_handshake, respond as respond_hybrid, should_initiate,
+    HybridInitiator, HybridResponse, RatchetMessage, RatchetSession, SessionKey,
 };
 use devices::{DeviceDescriptor, DeviceRequest, DeviceResponse, PairingLink, SealedDeviceMessage};
 use futures::StreamExt;
@@ -786,6 +786,11 @@ pub async fn run(
         .collect::<HashMap<_, _>>();
     let mut device_sync_tick = tokio::time::interval(Duration::from_secs(2));
     device_sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Riconciliatore handshake: periodicamente ripara le sessioni mancanti verso
+    // contatti connessi (l'iniziatore ritenta, il responder ri-annuncia la
+    // presence per sbloccare anche un iniziatore con build vecchia).
+    let mut handshake_tick = tokio::time::interval(Duration::from_secs(3));
+    handshake_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     for contact in persisted_contacts {
         let restored = if contact.link.is_empty() {
@@ -977,6 +982,23 @@ pub async fn run(
                         peer,
                         descriptor,
                     )?;
+                }
+            }
+            _ = handshake_tick.tick(), if !peers.is_empty() => {
+                // Per ogni contatto connesso senza canale cifrato: se siamo
+                // l'iniziatore ritentiamo l'handshake, altrimenti ri-annunciamo
+                // la presence per invitare l'altro lato ad avviarlo.
+                let stalled = peers
+                    .iter()
+                    .copied()
+                    .filter(|peer| !sessions.contains_key(peer))
+                    .collect::<Vec<_>>();
+                for peer in stalled {
+                    if should_initiate(local_peer_id, peer) {
+                        maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
+                    } else {
+                        send_event(&mut swarm, &mut sessions, peer, local_peer_id, &mut sent_numbers, ChatEvent::Presence(PresenceUpdate { display_name: display_name.clone(), online: true, status: presence_status.clone() }));
+                    }
                 }
             }
             _ = wait_for_reconnect(next_reconnect.map(|(_, deadline)| deadline)) => {
