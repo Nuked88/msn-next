@@ -586,12 +586,19 @@ button:disabled {
   color: var(--muted);
   background: transparent;
   cursor: pointer;
-  transition: color 130ms ease, background 130ms ease, transform 130ms ease;
+  transition: color 130ms ease, background 130ms ease;
+}
+
+.my-profile > button > svg {
+  transition: transform 200ms ease;
 }
 
 .my-profile > button:hover {
   color: var(--blue);
   background: var(--blue-soft);
+}
+
+.my-profile > button:hover > svg {
   transform: rotate(30deg);
 }
 
