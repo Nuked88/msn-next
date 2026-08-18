@@ -2874,7 +2874,7 @@ pub async fn run(
                 SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { id, step, .. })) if step.last => {
                     if let Some(peer) = pending_dht.remove(&id) {
                         let recovery = fallback_planner.after_dht(peer);
-                        execute_recovery(&mut swarm, &mut pending_dht, recovery);
+                        execute_recovery(&mut swarm, &mut pending_dht, &mut fallback_planner, peer, recovery);
                     }
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Autonat(autonat::Event::StatusChanged { new, .. })) => {
@@ -2945,7 +2945,7 @@ pub async fn run(
                             }
                             if known_contacts.contains(&peer_id) || known_devices.contains_key(&peer_id) {
                                 let recovery = fallback_planner.after_failure(peer_id);
-                                execute_recovery(&mut swarm, &mut pending_dht, recovery);
+                                execute_recovery(&mut swarm, &mut pending_dht, &mut fallback_planner, peer_id, recovery);
                                 schedule_reconnect(
                                     peer_id,
                                     &mut reconnect_at,
@@ -3185,38 +3185,57 @@ fn connect_contact(
         if let Err(error) = swarm.dial(address) {
             eprintln!("indirizzo non raggiungibile: {error}");
             let recovery = planner.after_failure(peer);
-            execute_recovery(swarm, pending_dht, recovery);
+            execute_recovery(swarm, pending_dht, planner, peer, recovery);
         }
     } else {
         let recovery = planner.after_failure(peer);
-        execute_recovery(swarm, pending_dht, recovery);
+        execute_recovery(swarm, pending_dht, planner, peer, recovery);
     }
 }
 
 fn execute_recovery(
     swarm: &mut Swarm<Behaviour>,
     pending_dht: &mut HashMap<kad::QueryId, PeerId>,
-    recovery: Recovery,
+    planner: &mut FallbackPlanner,
+    peer: PeerId,
+    mut recovery: Recovery,
 ) {
-    match recovery {
-        Recovery::SearchDht(peer) => {
-            println!("cerco {peer} nella DHT");
-            let query = swarm.behaviour_mut().kad.get_closest_peers(peer);
-            pending_dht.insert(query, peer);
-        }
-        Recovery::DialPeer(peer) => {
-            println!("provo indirizzi DHT per {peer}");
-            if let Err(error) = swarm.dial(DialOpts::peer_id(peer).build()) {
-                eprintln!("dial DHT fallito: {error}");
+    // Se un dial fallisce subito (es. "already dialing" mentre un indirizzo
+    // diretto irraggiungibile è ancora in timeout), avanza al percorso
+    // successivo invece di fermarsi: così il relay viene comunque provato.
+    loop {
+        match recovery {
+            Recovery::SearchDht(target) => {
+                println!("cerco {target} nella DHT");
+                let query = swarm.behaviour_mut().kad.get_closest_peers(target);
+                pending_dht.insert(query, target);
+                return;
+            }
+            Recovery::DialPeer(target) => {
+                println!("provo indirizzi DHT per {target}");
+                match swarm.dial(DialOpts::peer_id(target).build()) {
+                    Ok(()) => return,
+                    Err(error) => {
+                        eprintln!("dial DHT fallito: {error}");
+                        recovery = planner.after_failure(peer);
+                    }
+                }
+            }
+            Recovery::ViaRelay(address) => {
+                println!("provo il relay: {address}");
+                match swarm.dial(address) {
+                    Ok(()) => return,
+                    Err(error) => {
+                        eprintln!("dial relay fallito: {error}");
+                        recovery = planner.after_failure(peer);
+                    }
+                }
+            }
+            Recovery::Exhausted => {
+                eprintln!("nessun altro percorso disponibile");
+                return;
             }
         }
-        Recovery::ViaRelay(address) => {
-            println!("provo il relay: {address}");
-            if let Err(error) = swarm.dial(address) {
-                eprintln!("dial relay fallito: {error}");
-            }
-        }
-        Recovery::Exhausted => eprintln!("nessun altro percorso disponibile"),
     }
 }
 
