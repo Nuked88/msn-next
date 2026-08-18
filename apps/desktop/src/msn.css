@@ -79,6 +79,8 @@
 
 * {
   box-sizing: border-box;
+  /* Niente flash quadrato al tap su Android (ignora il border-radius). */
+  -webkit-tap-highlight-color: transparent;
 }
 
 html,
@@ -473,8 +475,8 @@ button:disabled {
 }
 .avatar-shell.status-trigger:active { transform: scale(0.97); }
 .avatar-shell.status-trigger:focus-visible {
-  outline: 2px solid var(--blue);
-  outline-offset: 2px;
+  outline: none;
+  box-shadow: 0 0 0 2px var(--surface-raised), 0 0 0 4px var(--blue);
 }
 /* Pulsazione del pallino quando online, per invitare al click. */
 .avatar-shell.status-trigger > i.online {
@@ -595,7 +597,6 @@ button:disabled {
 
 .my-profile > button:hover {
   color: var(--blue);
-  background: var(--blue-soft);
 }
 
 .my-profile > button:hover > svg {
