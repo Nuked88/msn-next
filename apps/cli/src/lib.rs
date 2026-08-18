@@ -3177,6 +3177,11 @@ fn connect_contact(
 ) {
     let mut valid = VecDeque::new();
     for address in addresses {
+        // Il loopback di un peer remoto non è mai raggiungibile: scartarlo evita
+        // di sprecare lo slot di dial (cicli "Rifiuto persistente" su 127.0.0.1).
+        if is_loopback_multiaddr(&address) {
+            continue;
+        }
         match split_peer_address(&address) {
             Ok((address_peer, base)) if address_peer == peer => {
                 swarm.behaviour_mut().kad.add_address(&peer, base);
@@ -3199,6 +3204,14 @@ fn connect_contact(
         let recovery = planner.after_failure(peer);
         execute_recovery(swarm, pending_dht, planner, peer, recovery);
     }
+}
+
+fn is_loopback_multiaddr(address: &Multiaddr) -> bool {
+    address.iter().any(|proto| match proto {
+        Protocol::Ip4(ip) => ip.is_loopback(),
+        Protocol::Ip6(ip) => ip.is_loopback(),
+        _ => false,
+    })
 }
 
 fn execute_recovery(
