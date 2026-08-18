@@ -741,6 +741,9 @@ pub async fn run(
         HashMap::<request_response::OutboundRequestId, PendingTransfer>::new();
     let mut pending_handshakes =
         HashMap::<request_response::OutboundRequestId, (PeerId, HybridInitiator)>::new();
+    // Tentativi di handshake per peer: consente il retry se il primo invio
+    // fallisce (frequente su mobile finché la connessione non è stabile).
+    let mut handshake_retries = HashMap::<PeerId, u8>::new();
     // Affidabilità messaggi: coda per-peer quando la sessione non è pronta, e
     // tracciamento (peer, evento, tentativi) per il retry sui fallimenti.
     let mut outbox = HashMap::<PeerId, VecDeque<ChatEvent>>::new();
@@ -2099,6 +2102,10 @@ pub async fn run(
                             },
                         });
                         send_event(&mut swarm, &mut sessions, peer_id, local_peer_id, &mut sent_numbers, ChatEvent::Presence(PresenceUpdate { display_name: display_name.clone(), online: true, status: presence_status.clone() }));
+                        // Avvia subito l'handshake appena la connessione è su, senza
+                        // attendere il round-trip della presence (che può perdersi).
+                        handshake_retries.remove(&peer_id);
+                        maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer_id);
                     }
                 }
                 SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
@@ -2113,6 +2120,7 @@ pub async fn run(
                             .retain(|_, (pending_peer, _)| *pending_peer != peer_id);
                         pending_inbound_handshakes
                             .retain(|_, (pending_peer, _)| *pending_peer != peer_id);
+                        handshake_retries.remove(&peer_id);
                         nudge_limits.remove(&peer_id);
                         incoming_nudge_limits.remove(&peer_id);
                         if was_application_peer {
@@ -2558,6 +2566,7 @@ pub async fn run(
                                         peer,
                                         RatchetSession::new(session_key, local_peer_id, peer),
                                     );
+                                    handshake_retries.remove(&peer);
                                     println!("handshake ibrido completato: {peer}");
                                     let _ = events.send(ClientEvent::ContactUpdated {
                                         contact: ClientContact {
@@ -2592,6 +2601,13 @@ pub async fn run(
                 SwarmEvent::Behaviour(BehaviourEvent::Handshake(request_response::Event::OutboundFailure { peer, request_id, error, .. })) => {
                     pending_handshakes.remove(&request_id);
                     eprintln!("handshake ibrido fallito con {peer}: {error}");
+                    // Riprova finché il peer è connesso e non è già cifrato: evita
+                    // di restare bloccati su "preparazione" per un invio transitorio.
+                    let attempts = handshake_retries.entry(peer).or_insert(0);
+                    if *attempts < MAX_REQUEST_RETRIES && peers.contains(&peer) && !sessions.contains_key(&peer) {
+                        *attempts += 1;
+                        maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
+                    }
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Handshake(request_response::Event::InboundFailure { peer, request_id, error, .. })) => {
                     pending_inbound_handshakes.remove(&request_id);
