@@ -2057,6 +2057,7 @@ pub async fn run(
                                 swarm.listen_on(address.clone().with(Protocol::P2pCircuit))
                             {
                                 eprintln!("prenotazione relay fallita: {error}");
+                                log::warn!("prenotazione relay fallita: {error}");
                             }
                         }
                     }
@@ -2111,6 +2112,7 @@ pub async fn run(
                     }
                     if (known_contacts.contains(&peer_id) || is_manual) && peers.insert(peer_id) {
                         println!("connesso: {peer_id}");
+                        log::info!("connesso: {peer_id}");
                         let _ = events.send(ClientEvent::ContactUpdated {
                             contact: ClientContact {
                                 peer_id: peer_id.to_string(),
@@ -2147,6 +2149,7 @@ pub async fn run(
                         incoming_nudge_limits.remove(&peer_id);
                         if was_application_peer {
                             println!("offline: {} ({cause:?})", peer_names.get(&peer_id).map_or_else(|| peer_id.to_string(), Clone::clone));
+                            log::info!("offline: {peer_id} ({cause:?})");
                             let _ = events.send(ClientEvent::ContactUpdated {
                                 contact: ClientContact {
                                     peer_id: peer_id.to_string(),
@@ -2590,6 +2593,7 @@ pub async fn run(
                                     );
                                     handshake_retries.remove(&peer);
                                     println!("handshake ibrido completato: {peer}");
+                                    log::info!("handshake ibrido completato: {peer}");
                                     let _ = events.send(ClientEvent::ContactUpdated {
                                         contact: ClientContact {
                                             peer_id: peer.to_string(),
@@ -2623,6 +2627,7 @@ pub async fn run(
                 SwarmEvent::Behaviour(BehaviourEvent::Handshake(request_response::Event::OutboundFailure { peer, request_id, error, .. })) => {
                     pending_handshakes.remove(&request_id);
                     eprintln!("handshake ibrido fallito con {peer}: {error}");
+                    log::warn!("handshake ibrido fallito con {peer}: {error}");
                     // Riprova finché il peer è connesso e non è già cifrato: evita
                     // di restare bloccati su "preparazione" per un invio transitorio.
                     let attempts = handshake_retries.entry(peer).or_insert(0);
@@ -2879,9 +2884,11 @@ pub async fn run(
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Autonat(autonat::Event::StatusChanged { new, .. })) => {
                     println!("raggiungibilità: {new:?}");
+                    log::info!("raggiungibilità (autonat): {new:?}");
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::RelayClient(event)) => {
                     println!("relay client: {event:?}");
+                    log::info!("relay client: {event:?}");
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::RelayServer(event)) => {
                     println!("relay server: {event:?}");
@@ -2938,6 +2945,7 @@ pub async fn run(
                         } else {
                             dialing.remove(&peer_id);
                             eprintln!("connessione fallita: {error}");
+                            log::warn!("connessione fallita: {error}");
                             if pending_pair_targets.contains_key(&peer_id) {
                                 let _ = events.send(ClientEvent::Error {
                                     message: "l'altro dispositivo non è raggiungibile; verifica che sia online e che il codice non sia scaduto".into(),
@@ -3223,6 +3231,7 @@ fn execute_recovery(
             }
             Recovery::ViaRelay(address) => {
                 println!("provo il relay: {address}");
+                log::info!("provo il relay: {address}");
                 match swarm.dial(address) {
                     Ok(()) => return,
                     Err(error) => {
@@ -3233,6 +3242,7 @@ fn execute_recovery(
             }
             Recovery::Exhausted => {
                 eprintln!("nessun altro percorso disponibile");
+                log::warn!("nessun altro percorso disponibile per {peer}");
                 return;
             }
         }
