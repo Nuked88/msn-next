@@ -1325,17 +1325,14 @@ pub async fn run(
                     }
                 }
                 Some(ClientCommand::SendText { peer, text }) => {
-                    if !peers.contains(&peer) {
-                        // Canale diretto col contatto non disponibile: se ho un
-                        // dispositivo collegato online, gli chiedo di consegnare il
-                        // messaggio (relay). Il contatto resta comunque "non protetto"
-                        // lato UI finché il canale diretto non è stabilito.
-                        if online_devices.is_empty() {
-                            let _ = events.send(ClientEvent::Error {
-                                message: "contatto non collegato".into(),
-                            });
-                            continue;
-                        }
+                    // Nessun canale cifrato diretto col contatto (offline, oppure
+                    // connesso ma handshake non ancora completo): se ho un dispositivo
+                    // collegato online gli chiedo di consegnare il messaggio (relay).
+                    // Il reconciler continua a tentare l'handshake diretto in
+                    // parallelo, così appena è pronto si passa al canale diretto.
+                    // Senza dispositivi collegati si prosegue sotto: il messaggio
+                    // viene accodato finché la sessione diretta non è disponibile.
+                    if !sessions.contains_key(&peer) && !online_devices.is_empty() {
                         let mut message_id = [0u8; 16];
                         OsRng.fill_bytes(&mut message_id);
                         let emoticons = resolve_emoticons(&text, &triggers).unwrap_or_default();
@@ -1357,8 +1354,10 @@ pub async fn run(
                             },
                         });
                         for device in online_devices.iter().copied().collect::<Vec<_>>() {
+                            log::info!("relay: chiedo a {device} di consegnare a {peer}");
                             if let Err(error) = send_relay_text(&mut swarm, &account_key, &mut pending_device_requests, device, &peer, message_id, text.clone()) {
                                 eprintln!("relay verso dispositivo fallito: {error}");
+                                log::warn!("relay verso dispositivo fallito: {error}");
                             }
                         }
                         continue;
@@ -2303,6 +2302,21 @@ pub async fn run(
                                     );
                                 }
                                 if event_authorizes_handshake(&request.event) {
+                                    // Una presence IN CHIARO da un contatto con cui
+                                    // crediamo di avere una sessione significa che
+                                    // l'altro lato l'ha persa (un restart, altrimenti
+                                    // userebbe il canale cifrato). La nostra è stale:
+                                    // la scartiamo così l'handshake riparte pulito
+                                    // (l'iniziatore reinvia l'hello; il responder
+                                    // accetta e sostituisce la sessione). Auto-heal
+                                    // del caso "connesso ma bloccato su preparazione".
+                                    if known_contacts.contains(&peer)
+                                        && sessions.remove(&peer).is_some()
+                                    {
+                                        log::info!(
+                                            "sessione stale scartata per {peer}: presence in chiaro"
+                                        );
+                                    }
                                     maybe_start_hybrid_handshake(
                                         &mut swarm,
                                         &mut pending_handshakes,
@@ -2691,6 +2705,7 @@ pub async fn run(
                                 RatchetSession::new(session_key, local_peer_id, peer),
                             );
                             println!("handshake ibrido completato: {peer}");
+                            log::info!("handshake ibrido completato (responder): {peer}");
                             let _ = events.send(ClientEvent::ContactUpdated {
                                 contact: ClientContact {
                                     peer_id: peer.to_string(),
@@ -2823,6 +2838,12 @@ pub async fn run(
                                     // Un dispositivo collegato ci chiede di consegnare un
                                     // messaggio a un suo contatto che non riesce a raggiungere.
                                     // Consegniamo solo verso contatti noti (mai sconosciuti).
+                                    let parsed = target.parse::<PeerId>().ok();
+                                    log::info!(
+                                        "relay: RelayText da {peer} per {target}; known_contact={}, session={}",
+                                        parsed.map(|p| known_contacts.contains(&p)).unwrap_or(false),
+                                        parsed.map(|p| sessions.contains_key(&p)).unwrap_or(false)
+                                    );
                                     let delivered = match target.parse::<PeerId>() {
                                         Ok(target_peer) if known_contacts.contains(&target_peer) => {
                                             let emoticons = resolve_emoticons(&text, &triggers).unwrap_or_default();
@@ -2856,6 +2877,7 @@ pub async fn run(
                                         }
                                         _ => false,
                                     };
+                                    log::info!("relay: consegna a {target} delivered={delivered}");
                                     devices::seal(&key, &DeviceResponse::RelayResult { id, delivered })?
                                 }
                                 _ => devices::seal(&key, &DeviceResponse::Rejected("richiesta dispositivo non valida".into()))?,
@@ -2873,14 +2895,16 @@ pub async fn run(
                         // sincronizzato dal dispositivo che l'ha inoltrato).
                         if let PendingDeviceRequest::Relay { peer: relay_peer } = pending {
                             if relay_peer == peer {
-                                if let Ok(DeviceResponse::RelayResult { delivered, .. }) =
-                                    devices::open::<DeviceResponse>(&account_key, &response)
-                                {
-                                    if !delivered {
-                                        let _ = events.send(ClientEvent::Error {
-                                            message: "il dispositivo collegato non ha potuto consegnare il messaggio".into(),
-                                        });
+                                match devices::open::<DeviceResponse>(&account_key, &response) {
+                                    Ok(DeviceResponse::RelayResult { delivered, .. }) => {
+                                        log::info!("relay: risposta da {peer} delivered={delivered}");
+                                        if !delivered {
+                                            let _ = events.send(ClientEvent::Error {
+                                                message: "il dispositivo collegato non ha potuto consegnare il messaggio".into(),
+                                            });
+                                        }
                                     }
+                                    other => log::warn!("relay: risposta inattesa da {peer}: {other:?}"),
                                 }
                             }
                             continue;
