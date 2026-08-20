@@ -10,6 +10,7 @@
     "beforeBuildCommand": "npm run build"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "title": "msnnext",
@@ -19,7 +20,9 @@
         "minHeight": 560,
         "decorations": false,
         "resizable": true,
-        "fullscreen": false
+        "fullscreen": false,
+        "transparent": true,
+        "visible": false
       }
     ],
     "security": {

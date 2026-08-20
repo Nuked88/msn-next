@@ -34,14 +34,15 @@
     Paperclip,
     Pencil,
     Plus,
-    Power,
     QrCode,
     Radio,
     RefreshCw,
     Send,
-    Settings2,
+    Settings,
     Share2,
+    ShieldAlert,
     ShieldCheck,
+    ShieldOff,
     Smile,
     Sparkles,
     Square,
@@ -192,6 +193,7 @@
     nudgeSound: boolean
     relayAddress: string
     fontScale: number
+    startMinimized: boolean
   }
 
   const emoticons: Emoticon[] = [
@@ -342,6 +344,8 @@
     && localStorage.getItem(securityIntroKey) !== 'seen'
   let avatarDataUrl = ''
   let previewSentImages = true
+  let startMinimized = true
+  let autostartEnabled = false
   let previewReceivedImages = false
   let nudgeSound = true
   let fontScale = 125
@@ -442,6 +446,7 @@
     let unlisten: UnlistenFn | undefined
     let unlistenDrop: UnlistenFn | undefined
     let unlistenFocus: UnlistenFn | undefined
+    let unlistenResize: UnlistenFn | undefined
     let updateTimer: ReturnType<typeof setTimeout> | undefined
     const blockNativeMenu = (event: MouseEvent) => event.preventDefault()
     const openPreferences = (event: KeyboardEvent) => {
@@ -465,6 +470,18 @@
       }
       scheduleUpdateCheck()
     }
+    // Angoli finestra arrotondati solo su desktop (su mobile è fullscreen).
+    // Da massimizzata gli angoli tornano squadrati (niente buchi agli angoli schermo).
+    if (typeof navigator !== 'undefined' && !/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)) {
+      document.documentElement.classList.add('desktop')
+    }
+    if (appWindow) {
+      const syncMaximized = async () => {
+        try { document.documentElement.classList.toggle('maximized', await appWindow.isMaximized()) } catch {}
+      }
+      void syncMaximized()
+      void appWindow.onResized(() => void syncMaximized()).then((stop) => unlistenResize = stop)
+    }
     if (appWindow) {
       void appWindow.isFocused().then((focused) => windowFocused = focused)
       void appWindow.onFocusChanged(({ payload: focused }) => {
@@ -486,6 +503,7 @@
       unlisten?.()
       unlistenDrop?.()
       unlistenFocus?.()
+      unlistenResize?.()
       if (updateTimer) clearTimeout(updateTimer)
       window.removeEventListener('contextmenu', blockNativeMenu)
       window.removeEventListener('keydown', openPreferences)
@@ -516,6 +534,8 @@
       nudgeSound = profile.nudgeSound
       relayAddress = profile.relayAddress
       fontScale = profile.fontScale
+      startMinimized = profile.startMinimized
+      try { autostartEnabled = await invoke<boolean>('autostart_get') } catch { autostartEnabled = false }
       const isRunning = await invoke<boolean>('node_status')
       running = isRunning
       setupOpen = false
@@ -1350,7 +1370,7 @@
         const profile = await invoke<Profile>('profile_save', {
           name: displayName.trim(), avatarPath: null, clearAvatar: false,
           previewSentImages, previewReceivedImages, nudgeSound, fontScale,
-          relayAddress,
+          relayAddress, startMinimized,
         })
         avatarDataUrl = profile.avatarDataUrl || ''
       }
@@ -1608,6 +1628,16 @@
     }
   }
 
+  async function setAutostart(enabled: boolean) {
+    try {
+      await invoke('autostart_set', { enabled })
+      autostartEnabled = enabled
+    } catch (error) {
+      autostartEnabled = !enabled
+      showToast(String(error))
+    }
+  }
+
   async function saveProfile(
     avatarPath: string | null = null,
     clearAvatar = false,
@@ -1618,7 +1648,7 @@
       const profile = await invoke<Profile>('profile_save', {
         name: displayName.trim(), avatarPath, clearAvatar,
         previewSentImages, previewReceivedImages, nudgeSound, fontScale,
-        relayAddress,
+        relayAddress, startMinimized,
       })
       displayName = profile.name
       avatarDataUrl = profile.avatarDataUrl || ''
@@ -1964,17 +1994,6 @@
       <small>messenger</small>
     </div>
     <div class="titlebar-tools">
-      <div class="theme-switcher" role="group" aria-label={$t('theme.group')}>
-        <button class:active={theme === 'light'} aria-label={$t('theme.lightTitle')} title={$t('theme.lightTitle')} onclick={() => setTheme('light')}>
-          <Sun size={14} /><span>{$t('theme.light')}</span>
-        </button>
-        <button class:active={theme === 'dark'} aria-label={$t('theme.darkTitle')} title={$t('theme.darkTitle')} onclick={() => setTheme('dark')}>
-          <Moon size={14} /><span>{$t('theme.dark')}</span>
-        </button>
-        <button class:active={theme === 'system'} aria-label={$t('theme.systemTitle')} title={$t('theme.systemTitle')} onclick={() => setTheme('system')}>
-          <Monitor size={14} /><span>{$t('theme.system')}</span>
-        </button>
-      </div>
       {#if updateCandidate}
         <button
           class="titlebar-update"
@@ -1986,10 +2005,6 @@
           <span>{updateStatus === 'downloading' ? `${updateProgress || '…'}%` : updateStatus === 'installing' ? $t('update.restarting') : $t('update.updateTo', { version: updateCandidate.version })}</span>
         </button>
       {/if}
-      <span class:online={running} class="node-state"><i></i>{running ? $t('state.connected') : $t('state.disconnected')}</span>
-      <button class:online={running} class="power-button" aria-label={running ? $t('action.disconnect') : $t('action.connect')} title={running ? $t('action.disconnect') : $t('action.connect')} onclick={running ? stopNode : () => startNode(false)}>
-        <Power size={16} />
-      </button>
       <div class="window-controls">
         <button aria-label={$t('window.minimize')} title={$t('window.minimize')} onclick={() => void appWindow?.minimize()}><Minus size={15} /></button>
         <button aria-label={$t('window.maximize')} title={$t('window.maximize')} onclick={() => void appWindow?.toggleMaximize()}><Square size={12} /></button>
@@ -2020,7 +2035,7 @@
           <span>{running ? $t(`status.${presenceStatus}`) : $t('profile.offline')}</span>
         </div>
         <button aria-label={$t('settings.open')} title={$t('settings.open')} onclick={() => openSettings()}>
-          <Settings2 size={17} />
+          <Settings size={17} />
         </button>
         {#if statusMenuOpen}
           <button class="context-scrim" aria-label={$t('ctx.close')} onclick={() => statusMenuOpen = false}></button>
@@ -2092,8 +2107,8 @@
       </section>
 
       <footer class="roster-footer">
-        <button onclick={openContacts}><UserRoundPlus size={15} /> {$t('roster.footer.add')}</button>
-        <button onclick={openGroupCreation}><UsersRound size={15} /> {$t('roster.footer.newGroup')}</button>
+        <button class="icon-only" aria-label={$t('roster.footer.add')} title={$t('roster.footer.add')} onclick={openContacts}><UserRoundPlus size={17} /></button>
+        <button class="icon-only" aria-label={$t('roster.footer.newGroup')} title={$t('roster.footer.newGroup')} onclick={openGroupCreation}><UsersRound size={17} /></button>
         <span>{$t('roster.online', { count: onlineContacts.length })}</span>
       </footer>
     </aside>
@@ -2118,7 +2133,15 @@
           </span>
         </div>
         <div class="header-actions">
-          <span class:secure={ready} class="security-badge"><ShieldCheck size={14} />{ready ? $t('conv.protected') : $t('conv.waiting')}</span>
+          <span
+            class:secure={ready}
+            class:waiting={!ready && (activeContact?.online || !!activeGroup)}
+            class="security-badge"
+            title={ready ? $t('conv.protectedHint') : (activeContact?.online || activeGroup) ? $t('conv.waitingHint') : $t('conv.offlineHint')}
+            aria-label={ready ? $t('conv.protected') : (activeContact?.online || activeGroup) ? $t('conv.waiting') : $t('conv.offline')}
+          >
+            {#if ready}<ShieldCheck size={16} />{:else if activeContact?.online || activeGroup}<ShieldAlert size={16} />{:else}<ShieldOff size={16} />{/if}
+          </span>
           <button class:active={detailsOpen} class="header-tool" aria-label={$t('conv.details')} title={$t('conv.details')} onclick={openConversationDetails}>
             <Info size={17} />
           </button>
@@ -2619,6 +2642,8 @@
                 <label class="settings-row"><span><strong>{$t('settings.nudgeSound.title')}</strong><small>{$t('settings.nudgeSound.desc')}</small></span><input type="checkbox" bind:checked={nudgeSound} /></label>
                 <label class="settings-row"><span><strong>{$t('settings.effectsSounds.title')}</strong><small>{$t('settings.effectsSounds.desc')}</small></span><input type="checkbox" bind:checked={effectsSounds} /></label>
                 <label class="settings-row"><span><strong>{$t('settings.notifications.title')}</strong><small>{$t('settings.notifications.desc')}</small></span><input type="checkbox" bind:checked={notificationsEnabled} onchange={() => { if (notificationsEnabled) void ensureNotifPermission() }} /></label>
+                <label class="settings-row"><span><strong>{$t('settings.autostart.title')}</strong><small>{$t('settings.autostart.desc')}</small></span><input type="checkbox" checked={autostartEnabled} onchange={(e) => void setAutostart(e.currentTarget.checked)} /></label>
+                <label class="settings-row"><span><strong>{$t('settings.startMinimized.title')}</strong><small>{$t('settings.startMinimized.desc')}</small></span><input type="checkbox" bind:checked={startMinimized} /></label>
                 <label class="settings-row"><span><strong>{$t('settings.language.title')}</strong><small>{$t('settings.language.desc')}</small></span>
                   <select bind:value={$locale}>
                     {#each availableLocales as lang (lang.code)}<option value={lang.code}>{lang.label}</option>{/each}
