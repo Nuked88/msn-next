@@ -314,6 +314,8 @@
   let theme: Theme = savedTheme === 'light' || savedTheme === 'dark' || savedTheme === 'system'
     ? savedTheme
     : 'system'
+  const savedPalette = typeof localStorage === 'undefined' ? null : localStorage.getItem('msnnext-palette')
+  let palette: 'classic' | 'aurora' = savedPalette === 'aurora' ? 'aurora' : 'classic'
   let displayName = typeof localStorage === 'undefined'
     ? 'Amico'
     : localStorage.getItem('msnnext-name') || 'Amico'
@@ -556,12 +558,19 @@
       ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
       : theme
     document.documentElement.dataset.theme = resolved
+    document.documentElement.dataset.palette = palette
     document.documentElement.style.colorScheme = resolved
   }
 
   function setTheme(next: Theme) {
     theme = next
     localStorage.setItem('msnnext-theme', next)
+    applyTheme()
+  }
+
+  function setPalette(next: 'classic' | 'aurora') {
+    palette = next
+    localStorage.setItem('msnnext-palette', next)
     applyTheme()
   }
 
@@ -2638,6 +2647,14 @@
                 <button class:active={theme === 'light'} onclick={() => setTheme('light')}><Sun size={16} /> {$t('theme.light')}</button>
                 <button class:active={theme === 'dark'} onclick={() => setTheme('dark')}><Moon size={16} /> {$t('theme.dark')}</button>
                 <button class:active={theme === 'system'} onclick={() => setTheme('system')}><Monitor size={16} /> {$t('theme.system')}</button>
+              </div>
+              <div class="settings-palette-control" role="group" aria-label={$t('theme.styleGroup')}>
+                <button class:active={palette === 'classic'} onclick={() => setPalette('classic')}>
+                  <span class="palette-swatch classic" aria-hidden="true"></span> {$t('theme.classic')}
+                </button>
+                <button class:active={palette === 'aurora'} onclick={() => setPalette('aurora')}>
+                  <span class="palette-swatch aurora" aria-hidden="true"></span> {$t('theme.aurora')}
+                </button>
               </div>
               <div class="settings-list">
                 <label class="settings-row"><span><strong>{$t('settings.textSize.title')}</strong><small>{$t('settings.textSize.hint')}</small></span><select bind:value={fontScale} aria-label={$t('settings.textSize.title')}><option value={100}>{$t('settings.textSize.original')}</option><option value={115}>{$t('settings.textSize.comfortable')}</option><option value={125}>{$t('settings.textSize.large')}</option><option value={140}>{$t('settings.textSize.xlarge')}</option></select></label>
