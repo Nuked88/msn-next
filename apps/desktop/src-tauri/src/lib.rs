@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 #[cfg(desktop)]
 use tauri::{
-    menu::{Menu, MenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     WindowEvent,
 };
@@ -64,6 +64,8 @@ struct StoredProfile {
     relay_address: String,
     #[serde(default = "default_font_scale")]
     font_scale: u16,
+    #[serde(default = "enabled_by_default")]
+    start_minimized: bool,
 }
 
 #[derive(Serialize)]
@@ -76,6 +78,7 @@ struct ProfileView {
     nudge_sound: bool,
     relay_address: String,
     font_scale: u16,
+    start_minimized: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -135,6 +138,7 @@ fn profile_view(data_dir: &Path, profile: StoredProfile) -> Result<ProfileView, 
         nudge_sound: profile.nudge_sound,
         relay_address: profile.relay_address,
         font_scale: profile.font_scale,
+        start_minimized: profile.start_minimized,
     })
 }
 
@@ -1181,6 +1185,7 @@ fn profile_save(
     nudge_sound: Option<bool>,
     relay_address: Option<String>,
     font_scale: Option<u16>,
+    start_minimized: Option<bool>,
 ) -> Result<ProfileView, String> {
     let name = name.trim();
     if name.is_empty() || name.len() > 64 {
@@ -1214,6 +1219,9 @@ fn profile_save(
     if !valid_font_scale(font_scale) {
         return Err("invalid text size".into());
     }
+    let start_minimized = start_minimized
+        .or_else(|| previous.as_ref().map(|profile| profile.start_minimized))
+        .unwrap_or(true);
     let relay_address = relay_address
         .or_else(|| {
             previous
@@ -1261,6 +1269,7 @@ fn profile_save(
         nudge_sound,
         relay_address,
         font_scale,
+        start_minimized,
     };
     std::fs::write(
         &profile_path,
@@ -1419,6 +1428,55 @@ fn node_stop(state: State<'_, NodeState>) -> Result<(), String> {
     Ok(())
 }
 
+/// True se l'app è stata lanciata dall'avvio automatico del sistema (arg passato
+/// dal plugin autostart), non da un avvio manuale dell'utente.
+#[cfg(desktop)]
+fn launched_at_startup() -> bool {
+    std::env::args().any(|arg| arg == "--autostarted")
+}
+
+/// Preferenza "avvia minimizzato" dal profilo salvato (default: attiva).
+#[cfg(desktop)]
+fn start_minimized_pref(app: &AppHandle) -> bool {
+    let Ok(data_dir) = app.path().app_data_dir() else {
+        return true;
+    };
+    std::fs::read(data_dir.join("profile.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<StoredProfile>(&bytes).ok())
+        .map(|profile| profile.start_minimized)
+        .unwrap_or(true)
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+fn autostart_get(app: AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+fn autostart_set(app: AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    if enabled { manager.enable() } else { manager.disable() }.map_err(|error| error.to_string())
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+fn autostart_get(_app: AppHandle) -> Result<bool, String> {
+    Ok(false)
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+fn autostart_set(_app: AppHandle, _enabled: bool) -> Result<(), String> {
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
@@ -1444,16 +1502,42 @@ pub fn run() {
             // Tray e chiusura-in-tray sono solo desktop; su mobile non esistono.
             #[cfg(desktop)]
             {
+                use tauri_plugin_autostart::ManagerExt;
+                // Primo avvio: abilita l'avvio automatico col sistema (default on).
+                // Un marker evita di riabilitarlo se l'utente lo disattiva.
+                if let Ok(data_dir) = app.path().app_data_dir() {
+                    let marker = data_dir.join("autostart.init");
+                    if !marker.exists() {
+                        let _ = app.autolaunch().enable();
+                        let _ = std::fs::create_dir_all(&data_dir);
+                        let _ = std::fs::write(&marker, b"1");
+                    }
+                }
+                let autostart_on = app.autolaunch().is_enabled().unwrap_or(false);
                 let open =
                     MenuItem::with_id(app, "tray-open", "Open msnnext", true, None::<&str>)?;
+                let autostart_item = CheckMenuItem::with_id(
+                    app,
+                    "tray-autostart",
+                    "Avvia con il sistema",
+                    true,
+                    autostart_on,
+                    None::<&str>,
+                )?;
                 let quit = MenuItem::with_id(app, "tray-quit", "Quit", true, None::<&str>)?;
-                let menu = Menu::with_items(app, &[&open, &quit])?;
+                let menu = Menu::with_items(app, &[&open, &autostart_item, &quit])?;
                 let mut tray = TrayIconBuilder::with_id("main")
                     .menu(&menu)
                     .show_menu_on_left_click(false)
                     .tooltip("msnnext")
-                    .on_menu_event(|app, event| match event.id().as_ref() {
+                    .on_menu_event(move |app, event| match event.id().as_ref() {
                         "tray-open" => show_main_window(app),
+                        "tray-autostart" => {
+                            let manager = app.autolaunch();
+                            let next = !manager.is_enabled().unwrap_or(false);
+                            let _ = if next { manager.enable() } else { manager.disable() };
+                            let _ = autostart_item.set_checked(next);
+                        }
                         "tray-quit" => app.exit(0),
                         _ => {}
                     })
@@ -1478,14 +1562,19 @@ pub fn run() {
         });
 
     #[cfg(desktop)]
-    let builder = builder.on_window_event(|window, event| {
-        if window.label() == "main" {
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+    let builder = builder
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--autostarted"]),
+        ))
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
             }
-        }
-    });
+        });
 
     builder
         .invoke_handler(tauri::generate_handler![
@@ -1529,6 +1618,8 @@ pub fn run() {
             profile_save,
             account_backup_export,
             account_backup_import,
+            autostart_get,
+            autostart_set,
             node_status,
             node_stop
         ])
@@ -1536,7 +1627,15 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if matches!(event, RunEvent::Ready) {
-                show_main_window(app);
+                // All'avvio automatico col sistema, se l'utente ha scelto "avvia
+                // minimizzato" (default), non mostriamo la finestra: resta nel tray.
+                #[cfg(desktop)]
+                let minimized = launched_at_startup() && start_minimized_pref(app);
+                #[cfg(not(desktop))]
+                let minimized = false;
+                if !minimized {
+                    show_main_window(app);
+                }
             }
         });
 }
