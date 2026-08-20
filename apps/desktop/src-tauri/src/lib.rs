@@ -142,9 +142,19 @@ fn parse_peer(value: &str) -> Result<libp2p_identity::PeerId, String> {
     msnnext_core::parse_peer_id(value)
 }
 
-// Secret storage is per-platform: OS keychain on desktop, app-private file on
-// mobile (Android sandboxes app storage; not yet Keystore-encrypted — Phase 1).
-#[cfg(desktop)]
+// Secret storage is per-platform: OS keychain on Windows/Linux desktop, a
+// machine-bound encrypted file on macOS, an app-private file on mobile.
+//
+// macOS uses a file instead of the Keychain because our app is ad-hoc signed
+// (no Developer ID): the Keychain binds an item to the creating binary's code
+// signature, so every rebuild/auto-update looks like a "different app" and
+// macOS prompts for the login password on each launch. The file is encrypted
+// at rest with a key derived from the machine's hardware UUID (never written to
+// disk), so a copied file (backup, cloud sync, another Mac) is undecryptable.
+// It is NOT protected against a process already running as this user — the
+// derivation is public — which would require Keychain/Secure Enclave and bring
+// back the prompt. This is a deliberate trade against that prompt.
+#[cfg(all(desktop, not(target_os = "macos")))]
 fn load_identity_secret(_data_dir: &Path) -> Result<Option<Vec<u8>>, String> {
     match identity_entry()?.get_secret() {
         Ok(bytes) => Ok(Some(bytes)),
@@ -153,7 +163,7 @@ fn load_identity_secret(_data_dir: &Path) -> Result<Option<Vec<u8>>, String> {
     }
 }
 
-#[cfg(desktop)]
+#[cfg(all(desktop, not(target_os = "macos")))]
 fn save_identity_secret(_data_dir: &Path, bytes: &[u8]) -> Result<(), String> {
     let entry = identity_entry()?;
     entry
@@ -163,6 +173,117 @@ fn save_identity_secret(_data_dir: &Path, bytes: &[u8]) -> Result<(), String> {
         return Err("keystore verification failed".into());
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_identity_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("identity.v1.enc")
+}
+
+// Key bound to this machine via the hardware UUID (ioreg). Never stored on disk.
+#[cfg(target_os = "macos")]
+fn macos_machine_key() -> Result<[u8; 32], String> {
+    let output = std::process::Command::new("/usr/sbin/ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+        .map_err(|error| format!("ioreg not runnable: {error}"))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let uuid = text
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("\"IOPlatformUUID\" = \"")
+                .and_then(|rest| rest.strip_suffix('"'))
+        })
+        .ok_or("IOPlatformUUID not found")?;
+    Ok(blake3::derive_key(
+        "msnnext macos identity-at-rest key v1",
+        uuid.as_bytes(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_encrypt(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let key = macos_machine_key()?;
+    let cipher = XChaCha20Poly1305::new_from_slice(&key)
+        .map_err(|_| "identity cipher init failed".to_owned())?;
+    let mut nonce = [0u8; 24];
+    OsRng.fill_bytes(&mut nonce);
+    let ciphertext = cipher
+        .encrypt(XNonce::from_slice(&nonce), bytes)
+        .map_err(|_| "identity encryption failed".to_owned())?;
+    let mut blob = Vec::with_capacity(25 + ciphertext.len());
+    blob.push(1); // format version
+    blob.extend_from_slice(&nonce);
+    blob.extend_from_slice(&ciphertext);
+    Ok(blob)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_decrypt(blob: &[u8]) -> Result<Vec<u8>, String> {
+    if blob.first() != Some(&1) || blob.len() < 25 {
+        return Err("invalid encrypted identity file".into());
+    }
+    let key = macos_machine_key()?;
+    XChaCha20Poly1305::new_from_slice(&key)
+        .map_err(|_| "identity cipher init failed".to_owned())?
+        .decrypt(XNonce::from_slice(&blob[1..25]), &blob[25..])
+        .map_err(|_| "identity not decryptable (different machine?)".to_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn load_identity_secret(data_dir: &Path) -> Result<Option<Vec<u8>>, String> {
+    let path = macos_identity_path(data_dir);
+    if path.exists() {
+        let blob = std::fs::read(&path).map_err(|error| error.to_string())?;
+        return Ok(Some(macos_decrypt(&blob)?));
+    }
+    // One-time migration: identity previously stored in the Keychain (this is
+    // the last launch that prompts for the login password) → encrypted file.
+    match identity_entry()?.get_secret() {
+        Ok(bytes) => {
+            save_identity_secret(data_dir, &bytes)?;
+            let _ = identity_entry().and_then(|entry| {
+                entry.delete_credential().map_err(|error| error.to_string())
+            });
+            Ok(Some(bytes))
+        }
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(format!("failed to read keystore: {error}")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn save_identity_secret(data_dir: &Path, bytes: &[u8]) -> Result<(), String> {
+    let blob = macos_encrypt(bytes)?;
+    let path = macos_identity_path(data_dir);
+    std::fs::write(&path, &blob).map_err(|error| error.to_string())?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    if macos_decrypt(&std::fs::read(&path).map_err(|error| error.to_string())?)? != bytes {
+        return Err("encrypted identity verification failed".into());
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_identity_tests {
+    use super::*;
+
+    #[test]
+    fn encrypted_identity_round_trips_and_rejects_tampering() {
+        let secret = b"nuked-identity-bytes-\x00\x01\x02\xff".to_vec();
+        let blob = macos_encrypt(&secret).expect("encrypt");
+        assert_ne!(&blob[25..], secret.as_slice(), "ciphertext must differ from plaintext");
+        assert_eq!(macos_decrypt(&blob).expect("decrypt"), secret);
+        // Truncated and tampered blobs are rejected, never mis-decrypted.
+        assert!(macos_decrypt(&blob[..20]).is_err());
+        let mut tampered = blob.clone();
+        *tampered.last_mut().unwrap() ^= 0xff;
+        assert!(macos_decrypt(&tampered).is_err());
+    }
 }
 
 #[cfg(not(desktop))]
