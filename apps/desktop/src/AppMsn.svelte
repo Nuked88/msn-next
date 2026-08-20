@@ -2595,14 +2595,7 @@
     <div class="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
       <button class="modal-close" aria-label={$t('window.close')} onclick={() => profileOpen = false}><X size={18} /></button>
       <header class="settings-header">
-        <div class="settings-avatar avatar-shell">
-          {#if avatarDataUrl}<img src={avatarDataUrl} alt="Avatar personale" />{:else}<span>{displayName.slice(0, 1).toUpperCase()}</span>{/if}
-        </div>
-        <div>
-          <p class="step-label">msnnext {appVersion}</p>
-          <h2 id="settings-title">{$t('settings.title')}</h2>
-          <small>{displayName}</small>
-        </div>
+        <h2 id="settings-title">{$t('settings.title')}</h2>
       </header>
 
       <div class="settings-shell">
