@@ -143,10 +143,14 @@ button:disabled {
 
 :root.desktop .app-frame {
   border-radius: var(--radius-lg);
+  /* clip-path ritaglia anche i figli posizionati (conversation-header, pane):
+     border-radius + overflow:hidden da solo li lascia sbordare su WebKit. */
+  clip-path: inset(0 round var(--radius-lg));
 }
 
 :root.desktop.maximized .app-frame {
   border-radius: 0;
+  clip-path: none;
 }
 
 .app-titlebar {
@@ -1328,7 +1332,9 @@ button:disabled {
    sempre allineato. L'orario compare nel margine sinistro solo al passaggio del
    mouse (stile Slack/Discord): i gruppi restano puliti, l'ora è lì se serve. */
 .message-line.continued {
-  margin-top: 2px;
+  /* Compatta i messaggi dello stesso mittente: annulla quasi del tutto il
+     margine del precedente così restano attaccati (niente spazio vuoto). */
+  margin-top: -11px;
 }
 
 .message-line.continued header {
