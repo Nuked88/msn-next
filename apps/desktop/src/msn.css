@@ -3598,6 +3598,50 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
   font-size: 0.625rem;
 }
 
+.contact-request-backdrop {
+  z-index: 96;
+  padding-top: max(env(safe-area-inset-top, 0px), 40px);
+}
+
+.contact-request-modal {
+  width: min(360px, 100%);
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  text-align: left;
+}
+
+.contact-request-avatar {
+  width: 44px;
+  height: 44px;
+  grid-row: span 2;
+}
+
+.contact-request-modal .contact-request-copy {
+  gap: 4px;
+}
+
+.contact-request-modal .contact-request-copy strong {
+  font-size: 0.875rem;
+}
+
+.contact-request-modal .contact-request-copy small {
+  font-size: 0.6875rem;
+  white-space: normal;
+}
+
+.contact-request-modal .contact-request-actions {
+  grid-column: 1 / -1;
+  justify-content: flex-end;
+  margin-top: 6px;
+}
+
+.contact-request-modal .contact-request-actions button {
+  min-height: 36px;
+  padding-inline: 18px;
+}
+
 .deleted-message {
   display: inline-flex;
   align-items: center;

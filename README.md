@@ -18,7 +18,7 @@ A P2P desktop messenger inspired by MSN Messenger. Its goal is to keep text, nud
 - onboarding, adding contacts through `msnnext://add/...` links, rendered QR codes, and QR scanning from images;
 - native file and image picker plus drag and drop;
 - persistent group chats with up to 32 participants, routed through individual encrypted channels;
-- separate conversations per Peer ID;
+- one conversation per contact: every linked device of that contact shares the same chat;
 - contacts, history, and identity persist across restarts;
 - multi-device linking through a one-time QR/code, with a distinct Peer ID for every installation;
 - typed bridge between GUI and core through Tauri commands and events.
@@ -30,6 +30,7 @@ A P2P desktop messenger inspired by MSN Messenger. Its goal is to keep text, nud
 - LAN discovery through mDNS;
 - Identify, Kademlia DHT, AutoNAT, DCUtR, and Circuit Relay v2;
 - signed contact links and verification that the public key matches the Peer ID;
+- hybrid Ed25519 + ML-DSA-65 account proof carried in presence, binding each device to its account: a contact's newly linked devices are recognized without a second approval, and an unproven peer still requires explicit consent;
 - hybrid X25519 + ML-KEM-768 application handshake;
 - application messages encrypted with XChaCha20-Poly1305 and a symmetric ratchet;
 - replay protection and limited support for out-of-order messages;

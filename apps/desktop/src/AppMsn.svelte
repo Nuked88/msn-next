@@ -473,6 +473,10 @@
     }
     window.addEventListener('contextmenu', blockNativeMenu)
     window.addEventListener('keydown', openPreferences)
+    const refreshPendingContactRequests = () => {
+      if (document.visibilityState === 'visible') void requestPendingContactRequests()
+    }
+    document.addEventListener('visibilitychange', refreshPendingContactRequests)
     if (isTauri()) {
       void getVersion().then((version) => appVersion = version)
       void initializeApp().then((stop) => unlisten = stop)
@@ -498,6 +502,7 @@
       void appWindow.onFocusChanged(({ payload: focused }) => {
         windowFocused = focused
         if (focused) {
+          void requestPendingContactRequests()
           markActiveConversationRead()
           void appWindow.requestUserAttention(null)
           if (selectedPeerId || selectedGroupId) void focusComposer()
@@ -518,6 +523,7 @@
       if (updateTimer) clearTimeout(updateTimer)
       window.removeEventListener('contextmenu', blockNativeMenu)
       window.removeEventListener('keydown', openPreferences)
+      document.removeEventListener('visibilitychange', refreshPendingContactRequests)
       media.removeEventListener('change', syncSystemTheme)
     }
   })
@@ -551,6 +557,7 @@
       running = isRunning
       setupOpen = false
       if (!isRunning) await startNode(false)
+      else await requestPendingContactRequests()
     } catch (error) {
       setupOpen = true
       showToast(String(error))
@@ -1799,6 +1806,20 @@
     devicePairingOpen = true
   }
 
+  // Dal setup iniziale: collega questo dispositivo a un account esistente
+  // scansionando/incollando il codice dal PC. Serve prima essere online (crea
+  // l'identità locale che diventa un dispositivo collegato).
+  async function linkDeviceFromSetup() {
+    if (!displayName.trim()) {
+      showToast($t('setup.nameFirst'))
+      return
+    }
+    if (!running) await startNode()
+    if (!running) return
+    setupOpen = false
+    joinDevicePairing()
+  }
+
   async function importDevicePairing() {
     if (!devicePairingLink.trim() || devicePairingBusy) return
     devicePairingBusy = true
@@ -2008,6 +2029,12 @@
     contactRequests = contactRequests.filter((request) => request.peerId !== peerId)
     try { await invoke('node_accept_contact_request', { peerId }) }
     catch (error) { showToast(String(error)) }
+  }
+
+  async function requestPendingContactRequests() {
+    if (!isTauri() || !running) return
+    try { await invoke('node_request_pending_contact_requests') }
+    catch (error) { console.warn('Richieste contatto non recuperabili', error) }
   }
 
   async function rejectContactRequest(peerId: string) {
@@ -2483,11 +2510,6 @@
 
 {#if setupOpen}
   <div class="modal-backdrop">
-    <div class="modal-theme-switcher" role="group" aria-label={$t('modal.windowTheme')}>
-      <button class:active={theme === 'light'} onclick={() => setTheme('light')}><Sun size={14} /> {$t('theme.light')}</button>
-      <button class:active={theme === 'dark'} onclick={() => setTheme('dark')}><Moon size={14} /> {$t('theme.dark')}</button>
-      <button class:active={theme === 'system'} onclick={() => setTheme('system')}><Monitor size={14} /> {$t('theme.system')}</button>
-    </div>
     <div class="modal setup-modal" role="dialog" aria-modal="true" aria-labelledby="setup-title">
       {#if running}<button class="modal-close" aria-label={$t('window.close')} onclick={() => setupOpen = false}><X size={18} /></button>{/if}
       <div class="modal-sky">
@@ -2507,6 +2529,7 @@
         <button class="primary-button wide" disabled={starting || !displayName.trim()} onclick={() => startNode()}>
           {starting ? $t('setup.connecting') : $t('setup.goOnline')}
         </button>
+        <button class="secondary-button wide" onclick={linkDeviceFromSetup}><Link2 size={14} /> {$t('setup.linkDevice')}</button>
         <button class="secondary-button wide" onclick={prepareAccountBackupImport}><Upload size={14} /> {$t('setup.restore')}</button>
         <small class="modal-foot">{$t('setup.foot')}</small>
       </div>
@@ -2516,11 +2539,6 @@
 
 {#if connectOpen}
   <div class="modal-backdrop">
-    <div class="modal-theme-switcher" role="group" aria-label={$t('modal.windowTheme')}>
-      <button class:active={theme === 'light'} onclick={() => setTheme('light')}><Sun size={14} /> {$t('theme.light')}</button>
-      <button class:active={theme === 'dark'} onclick={() => setTheme('dark')}><Moon size={14} /> {$t('theme.dark')}</button>
-      <button class:active={theme === 'system'} onclick={() => setTheme('system')}><Monitor size={14} /> {$t('theme.system')}</button>
-    </div>
     <div class="modal connect-modal" role="dialog" aria-modal="true" aria-labelledby="connect-title">
       <button class="modal-close" aria-label={$t('window.close')} onclick={() => connectOpen = false}><X size={18} /></button>
       <div class="modal-heading">
@@ -2869,12 +2887,13 @@
 {/if}
 
 {#if contactRequests.length}
-  <div class="contact-requests" role="region" aria-label={$t('contactRequest.title')}>
-    {#each contactRequests as request (request.peerId)}
-      <div class="contact-request-card">
-        <span class="avatar-shell contact-avatar"><span>{request.name.slice(0, 1).toUpperCase()}</span></span>
+  {#if isMobile}
+    {@const request = contactRequests[0]}
+    <div class="modal-backdrop contact-request-backdrop">
+      <div class="modal contact-request-modal" role="dialog" aria-modal="true" aria-labelledby="contact-request-title">
+        <span class="avatar-shell contact-request-avatar"><span>{request.name.slice(0, 1).toUpperCase()}</span></span>
         <div class="contact-request-copy">
-          <strong>{$t('contactRequest.title')}</strong>
+          <strong id="contact-request-title">{$t('contactRequest.title')}</strong>
           <small>{$t('contactRequest.wants', { name: request.name })}</small>
         </div>
         <div class="contact-request-actions">
@@ -2882,8 +2901,24 @@
           <button class="primary-button" onclick={() => acceptContactRequest(request.peerId)}>{$t('offer.accept')}</button>
         </div>
       </div>
-    {/each}
-  </div>
+    </div>
+  {:else}
+    <div class="contact-requests" role="region" aria-label={$t('contactRequest.title')}>
+      {#each contactRequests as request (request.peerId)}
+        <div class="contact-request-card">
+          <span class="avatar-shell contact-avatar"><span>{request.name.slice(0, 1).toUpperCase()}</span></span>
+          <div class="contact-request-copy">
+            <strong>{$t('contactRequest.title')}</strong>
+            <small>{$t('contactRequest.wants', { name: request.name })}</small>
+          </div>
+          <div class="contact-request-actions">
+            <button class="secondary-button" onclick={() => rejectContactRequest(request.peerId)}>{$t('offer.decline')}</button>
+            <button class="primary-button" onclick={() => acceptContactRequest(request.peerId)}>{$t('offer.accept')}</button>
+          </div>
+        </div>
+      {/each}
+    </div>
+  {/if}
 {/if}
 
 {#if toastText}

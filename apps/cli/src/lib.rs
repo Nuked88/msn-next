@@ -11,11 +11,12 @@ use chacha20poly1305::aead::rand_core::{OsRng, RngCore};
 use connectivity::{relay_route, split_peer_address, FallbackPlanner, Recovery};
 use crypto::{
     accepts_inbound, needs_outbound_handshake, respond as respond_hybrid, should_initiate,
-    HybridInitiator, HybridResponse, RatchetMessage, RatchetSession, SessionKey,
+    verify_account_proof, AccountIdentity, HybridInitiator, HybridResponse, RatchetMessage,
+    RatchetSession, SessionKey,
 };
 use devices::{DeviceDescriptor, DeviceRequest, DeviceResponse, PairingLink, SealedDeviceMessage};
 use futures::StreamExt;
-use history::{DeviceEntry, GroupChatEntry, History};
+use history::{ContactEntry, DeviceEntry, GroupChatEntry, History};
 use libp2p::{
     autonat, dcutr, identify,
     identity::Keypair,
@@ -31,7 +32,8 @@ use libp2p::{
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm,
 };
 use msnnext_protocol::{
-    resolve_emoticons, validate_text_message, validate_triggers, AttachmentManifest, ChatEvent,
+    resolve_emoticons, validate_text_message, validate_triggers, AccountProof, AttachmentManifest,
+    ChatEvent,
     DeleteRequest, Emoticon, EmoticonOffer, Envelope, GroupAttachmentOffer, GroupBan,
     GroupDefinition, GroupTextMessage, Mime, Nudge, NudgeRateLimit, PresenceUpdate,
     ProtocolResponse, TextMessage, Trigger, PROTOCOL_VERSION,
@@ -152,6 +154,7 @@ pub enum ClientCommand {
     RejectContactRequest {
         peer: PeerId,
     },
+    RequestPendingContactRequests,
     DeleteMessageForMe {
         event_id: String,
     },
@@ -211,6 +214,7 @@ impl ClientCommand {
             | Self::CancelFileTransfers
             | Self::AcceptAttachment { .. }
             | Self::RejectAttachment { .. }
+            | Self::RequestPendingContactRequests
             | Self::SetNotificationMute { .. }
             | Self::ImportContactLink { .. }
             | Self::RequestContactLink
@@ -663,6 +667,12 @@ pub async fn run(
         .filter_map(|peer| peer.parse::<PeerId>().ok())
         .collect::<HashSet<_>>();
     let local_peer_id = PeerId::from(identity.public());
+    // Identità di account: derivata dalla chiave di account condivisa fra i
+    // dispositivi collegati (la chiave stessa non lascia mai il dispositivo).
+    // Firma la prova con cui i contatti riconoscono i nostri dispositivi senza
+    // doverli approvare di nuovo.
+    let mut account_identity = AccountIdentity::from_account_key(&account_key)?;
+    let mut account_proof = account_identity.proof(local_peer_id).ok();
     let mut swarm = build_swarm(identity, args.relay_server)?;
 
     swarm.listen_on(args.listen.clone())?;
@@ -715,10 +725,17 @@ pub async fn run(
     // Peer che ci hanno contattato ma non sono ancora contatti: in attesa che
     // l'utente accetti/rifiuti (niente auto-aggiunta senza consenso).
     let mut pending_contact_requests = HashMap::<PeerId, String>::new();
+    // Account dimostrato da chi è ancora in attesa di approvazione: alla
+    // conferma lega subito la persona, così i suoi altri dispositivi non
+    // chiedono una seconda approvazione.
+    let mut pending_accounts = HashMap::<PeerId, String>::new();
     let mut reconnect_at = HashMap::<PeerId, Instant>::new();
     let mut reconnect_attempts = HashMap::<PeerId, u8>::new();
     let mut bootstrap_fallbacks = HashMap::<PeerId, VecDeque<Multiaddr>>::new();
     let mut known_contacts = HashSet::<PeerId>::new();
+    // Dispositivi collegati dei contatti: un contatto è una persona, non un
+    // singolo peer.
+    let mut contact_devices = ContactDevices::default();
     let infrastructure_peers = args
         .bootstrap
         .iter()
@@ -820,6 +837,9 @@ pub async fn run(
             history.delete_contact(&peer_id.to_string())?;
             continue;
         }
+        if !contact.account_id.is_empty() {
+            contact_devices.bind(peer_id, contact.account_id.clone());
+        }
         peer_names.insert(peer_id, name.clone());
         known_contacts.insert(peer_id);
         let _ = events.send(ClientEvent::ContactUpdated {
@@ -831,36 +851,7 @@ pub async fn run(
                 fingerprint: peer_fingerprint(peer_id),
             },
         });
-        let messages = history
-            .conversation(&peer_id.to_string(), 100)?
-            .into_iter()
-            .rev()
-            .map(|entry| {
-                let attachment = (entry.kind == "file")
-                    .then(|| decode_attachment(&entry.body))
-                    .flatten();
-                let text = (entry.kind == "text").then(|| decode_text_history(&entry.body));
-                ClientMessage {
-                    peer_id: entry.peer,
-                    direction: entry.direction,
-                    kind: entry.kind,
-                    body: text.as_ref().map_or_else(
-                        || {
-                            attachment
-                                .as_ref()
-                                .map_or(entry.body, |item| item.2.clone())
-                        },
-                        |message| message.text.clone(),
-                    ),
-                    timestamp_ms: entry.timestamp_ms,
-                    emoticons: text.as_ref().map(client_emoticon_spans).unwrap_or_default(),
-                    attachment_id: attachment.as_ref().map(|item| item.0.clone()),
-                    attachment_mime: attachment.map(|item| item.1),
-                    event_id: Some(entry.event_id),
-                    relayed: false,
-                }
-            })
-            .collect();
+        let messages = conversation_messages(&history, &peer_id.to_string())?;
         let _ = events.send(ClientEvent::ConversationLoaded {
             peer_id: peer_id.to_string(),
             messages,
@@ -1004,7 +995,7 @@ pub async fn run(
                     if should_initiate(local_peer_id, peer) {
                         maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
                     } else {
-                        send_event(&mut swarm, &mut sessions, peer, local_peer_id, &mut sent_numbers, ChatEvent::Presence(PresenceUpdate { display_name: display_name.clone(), online: true, status: presence_status.clone() }));
+                        send_event(&mut swarm, &mut sessions, &contact_devices, peer, local_peer_id, &mut sent_numbers, ChatEvent::Presence(presence_update(&display_name, &presence_status, true, &account_proof)));
                     }
                 }
             }
@@ -1112,7 +1103,7 @@ pub async fn run(
                     for peer in &peers {
                         match nudge_limits.entry(*peer).or_default().try_acquire(now) {
                             Ok(()) => {
-                                send_event(&mut swarm, &mut sessions, *peer, local_peer_id, &mut sent_numbers, ChatEvent::Nudge(Nudge { id, intensity: 1, timestamp_ms: now }));
+                                send_event(&mut swarm, &mut sessions, &contact_devices, *peer, local_peer_id, &mut sent_numbers, ChatEvent::Nudge(Nudge { id, intensity: 1, timestamp_ms: now }));
                                 record(&history, peer, "out", "nudge", "trillo");
                             }
                             Err(wait_ms) => eprintln!("trillo limitato per {peer}: riprova tra {}s", wait_ms.div_ceil(1_000)),
@@ -1128,13 +1119,13 @@ pub async fn run(
                     let message = TextMessage { text, emoticons, id: message_id };
                     for peer in &peers { record_text(&history, peer, "out", &message); }
                     let event = ChatEvent::Text(message);
-                    broadcast(&mut swarm, &mut sessions, &peers, local_peer_id, &mut sent_numbers, event);
+                    broadcast(&mut swarm, &mut sessions, &contact_devices, &peers, local_peer_id, &mut sent_numbers, event);
                 }
                 Some(line) if line.starts_with("emote ") => match parse_emote_command(&line, &args.emotes, &mut triggers) {
                     Ok(offer) => {
                         println!("emoticon salvata: {}", offer.metadata.name);
                         for peer in &peers { record(&history, peer, "out", "emote", &offer.metadata.name); }
-                        broadcast(&mut swarm, &mut sessions, &peers, local_peer_id, &mut sent_numbers, ChatEvent::EmoticonOffer(offer));
+                        broadcast(&mut swarm, &mut sessions, &contact_devices, &peers, local_peer_id, &mut sent_numbers, ChatEvent::EmoticonOffer(offer));
                     }
                     Err(error) => eprintln!("emoticon rifiutata: {error}"),
                 },
@@ -1145,7 +1136,7 @@ pub async fn run(
                         println!("offerta file: {} ({} chunk)", manifest.filename, manifest.chunks.len());
                         for peer in &peers {
                             record(&history, peer, "out", "file", &manifest.filename);
-                            if let Some(request_id) = send_event(&mut swarm, &mut sessions, *peer, local_peer_id, &mut sent_numbers, ChatEvent::AttachmentOffer(manifest.clone())) {
+                            if let Some(request_id) = send_event(&mut swarm, &mut sessions, &contact_devices, *peer, local_peer_id, &mut sent_numbers, ChatEvent::AttachmentOffer(manifest.clone())) {
                                 pending_offers.insert(request_id, PendingOffer { peer: *peer, path: path.clone(), manifest: manifest.clone(), retries: 0, group_id: None });
                             }
                         }
@@ -1273,10 +1264,11 @@ pub async fn run(
                         broadcast(
                             &mut swarm,
                             &mut sessions,
+                            &contact_devices,
                             &peers,
                             local_peer_id,
                             &mut sent_numbers,
-                            ChatEvent::Presence(PresenceUpdate { display_name: display_name.clone(), online: true, status: presence_status.clone() }),
+                            ChatEvent::Presence(presence_update(&display_name, &presence_status, true, &account_proof)),
                         );
                     }
                 }
@@ -1332,7 +1324,7 @@ pub async fn run(
                     // parallelo, così appena è pronto si passa al canale diretto.
                     // Senza dispositivi collegati si prosegue sotto: il messaggio
                     // viene accodato finché la sessione diretta non è disponibile.
-                    if !sessions.contains_key(&peer) && !online_devices.is_empty() {
+                    if !contact_devices.secure(peer, &sessions) && !online_devices.is_empty() {
                         let mut message_id = [0u8; 16];
                         OsRng.fill_bytes(&mut message_id);
                         let emoticons = resolve_emoticons(&text, &triggers).unwrap_or_default();
@@ -1378,6 +1370,7 @@ pub async fn run(
                                         send_event(
                                             &mut swarm,
                                             &mut sessions,
+                                            &contact_devices,
                                             peer,
                                             local_peer_id,
                                             &mut sent_numbers,
@@ -1409,8 +1402,8 @@ pub async fn run(
                     // Affidabilità: se la sessione cifrata è pronta invia e traccia
                     // per il retry; altrimenti accoda e avvia l'handshake — il
                     // messaggio parte al completamento (niente drop silenziosi).
-                    if sessions.contains_key(&peer) {
-                        match send_event(&mut swarm, &mut sessions, peer, local_peer_id, &mut sent_numbers, event.clone()) {
+                    if contact_devices.secure(peer, &sessions) {
+                        match send_event(&mut swarm, &mut sessions, &contact_devices, peer, local_peer_id, &mut sent_numbers, event.clone()) {
                             Some(request_id) => {
                                 pending_messages.insert(request_id, (peer, event, 0));
                             }
@@ -1446,10 +1439,11 @@ pub async fn run(
                     id[..8].copy_from_slice(&timestamp_ms.to_be_bytes());
                     id[8..].copy_from_slice(&nudge_counter.to_be_bytes());
                     match nudge_limits.entry(peer).or_default().try_acquire(timestamp_ms) {
-                        Ok(()) if peers.contains(&peer) => {
+                        Ok(()) if contact_devices.online(peer, &peers) => {
                             if send_event(
                                 &mut swarm,
                                 &mut sessions,
+                                &contact_devices,
                                 peer,
                                 local_peer_id,
                                 &mut sent_numbers,
@@ -1488,7 +1482,7 @@ pub async fn run(
                     }
                 }
                 Some(ClientCommand::SendFile { peer, path }) => {
-                    if !peers.contains(&peer) {
+                    if !contact_devices.online(peer, &peers) {
                         let _ = events.send(ClientEvent::Error {
                             message: "contatto non collegato".into(),
                         });
@@ -1504,6 +1498,7 @@ pub async fn run(
                             if let Some(request_id) = send_event(
                                 &mut swarm,
                                 &mut sessions,
+                                &contact_devices,
                                 peer,
                                 local_peer_id,
                                 &mut sent_numbers,
@@ -1627,7 +1622,7 @@ pub async fn run(
                             let name = name.trim().to_owned();
                             peer_names.insert(peer, name.clone());
                             let _ = events.send(ClientEvent::ContactUpdated { contact: ClientContact {
-                                peer_id: peer.to_string(), name, online: peers.contains(&peer), secure: sessions.contains_key(&peer), fingerprint: peer_fingerprint(peer),
+                                peer_id: peer.to_string(), name, online: contact_devices.online(peer, &peers), secure: contact_devices.secure(peer, &sessions), fingerprint: peer_fingerprint(peer),
                             }});
                         }
                         Err(error) => { let _ = events.send(ClientEvent::Error { message: error.to_string() }); }
@@ -1642,6 +1637,18 @@ pub async fn run(
                 Some(ClientCommand::DeleteContact { peer }) => {
                     match history.delete_contact(&peer.to_string()) {
                         Ok(()) => {
+                            // Bloccare una persona blocca tutti i suoi dispositivi.
+                            for device in contact_devices.forget(peer) {
+                                history.delete_contact(&device.to_string())?;
+                                ignored_contacts.insert(device);
+                                known_contacts.remove(&device);
+                                peer_names.remove(&device);
+                                peers.remove(&device);
+                                sessions.remove(&device);
+                                reconnect_at.remove(&device);
+                                reconnect_attempts.remove(&device);
+                                let _ = swarm.disconnect_peer_id(device);
+                            }
                             ignored_contacts.insert(peer);
                             known_contacts.remove(&peer);
                             peer_names.remove(&peer);
@@ -1660,6 +1667,13 @@ pub async fn run(
                         ignored_contacts.remove(&peer);
                         history.allow_contact(&peer.to_string())?;
                         history.ensure_contact(&peer.to_string(), &name, now_ms())?;
+                        // Approvata la persona, i suoi altri dispositivi non
+                        // dovranno più chiedere.
+                        if let Some(account) = pending_accounts.remove(&peer) {
+                            if contact_devices.bind(peer, account.clone()) {
+                                history.bind_contact_account(&peer.to_string(), &account, now_ms())?;
+                            }
+                        }
                         known_contacts.insert(peer);
                         peer_names.entry(peer).or_insert_with(|| name.clone());
                         peers.insert(peer);
@@ -1667,23 +1681,35 @@ pub async fn run(
                             peer_id: peer.to_string(),
                             name: peer_names.get(&peer).cloned().unwrap_or(name),
                             online: true,
-                            secure: sessions.contains_key(&peer),
+                            secure: contact_devices.secure(peer, &sessions),
                             fingerprint: peer_fingerprint(peer),
                         }});
                         // Ricambia la presence e avvia il canale cifrato.
-                        send_event(&mut swarm, &mut sessions, peer, local_peer_id, &mut sent_numbers,
-                            ChatEvent::Presence(PresenceUpdate { display_name: display_name.clone(), online: true, status: presence_status.clone() }));
+                        send_event(&mut swarm, &mut sessions, &contact_devices, peer, local_peer_id, &mut sent_numbers,
+                            ChatEvent::Presence(presence_update(&display_name, &presence_status, true, &account_proof)));
                         maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
                     }
                 }
                 Some(ClientCommand::RejectContactRequest { peer }) => {
                     pending_contact_requests.remove(&peer);
+                    pending_accounts.remove(&peer);
                     ignored_contacts.insert(peer);
                     known_contacts.remove(&peer);
                     peers.remove(&peer);
                     sessions.remove(&peer);
                     let _ = swarm.disconnect_peer_id(peer);
                     let _ = events.send(ClientEvent::ContactRemoved { peer_id: peer.to_string() });
+                }
+                Some(ClientCommand::RequestPendingContactRequests) => {
+                    // Gli eventi UI non vengono conservati da Tauri. Su mobile la
+                    // WebView può essere sospesa o ricreata mentre il nodo continua
+                    // a girare: ripubblica quindi le richieste ancora in attesa.
+                    for (peer, name) in &pending_contact_requests {
+                        let _ = events.send(ClientEvent::ContactRequest {
+                            peer_id: peer.to_string(),
+                            name: name.clone(),
+                        });
+                    }
                 }
                 Some(ClientCommand::DeleteMessageForMe { event_id }) => {
                     if let Err(error) = history.delete_event(&event_id, now_ms()) {
@@ -1701,7 +1727,7 @@ pub async fn run(
                             } else if now_ms().saturating_sub(timestamp_ms) > DELETE_WINDOW_MS {
                                 let _ = events.send(ClientEvent::Error { message: "tempo scaduto per la cancellazione per tutti".into() });
                             } else if let Some(id) = parse_message_id(&event_id) {
-                                send_event(&mut swarm, &mut sessions, peer, local_peer_id, &mut sent_numbers,
+                                send_event(&mut swarm, &mut sessions, &contact_devices, peer, local_peer_id, &mut sent_numbers,
                                     ChatEvent::DeleteMessage(DeleteRequest { id, group_id: None }));
                                 if let Err(error) = history.tombstone_event(&event_id, now_ms()) {
                                     let _ = events.send(ClientEvent::Error { message: error.to_string() });
@@ -1728,13 +1754,10 @@ pub async fn run(
                         "busy" | "away" => status,
                         _ => "online".to_string(),
                     };
-                    let update = PresenceUpdate {
-                        display_name: display_name.clone(),
-                        online: true,
-                        status: presence_status.clone(),
-                    };
+                    let update =
+                        presence_update(&display_name, &presence_status, true, &account_proof);
                     for &peer in &peers {
-                        send_event(&mut swarm, &mut sessions, peer, local_peer_id, &mut sent_numbers, ChatEvent::Presence(update.clone()));
+                        send_event(&mut swarm, &mut sessions, &contact_devices, peer, local_peer_id, &mut sent_numbers, ChatEvent::Presence(update.clone()));
                     }
                 }
                 Some(ClientCommand::CreateChatGroup { name, members }) => {
@@ -1766,7 +1789,7 @@ pub async fn run(
                     history.save_group_chat(&group)?;
                     let definition = group_definition(&group)?;
                     for member in group.members.iter().filter_map(|value| value.parse::<PeerId>().ok()).filter(|peer| *peer != local_peer_id) {
-                        send_event(&mut swarm, &mut sessions, member, local_peer_id, &mut sent_numbers, ChatEvent::GroupDefinition(definition.clone()));
+                        send_event(&mut swarm, &mut sessions, &contact_devices, member, local_peer_id, &mut sent_numbers, ChatEvent::GroupDefinition(definition.clone()));
                     }
                     send_group_chats(&history.group_chats()?, &events);
                     let _ = events.send(ClientEvent::GroupConversationLoaded { group_id: group.id, messages: Vec::new() });
@@ -1802,6 +1825,7 @@ pub async fn run(
                         send_event(
                             &mut swarm,
                             &mut sessions,
+                            &contact_devices,
                             member,
                             local_peer_id,
                             &mut sent_numbers,
@@ -1853,12 +1877,12 @@ pub async fn run(
                             if shared_emoticons.insert((*recipient, asset_id)) {
                                 if let Some(trigger) = triggers.iter().find(|trigger| trigger.asset_id == asset_id) {
                                     if let Ok(offer) = load_emoticon_offer(&args.emotes, trigger) {
-                                        send_event(&mut swarm, &mut sessions, *recipient, local_peer_id, &mut sent_numbers, ChatEvent::EmoticonOffer(offer));
+                                        send_event(&mut swarm, &mut sessions, &contact_devices, *recipient, local_peer_id, &mut sent_numbers, ChatEvent::EmoticonOffer(offer));
                                     }
                                 }
                             }
                         }
-                        send_event(&mut swarm, &mut sessions, *recipient, local_peer_id, &mut sent_numbers, group_event.clone());
+                        send_event(&mut swarm, &mut sessions, &contact_devices, *recipient, local_peer_id, &mut sent_numbers, group_event.clone());
                     }
                     history.record(&group_history_key(&group_id), "out", &format!("group-text:{local_peer_id}"), &encode_text_history(&message)?, timestamp_ms)?;
                     let _ = events.send(ClientEvent::GroupMessage { message: ClientGroupMessage {
@@ -1912,6 +1936,7 @@ pub async fn run(
                                 if let Some(request_id) = send_event(
                                     &mut swarm,
                                     &mut sessions,
+                                    &contact_devices,
                                     recipient,
                                     local_peer_id,
                                     &mut sent_numbers,
@@ -2155,19 +2180,21 @@ pub async fn run(
                     if (known_contacts.contains(&peer_id) || is_manual) && peers.insert(peer_id) {
                         println!("connesso: {peer_id}");
                         log::info!("connesso: {peer_id}");
+                        // La UI conosce il contatto, non il suo singolo dispositivo.
+                        let contact = contact_devices.canonical(peer_id);
                         let _ = events.send(ClientEvent::ContactUpdated {
                             contact: ClientContact {
-                                peer_id: peer_id.to_string(),
+                                peer_id: contact.to_string(),
                                 name: peer_names
-                                    .get(&peer_id)
+                                    .get(&contact)
                                     .cloned()
                                     .unwrap_or_else(|| "Nuovo contatto".into()),
                                 online: true,
-                                secure: false,
-                                fingerprint: peer_fingerprint(peer_id),
+                                secure: contact_devices.secure(contact, &sessions),
+                                fingerprint: peer_fingerprint(contact),
                             },
                         });
-                        send_event(&mut swarm, &mut sessions, peer_id, local_peer_id, &mut sent_numbers, ChatEvent::Presence(PresenceUpdate { display_name: display_name.clone(), online: true, status: presence_status.clone() }));
+                        send_event(&mut swarm, &mut sessions, &contact_devices, peer_id, local_peer_id, &mut sent_numbers, ChatEvent::Presence(presence_update(&display_name, &presence_status, true, &account_proof)));
                         // Avvia subito l'handshake appena la connessione è su, senza
                         // attendere il round-trip della presence (che può perdersi).
                         handshake_retries.remove(&peer_id);
@@ -2192,18 +2219,23 @@ pub async fn run(
                         if was_application_peer {
                             println!("offline: {} ({cause:?})", peer_names.get(&peer_id).map_or_else(|| peer_id.to_string(), Clone::clone));
                             log::info!("offline: {peer_id} ({cause:?})");
-                            let _ = events.send(ClientEvent::ContactUpdated {
-                                contact: ClientContact {
-                                    peer_id: peer_id.to_string(),
-                                    name: peer_names
-                                        .get(&peer_id)
-                                        .cloned()
-                                        .unwrap_or_else(|| "Contatto".into()),
-                                    online: false,
-                                    secure: false,
-                                    fingerprint: peer_fingerprint(peer_id),
-                                },
-                            });
+                            // Un contatto va offline solo quando cade l'ultimo dei
+                            // suoi dispositivi.
+                            let contact = contact_devices.canonical(peer_id);
+                            if !contact_devices.online(contact, &peers) {
+                                let _ = events.send(ClientEvent::ContactUpdated {
+                                    contact: ClientContact {
+                                        peer_id: contact.to_string(),
+                                        name: peer_names
+                                            .get(&contact)
+                                            .cloned()
+                                            .unwrap_or_else(|| "Contatto".into()),
+                                        online: false,
+                                        secure: false,
+                                        fingerprint: peer_fingerprint(contact),
+                                    },
+                                });
+                            }
                         }
                         if should_reconnect_closed_peer(
                             known_contacts.contains(&peer_id) || known_devices.contains_key(&peer_id),
@@ -2220,7 +2252,34 @@ pub async fn run(
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Chat(request_response::Event::Message { peer, message, .. })) => match message {
                     request_response::Message::Request { request, channel, .. } => {
-                        let validation = if ignored_contacts.contains(&peer) {
+                        // Riconosci il mittente PRIMA di decidere se è uno
+                        // sconosciuto: un dispositivo che dimostra di appartenere
+                        // all'account di un contatto già approvato non lo è.
+                        let mut source_account = None;
+                        if let ChatEvent::Presence(presence) = &request.event {
+                            let source = recognize_presence(
+                                &mut contact_devices,
+                                &known_contacts,
+                                &history.contacts()?,
+                                peer,
+                                presence,
+                            );
+                            source_account = source.account.clone();
+                            apply_presence_source(&source, peer, &mut PresenceBinding {
+                                history: &history,
+                                events: &events,
+                                known_contacts: &mut known_contacts,
+                                ignored_contacts: &mut ignored_contacts,
+                                peer_names: &mut peer_names,
+                                pending_contact_requests: &mut pending_contact_requests,
+                            })?;
+                        }
+                        // Cronologia e UI seguono sempre il contatto, non il
+                        // singolo dispositivo che ha aperto la connessione.
+                        let contact = contact_devices.canonical(peer);
+                        let validation = if ignored_contacts.contains(&peer)
+                            || ignored_contacts.contains(&contact)
+                        {
                             Err("contatto rimosso")
                         } else if matches!(&request.event, ChatEvent::Presence(_)) {
                             validate_envelope(peer, local_peer_id, &request)
@@ -2229,7 +2288,7 @@ pub async fn run(
                         };
                         let (response, valid) = match validation {
                             Ok(()) => (
-                                receive_event(peer, &request.event, &mut Incoming {
+                                receive_event(contact, &request.event, &mut Incoming {
                                     pending_emoticons: &mut pending_emoticons,
                                     events: &events,
                                     nudge_limits: &mut incoming_nudge_limits,
@@ -2254,6 +2313,11 @@ pub async fn run(
                                 // Presence non sollecitata da uno sconosciuto: niente
                                 // auto-aggiunta. Chiedi conferma all'utente una volta.
                                 if let ChatEvent::Presence(presence) = &request.event {
+                                    if !ignored_contacts.contains(&peer) {
+                                        if let Some(account) = &source_account {
+                                            pending_accounts.insert(peer, account.clone());
+                                        }
+                                    }
                                     if !ignored_contacts.contains(&peer)
                                         && pending_contact_requests
                                             .insert(peer, presence.display_name.clone())
@@ -2268,18 +2332,22 @@ pub async fn run(
                                 }
                             } else {
                                 if let ChatEvent::Presence(presence) = &request.event {
-                                    history.ensure_contact(
-                                        &peer.to_string(),
-                                        &presence.display_name,
-                                        now_ms(),
-                                    )?;
+                                    // Un nostro dispositivo collegato non è un
+                                    // contatto: non deve finire in rubrica.
+                                    if !known_devices.contains_key(&peer) {
+                                        history.ensure_contact(
+                                            &contact.to_string(),
+                                            &presence.display_name,
+                                            now_ms(),
+                                        )?;
+                                    }
                                 }
                                 if let Some(event) =
-                                    client_event_from_chat(peer, &request.event, "in", false, peer_names.get(&peer).map(String::as_str))
+                                    client_event_from_chat(contact, &request.event, "in", contact_devices.secure(contact, &sessions), peer_names.get(&contact).map(String::as_str))
                                 {
                                     let _ = events.send(event);
                                 }
-                                emit_contact_status(&events, peer, &request.event);
+                                emit_contact_status(&events, contact, &request.event);
                                 if should_classify_application_peer(
                                     true,
                                     infrastructure_peers.contains(&peer),
@@ -2291,14 +2359,16 @@ pub async fn run(
                                     send_event(
                                         &mut swarm,
                                         &mut sessions,
+                                        &contact_devices,
                                         peer,
                                         local_peer_id,
                                         &mut sent_numbers,
-                                        ChatEvent::Presence(PresenceUpdate {
-                                            display_name: display_name.clone(),
-                                            online: true,
-                                            status: presence_status.clone(),
-                                        }),
+                                        ChatEvent::Presence(presence_update(
+                                            &display_name,
+                                            &presence_status,
+                                            true,
+                                            &account_proof,
+                                        )),
                                     );
                                 }
                                 if event_authorizes_handshake(&request.event) {
@@ -2332,7 +2402,12 @@ pub async fn run(
                 },
                 SwarmEvent::Behaviour(BehaviourEvent::SecureChat(request_response::Event::Message { peer, message, .. })) => match message {
                     request_response::Message::Request { request_id, request, channel } => {
-                        let envelope = if ignored_contacts.contains(&peer) {
+                        // Il canale è per dispositivo, la conversazione è per
+                        // contatto: cronologia e UI seguono il contatto.
+                        let contact = contact_devices.canonical(peer);
+                        let envelope = if ignored_contacts.contains(&peer)
+                            || ignored_contacts.contains(&contact)
+                        {
                             Err("contatto rimosso")
                         } else {
                             sessions
@@ -2347,7 +2422,7 @@ pub async fn run(
                             Ok(envelope) => match validate_envelope(peer, local_peer_id, &envelope) {
                                 Ok(()) => {
                                     match incoming_offer_details(
-                                        peer,
+                                        contact,
                                         local_peer_id,
                                         &envelope.event,
                                         &history,
@@ -2355,8 +2430,8 @@ pub async fn run(
                                         Ok(Some((manifest, group_id))) => {
                                             if extension_auto_accepted(&manifest.filename, &auto_accept_extensions) {
                                                 // Estensione consentita: accetta senza chiedere.
-                                                let client_event = client_event_from_chat(peer, &envelope.event, "in", true, peer_names.get(&peer).map(String::as_str));
-                                                let resp = receive_event(peer, &envelope.event, &mut Incoming {
+                                                let client_event = client_event_from_chat(contact, &envelope.event, "in", true, peer_names.get(&contact).map(String::as_str));
+                                                let resp = receive_event(contact, &envelope.event, &mut Incoming {
                                                     pending_emoticons: &mut pending_emoticons,
                                                     events: &events,
                                                     nudge_limits: &mut incoming_nudge_limits,
@@ -2389,14 +2464,17 @@ pub async fn run(
                                             let offer_id = inbound_offer_counter;
                                             let _ = events.send(ClientEvent::IncomingAttachmentOffered {
                                                 offer_id,
-                                                peer_id: peer.to_string(),
+                                                peer_id: contact.to_string(),
                                                 filename: manifest.filename.clone(),
                                                 mime: manifest.mime.clone(),
                                                 size: manifest.size,
                                                 group_id,
                                             });
                                             pending_inbound_offers.insert(offer_id, PendingInboundOffer {
-                                                peer,
+                                                // Il trasferimento appartiene alla
+                                                // conversazione del contatto, non al
+                                                // dispositivo che l'ha aperto.
+                                                peer: contact,
                                                 request_id,
                                                 event: envelope.event,
                                                 channel,
@@ -2413,23 +2491,42 @@ pub async fn run(
                                         }
                                     }
                                     let client_event = client_event_from_chat(
-                                        peer, &envelope.event, "in", true,
-                                        peer_names.get(&peer).map(String::as_str),
+                                        contact, &envelope.event, "in", true,
+                                        peer_names.get(&contact).map(String::as_str),
                                     );
                                     if let ChatEvent::Presence(presence) = &envelope.event {
+                                        // Aggiorna anche qui il legame con l'account:
+                                        // la prova viaggia su entrambi i canali.
+                                        let source = recognize_presence(
+                                            &mut contact_devices,
+                                            &known_contacts,
+                                            &history.contacts()?,
+                                            peer,
+                                            presence,
+                                        );
+                                        apply_presence_source(&source, peer, &mut PresenceBinding {
+                                            history: &history,
+                                            events: &events,
+                                            known_contacts: &mut known_contacts,
+                                            ignored_contacts: &mut ignored_contacts,
+                                            peer_names: &mut peer_names,
+                                            pending_contact_requests: &mut pending_contact_requests,
+                                        })?;
                                         // Difesa: aggiorna il contatto solo se già
                                         // noto; mai auto-aggiungere via canale cifrato.
+                                        // Un nostro dispositivo collegato non è un
+                                        // contatto e non va in rubrica.
                                         if known_contacts.contains(&peer)
-                                            || known_devices.contains_key(&peer)
+                                            && !known_devices.contains_key(&peer)
                                         {
                                             history.ensure_contact(
-                                                &peer.to_string(),
+                                                &contact.to_string(),
                                                 &presence.display_name,
                                                 now_ms(),
                                             )?;
                                         }
                                     }
-                                    let response = receive_event(peer, &envelope.event, &mut Incoming {
+                                    let response = receive_event(contact, &envelope.event, &mut Incoming {
                                         pending_emoticons: &mut pending_emoticons,
                                         events: &events,
                                         nudge_limits: &mut incoming_nudge_limits,
@@ -2444,7 +2541,7 @@ pub async fn run(
                                     if let Some(event) = client_event {
                                         let _ = events.send(event);
                                     }
-                                    emit_contact_status(&events, peer, &envelope.event);
+                                    emit_contact_status(&events, contact, &envelope.event);
                                     response
                                 }
                                 Err(error) => ProtocolResponse::Rejected(error.into()),
@@ -2469,6 +2566,7 @@ pub async fn run(
                                             send_next_transfer_chunk(
                                                 &mut swarm,
                                                 &mut sessions,
+                                                &contact_devices,
                                                 &mut sent_numbers,
                                                 &mut pending_transfers,
                                                 local_peer_id,
@@ -2515,6 +2613,7 @@ pub async fn run(
                                     send_next_transfer_chunk(
                                         &mut swarm,
                                         &mut sessions,
+                                        &contact_devices,
                                         &mut sent_numbers,
                                         &mut pending_transfers,
                                         local_peer_id,
@@ -2549,6 +2648,7 @@ pub async fn run(
                             if let Some(next_id) = send_event(
                                 &mut swarm,
                                 &mut sessions,
+                                &contact_devices,
                                 pending.peer,
                                 local_peer_id,
                                 &mut sent_numbers,
@@ -2566,6 +2666,7 @@ pub async fn run(
                             send_current_transfer_chunk(
                                 &mut swarm,
                                 &mut sessions,
+                                &contact_devices,
                                 &mut sent_numbers,
                                 &mut pending_transfers,
                                 local_peer_id,
@@ -2579,7 +2680,7 @@ pub async fn run(
                     } else if let Some((msg_peer, event, retries)) = pending_messages.remove(&request_id) {
                         // Retry di un messaggio di testo fallito in transito.
                         if let Some(next) = next_request_retry(retries) {
-                            match send_event(&mut swarm, &mut sessions, msg_peer, local_peer_id, &mut sent_numbers, event.clone()) {
+                            match send_event(&mut swarm, &mut sessions, &contact_devices, msg_peer, local_peer_id, &mut sent_numbers, event.clone()) {
                                 Some(new_id) => {
                                     pending_messages.insert(new_id, (msg_peer, event, next));
                                 }
@@ -2651,27 +2752,29 @@ pub async fn run(
                                     handshake_retries.remove(&peer);
                                     println!("handshake ibrido completato: {peer}");
                                     log::info!("handshake ibrido completato: {peer}");
+                                    let contact = contact_devices.canonical(peer);
                                     let _ = events.send(ClientEvent::ContactUpdated {
                                         contact: ClientContact {
-                                            peer_id: peer.to_string(),
+                                            peer_id: contact.to_string(),
                                             name: peer_names
-                                                .get(&peer)
+                                                .get(&contact)
                                                 .cloned()
                                                 .unwrap_or_else(|| "Contatto".into()),
                                             online: true,
                                             secure: true,
-                                            fingerprint: peer_fingerprint(peer),
+                                            fingerprint: peer_fingerprint(contact),
                                         },
                                     });
                                     send_group_definitions_for_peer(
                                         &history,
                                         &mut swarm,
                                         &mut sessions,
+                                        &contact_devices,
                                         &mut sent_numbers,
                                         local_peer_id,
                                         peer,
                                     );
-                                    flush_outbox(&mut swarm, &mut sessions, &mut sent_numbers, &mut pending_messages, &mut outbox, local_peer_id, peer);
+                                    flush_outbox(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, local_peer_id, peer);
                                 }
                                 Err(error) => eprintln!("handshake ibrido fallito con {peer}: {error}"),
                             },
@@ -2706,27 +2809,29 @@ pub async fn run(
                             );
                             println!("handshake ibrido completato: {peer}");
                             log::info!("handshake ibrido completato (responder): {peer}");
+                            let contact = contact_devices.canonical(peer);
                             let _ = events.send(ClientEvent::ContactUpdated {
                                 contact: ClientContact {
-                                    peer_id: peer.to_string(),
+                                    peer_id: contact.to_string(),
                                     name: peer_names
-                                        .get(&peer)
+                                        .get(&contact)
                                         .cloned()
                                         .unwrap_or_else(|| "Contatto".into()),
                                     online: true,
                                     secure: true,
-                                    fingerprint: peer_fingerprint(peer),
+                                    fingerprint: peer_fingerprint(contact),
                                 },
                             });
                             send_group_definitions_for_peer(
                                 &history,
                                 &mut swarm,
                                 &mut sessions,
+                                &contact_devices,
                                 &mut sent_numbers,
                                 local_peer_id,
                                 peer,
                             );
-                            flush_outbox(&mut swarm, &mut sessions, &mut sent_numbers, &mut pending_messages, &mut outbox, local_peer_id, peer);
+                            flush_outbox(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, local_peer_id, peer);
                         }
                     }
                 }
@@ -2782,6 +2887,7 @@ pub async fn run(
                                         &mut known_contacts,
                                         &mut ignored_contacts,
                                         &mut peer_names,
+                                        &mut contact_devices,
                                         &peers,
                                         &sessions,
                                         &events,
@@ -2794,6 +2900,12 @@ pub async fn run(
                                         applied: applied.applied,
                                         paired: true,
                                     });
+                                    // Ri-annuncia la presence firmata ai contatti
+                                    // raggiungibili: è così che imparano il legame
+                                    // fra la persona e il suo account.
+                                    for contact_peer in peers.iter().copied().collect::<Vec<_>>() {
+                                        send_event(&mut swarm, &mut sessions, &contact_devices, contact_peer, local_peer_id, &mut sent_numbers, ChatEvent::Presence(presence_update(&display_name, &presence_status, true, &account_proof)));
+                                    }
                                     devices::seal(&key, &payload)?
                                 }
                                 Ok(DeviceRequest::Sync { device, after_seq, records })
@@ -2818,6 +2930,7 @@ pub async fn run(
                                         &mut known_contacts,
                                         &mut ignored_contacts,
                                         &mut peer_names,
+                                        &mut contact_devices,
                                         &peers,
                                         &sessions,
                                         &events,
@@ -2850,7 +2963,7 @@ pub async fn run(
                                             let message = TextMessage { text: text.clone(), emoticons, id };
                                             let event = ChatEvent::Text(message.clone());
                                             if sessions.contains_key(&target_peer) {
-                                                match send_event(&mut swarm, &mut sessions, target_peer, local_peer_id, &mut sent_numbers, event.clone()) {
+                                                match send_event(&mut swarm, &mut sessions, &contact_devices, target_peer, local_peer_id, &mut sent_numbers, event.clone()) {
                                                     Some(request_id) => { pending_messages.insert(request_id, (target_peer, event, 0)); }
                                                     None => { outbox.entry(target_peer).or_default().push_back(event); }
                                                 }
@@ -2923,6 +3036,12 @@ pub async fn run(
                                     store(linked_key).map_err(|error| format!("account collegato ma non salvabile: {error}"))?;
                                 }
                                 account_key = linked_key;
+                                // Adottato l'account del dispositivo che ci ha
+                                // collegati: da ora firmiamo le presence con la
+                                // sua identità, così i suoi contatti ci
+                                // riconoscono senza approvarci di nuovo.
+                                account_identity = AccountIdentity::from_account_key(&account_key)?;
+                                account_proof = account_identity.proof(local_peer_id).ok();
                                 pending_pair_targets.remove(&peer);
                                 if history.contacts()?.iter().any(|contact| contact.peer == local_peer_id.to_string()) {
                                     history.delete_contact(&local_peer_id.to_string())?;
@@ -2948,11 +3067,17 @@ pub async fn run(
                                 let applied = history.apply_sync_records(&records)?;
                                 let received_through = records.last().map_or(0, |record| record.seq);
                                 history.update_sync_cursors(&peer.to_string(), received_through, accepted_through)?;
-                                refresh_synced_state(&history, &mut known_contacts, &mut ignored_contacts, &mut peer_names, &peers, &sessions, &events)?;
+                                refresh_synced_state(&history, &mut known_contacts, &mut ignored_contacts, &mut peer_names, &mut contact_devices, &peers, &sessions, &events)?;
                                 send_group_chats(&history.group_chats()?, &events);
                                 send_devices(&known_devices, &online_devices, &events);
                                 connect_synced_peers(&history, &known_devices, local_peer_id, &mut SyncConnections { swarm: &mut swarm, online_contacts: &peers, online_devices: &online_devices, dialing: &mut dialing, bootstrap_fallbacks: &mut bootstrap_fallbacks, fallback_planner: &mut fallback_planner, pending_dht: &mut pending_dht })?;
                                 let _ = events.send(ClientEvent::DeviceSynchronized { peer_id: peer.to_string(), applied: applied.applied, paired: true });
+                                // Ri-annuncia la presence firmata ai contatti
+                                // raggiungibili: è così che imparano il legame
+                                // fra la persona e il suo account.
+                                for contact_peer in peers.iter().copied().collect::<Vec<_>>() {
+                                    send_event(&mut swarm, &mut sessions, &contact_devices, contact_peer, local_peer_id, &mut sent_numbers, ChatEvent::Presence(presence_update(&display_name, &presence_status, true, &account_proof)));
+                                }
                                 if received_through < latest_seq || accepted_through < history.latest_sync_seq()? {
                                     let descriptor = local_device_descriptor(local_peer_id, &display_name, contact_addresses(&swarm, &args.relays, local_peer_id));
                                     send_device_sync(&mut swarm, &history, &account_key, &mut pending_device_requests, peer, descriptor)?;
@@ -2965,7 +3090,7 @@ pub async fn run(
                                     |record| record.seq,
                                 );
                                 history.update_sync_cursors(&peer.to_string(), received_through, accepted_through)?;
-                                refresh_synced_state(&history, &mut known_contacts, &mut ignored_contacts, &mut peer_names, &peers, &sessions, &events)?;
+                                refresh_synced_state(&history, &mut known_contacts, &mut ignored_contacts, &mut peer_names, &mut contact_devices, &peers, &sessions, &events)?;
                                 send_group_chats(&history.group_chats()?, &events);
                                 connect_synced_peers(&history, &known_devices, local_peer_id, &mut SyncConnections { swarm: &mut swarm, online_contacts: &peers, online_devices: &online_devices, dialing: &mut dialing, bootstrap_fallbacks: &mut bootstrap_fallbacks, fallback_planner: &mut fallback_planner, pending_dht: &mut pending_dht })?;
                                 let _ = events.send(ClientEvent::DeviceSynchronized { peer_id: peer.to_string(), applied: applied.applied, paired: false });
@@ -3095,6 +3220,302 @@ pub async fn run(
     }
     let _ = events.send(ClientEvent::Stopped);
     Ok(())
+}
+
+/// Ultimi messaggi di una conversazione nel formato atteso dalla UI.
+fn conversation_messages(history: &History, peer: &str) -> Result<Vec<ClientMessage>, Box<dyn Error>> {
+    Ok(history
+        .conversation(peer, 100)?
+            .into_iter()
+            .rev()
+            .map(|entry| {
+                let attachment = (entry.kind == "file")
+                    .then(|| decode_attachment(&entry.body))
+                    .flatten();
+                let text = (entry.kind == "text").then(|| decode_text_history(&entry.body));
+                ClientMessage {
+                    peer_id: entry.peer,
+                    direction: entry.direction,
+                    kind: entry.kind,
+                    body: text.as_ref().map_or_else(
+                        || {
+                            attachment
+                                .as_ref()
+                                .map_or(entry.body, |item| item.2.clone())
+                        },
+                        |message| message.text.clone(),
+                    ),
+                    timestamp_ms: entry.timestamp_ms,
+                    emoticons: text.as_ref().map(client_emoticon_spans).unwrap_or_default(),
+                    attachment_id: attachment.as_ref().map(|item| item.0.clone()),
+                    attachment_mime: attachment.map(|item| item.1),
+                    event_id: Some(entry.event_id),
+                    relayed: false,
+                }
+            })
+            .collect())
+}
+
+/// Un contatto è una PERSONA (un account), non un singolo dispositivo. Questa
+/// mappa lega i dispositivi collegati di un contatto al contatto stesso: le
+/// prove di account ricevute nelle presence popolano `alias`, così un
+/// dispositivo nuovo di un contatto già approvato non genera né una richiesta
+/// di contatto né un duplicato in rubrica.
+#[derive(Default)]
+struct ContactDevices {
+    /// contatto -> account
+    accounts: HashMap<PeerId, String>,
+    /// account -> contatto
+    contacts: HashMap<String, PeerId>,
+    /// dispositivo -> contatto
+    alias: HashMap<PeerId, PeerId>,
+}
+
+impl ContactDevices {
+    /// Lega un contatto al suo account. Ritorna `true` se il legame è nuovo o
+    /// cambiato (va persistito e sincronizzato).
+    fn bind(&mut self, contact: PeerId, account: String) -> bool {
+        if self.accounts.get(&contact).is_some_and(|known| *known == account) {
+            return false;
+        }
+        if let Some(previous) = self.accounts.insert(contact, account.clone()) {
+            self.contacts.remove(&previous);
+            self.alias.retain(|_, owner| *owner != contact);
+        }
+        self.contacts.insert(account, contact);
+        true
+    }
+
+    /// Registra `device` come dispositivo del contatto che possiede `account`.
+    fn attach(&mut self, device: PeerId, account: &str) -> Option<PeerId> {
+        let contact = *self.contacts.get(account)?;
+        if device != contact {
+            self.alias.insert(device, contact);
+        }
+        Some(contact)
+    }
+
+    /// Contatto a cui appartiene il peer: se stesso se non è un dispositivo.
+    fn canonical(&self, peer: PeerId) -> PeerId {
+        self.alias.get(&peer).copied().unwrap_or(peer)
+    }
+
+    fn is_device(&self, peer: PeerId) -> bool {
+        self.alias.contains_key(&peer)
+    }
+
+    fn devices(&self, contact: PeerId) -> impl Iterator<Item = PeerId> + '_ {
+        self.alias
+            .iter()
+            .filter(move |(_, owner)| **owner == contact)
+            .map(|(device, _)| *device)
+    }
+
+    /// Dimentica contatto e dispositivi (contatto cancellato): ritorna i
+    /// dispositivi da scollegare.
+    fn forget(&mut self, contact: PeerId) -> Vec<PeerId> {
+        if let Some(account) = self.accounts.remove(&contact) {
+            self.contacts.remove(&account);
+        }
+        let devices = self.devices(contact).collect::<Vec<_>>();
+        self.alias.retain(|_, owner| *owner != contact);
+        devices
+    }
+
+    /// Dispositivo su cui inviare: il contatto stesso se ha una sessione,
+    /// altrimenti un suo dispositivo collegato che ce l'ha.
+    // ponytail: con più dispositivi online ne sceglie uno qualsiasi; basta,
+    // perché i dispositivi di un contatto si sincronizzano fra loro.
+    fn route(&self, contact: PeerId, sessions: &HashMap<PeerId, RatchetSession>) -> PeerId {
+        if sessions.contains_key(&contact) {
+            return contact;
+        }
+        self.devices(contact)
+            .find(|device| sessions.contains_key(device))
+            .unwrap_or(contact)
+    }
+
+    fn online(&self, contact: PeerId, peers: &HashSet<PeerId>) -> bool {
+        peers.contains(&contact) || self.devices(contact).any(|device| peers.contains(&device))
+    }
+
+    fn secure(&self, contact: PeerId, sessions: &HashMap<PeerId, RatchetSession>) -> bool {
+        sessions.contains_key(&self.route(contact, sessions))
+    }
+}
+
+/// Esito del riconoscimento di una presence in ingresso.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PresenceSource {
+    /// Contatto a cui attribuire la presence, se riconosciuto.
+    contact: Option<PeerId>,
+    /// Account che ha firmato la prova, se la firma è valida.
+    account: Option<String>,
+    /// Legame contatto -> account da persistere.
+    bind: Option<(PeerId, String)>,
+    /// Due contatti in rubrica sono la stessa persona: (da fondere, superstite).
+    merge: Option<(PeerId, PeerId)>,
+}
+
+/// Riconosce il mittente di una presence PRIMA di decidere se serve
+/// l'approvazione dell'utente: un dispositivo che dimostra di appartenere
+/// all'account di un contatto già approvato non è uno sconosciuto.
+fn recognize_presence(
+    devices: &mut ContactDevices,
+    known_contacts: &HashSet<PeerId>,
+    contacts: &[ContactEntry],
+    peer: PeerId,
+    presence: &PresenceUpdate,
+) -> PresenceSource {
+    let account = presence
+        .account
+        .as_ref()
+        .and_then(|proof| verify_account_proof(proof, peer));
+    if known_contacts.contains(&peer) && !devices.is_device(peer) {
+        let Some(account) = account else {
+            return PresenceSource {
+                contact: Some(peer),
+                ..PresenceSource::default()
+            };
+        };
+        let verified = Some(account.clone());
+        // Stesso account di un ALTRO contatto in rubrica: sono la stessa
+        // persona vista da due dispositivi, vanno fusi.
+        if let Some(other) = devices.contacts.get(&account).copied().filter(|other| *other != peer)
+        {
+            let (keep, drop) = merge_target(contacts, other, peer);
+            devices.forget(drop);
+            let bind = devices
+                .bind(keep, account.clone())
+                .then_some((keep, account));
+            // Il peer del duplicato resta raggiungibile come dispositivo del
+            // contatto superstite.
+            devices.alias.insert(drop, keep);
+            return PresenceSource {
+                contact: Some(keep),
+                account: verified,
+                bind,
+                merge: Some((drop, keep)),
+            };
+        }
+        let bind = devices
+            .bind(peer, account.clone())
+            .then_some((peer, account));
+        return PresenceSource {
+            contact: Some(peer),
+            account: verified,
+            bind,
+            merge: None,
+        };
+    }
+    if let Some(contact) = devices.alias.get(&peer).copied() {
+        return PresenceSource {
+            contact: Some(contact),
+            account,
+            ..PresenceSource::default()
+        };
+    }
+    PresenceSource {
+        contact: account
+            .as_ref()
+            .and_then(|account| devices.attach(peer, account)),
+        account,
+        ..PresenceSource::default()
+    }
+}
+
+/// Stato toccato dall'esito di `recognize_presence`.
+struct PresenceBinding<'a> {
+    history: &'a History,
+    events: &'a mpsc::UnboundedSender<ClientEvent>,
+    known_contacts: &'a mut HashSet<PeerId>,
+    ignored_contacts: &'a mut HashSet<PeerId>,
+    peer_names: &'a mut HashMap<PeerId, String>,
+    pending_contact_requests: &'a mut HashMap<PeerId, String>,
+}
+
+/// Applica l'esito del riconoscimento: salva il legame con l'account, fonde i
+/// contatti duplicati e promuove il peer a dispositivo di un contatto noto.
+fn apply_presence_source(
+    source: &PresenceSource,
+    peer: PeerId,
+    context: &mut PresenceBinding<'_>,
+) -> Result<(), Box<dyn Error>> {
+    if let Some((contact, account)) = &source.bind {
+        context
+            .history
+            .bind_contact_account(&contact.to_string(), account, now_ms())?;
+    }
+    if let Some((duplicate, keep)) = source.merge {
+        let moved = context
+            .history
+            .merge_contact(&duplicate.to_string(), &keep.to_string(), now_ms())?;
+        println!("contatti uniti: {duplicate} -> {keep} ({moved} messaggi)");
+        log::info!("contatti uniti: {duplicate} -> {keep} ({moved} messaggi)");
+        context.peer_names.remove(&duplicate);
+        let _ = context.events.send(ClientEvent::ContactRemoved {
+            peer_id: duplicate.to_string(),
+        });
+        let _ = context.events.send(ClientEvent::ConversationLoaded {
+            peer_id: keep.to_string(),
+            messages: conversation_messages(context.history, &keep.to_string())?,
+        });
+    }
+    let Some(contact) = source.contact.filter(|contact| *contact != peer) else {
+        return Ok(());
+    };
+    // Dispositivo verificato di un contatto già approvato: nessuna richiesta di
+    // contatto, nessun duplicato in rubrica. Vale esattamente i permessi del
+    // contatto a cui appartiene.
+    if context.known_contacts.insert(peer) {
+        println!("dispositivo di {contact} riconosciuto: {peer}");
+        log::info!("dispositivo di {contact} riconosciuto: {peer}");
+    }
+    if context.pending_contact_requests.remove(&peer).is_some() {
+        // Richiesta già mostrata all'utente ma nel frattempo il peer si è
+        // rivelato un dispositivo di un contatto noto: ritira la domanda.
+        let _ = context.events.send(ClientEvent::ContactRemoved {
+            peer_id: peer.to_string(),
+        });
+    }
+    if context.ignored_contacts.remove(&peer) {
+        context.history.allow_contact(&peer.to_string())?;
+    }
+    if let Some(name) = context.peer_names.get(&contact).cloned() {
+        context.peer_names.insert(peer, name);
+    }
+    Ok(())
+}
+
+/// Quale dei due contatti sopravvive alla fusione: quello importato da contact
+/// card (link presente) e, a parità, il peer id minore. Deterministico, così
+/// tutti i dispositivi fondono nella stessa direzione.
+fn merge_target(contacts: &[ContactEntry], first: PeerId, second: PeerId) -> (PeerId, PeerId) {
+    let linked = |peer: PeerId| {
+        contacts
+            .iter()
+            .any(|contact| contact.peer == peer.to_string() && !contact.link.is_empty())
+    };
+    match (linked(first), linked(second)) {
+        (true, false) => (first, second),
+        (false, true) => (second, first),
+        _ if first.to_string() <= second.to_string() => (first, second),
+        _ => (second, first),
+    }
+}
+
+fn presence_update(
+    display_name: &str,
+    status: &str,
+    online: bool,
+    account: &Option<AccountProof>,
+) -> PresenceUpdate {
+    PresenceUpdate {
+        display_name: display_name.to_owned(),
+        online,
+        status: status.to_owned(),
+        account: account.clone(),
+    }
 }
 
 fn emit_contact_status(
@@ -3421,6 +3842,7 @@ fn chat_associated_data(sender: PeerId, recipient: PeerId) -> Vec<u8> {
 fn broadcast(
     swarm: &mut libp2p::Swarm<Behaviour>,
     sessions: &mut HashMap<PeerId, RatchetSession>,
+    devices: &ContactDevices,
     peers: &HashSet<PeerId>,
     local_peer_id: PeerId,
     sent_numbers: &mut HashMap<PeerId, u64>,
@@ -3433,6 +3855,7 @@ fn broadcast(
         send_event(
             swarm,
             sessions,
+            devices,
             *peer,
             local_peer_id,
             sent_numbers,
@@ -3446,22 +3869,32 @@ fn broadcast(
 fn flush_outbox(
     swarm: &mut libp2p::Swarm<Behaviour>,
     sessions: &mut HashMap<PeerId, RatchetSession>,
+    devices: &ContactDevices,
     sent_numbers: &mut HashMap<PeerId, u64>,
     pending_messages: &mut HashMap<request_response::OutboundRequestId, (PeerId, ChatEvent, u8)>,
     outbox: &mut HashMap<PeerId, VecDeque<ChatEvent>>,
     local_peer_id: PeerId,
     peer: PeerId,
 ) {
-    let Some(queue) = outbox.remove(&peer) else {
-        return;
-    };
-    for event in queue {
-        match send_event(swarm, sessions, peer, local_peer_id, sent_numbers, event.clone()) {
-            Some(request_id) => {
-                pending_messages.insert(request_id, (peer, event, 0));
-            }
-            None => {
-                outbox.entry(peer).or_default().push_back(event);
+    // La coda è indicizzata sul contatto: se la sessione è nata su un suo
+    // dispositivo collegato, svuota comunque la coda del contatto.
+    let contact = devices.canonical(peer);
+    let mut targets = vec![peer];
+    if contact != peer {
+        targets.push(contact);
+    }
+    for target in targets {
+        let Some(queue) = outbox.remove(&target) else {
+            continue;
+        };
+        for event in queue {
+            match send_event(swarm, sessions, devices, target, local_peer_id, sent_numbers, event.clone()) {
+                Some(request_id) => {
+                    pending_messages.insert(request_id, (target, event, 0));
+                }
+                None => {
+                    outbox.entry(target).or_default().push_back(event);
+                }
             }
         }
     }
@@ -3470,11 +3903,16 @@ fn flush_outbox(
 fn send_event(
     swarm: &mut libp2p::Swarm<Behaviour>,
     sessions: &mut HashMap<PeerId, RatchetSession>,
+    devices: &ContactDevices,
     peer: PeerId,
     local_peer_id: PeerId,
     sent_numbers: &mut HashMap<PeerId, u64>,
     event: ChatEvent,
 ) -> Option<request_response::OutboundRequestId> {
+    // Un contatto è una persona, non un peer: se non ha una sessione diretta
+    // consegna al suo dispositivo collegato che ce l'ha (il messaggio si
+    // propaga agli altri suoi dispositivi via device-sync).
+    let peer = devices.route(peer, sessions);
     let secure = sessions.contains_key(&peer);
     if !secure && !matches!(event, ChatEvent::Presence(_)) {
         eprintln!("sessione sicura non pronta per {peer}");
@@ -3518,6 +3956,7 @@ fn send_event(
 fn send_next_transfer_chunk(
     swarm: &mut Swarm<Behaviour>,
     sessions: &mut HashMap<PeerId, RatchetSession>,
+    devices: &ContactDevices,
     sent_numbers: &mut HashMap<PeerId, u64>,
     pending_transfers: &mut HashMap<request_response::OutboundRequestId, PendingTransfer>,
     local_peer_id: PeerId,
@@ -3537,6 +3976,7 @@ fn send_next_transfer_chunk(
     send_current_transfer_chunk(
         swarm,
         sessions,
+        devices,
         sent_numbers,
         pending_transfers,
         local_peer_id,
@@ -3565,6 +4005,7 @@ fn validate_missing_chunks(
 fn send_current_transfer_chunk(
     swarm: &mut Swarm<Behaviour>,
     sessions: &mut HashMap<PeerId, RatchetSession>,
+    devices: &ContactDevices,
     sent_numbers: &mut HashMap<PeerId, u64>,
     pending_transfers: &mut HashMap<request_response::OutboundRequestId, PendingTransfer>,
     local_peer_id: PeerId,
@@ -3584,6 +4025,7 @@ fn send_current_transfer_chunk(
     if let Some(request_id) = send_event(
         swarm,
         sessions,
+        devices,
         transfer.peer,
         local_peer_id,
         sent_numbers,
@@ -4509,11 +4951,13 @@ fn connect_synced_peers(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn refresh_synced_state(
     history: &History,
     known_contacts: &mut HashSet<PeerId>,
     ignored_contacts: &mut HashSet<PeerId>,
     peer_names: &mut HashMap<PeerId, String>,
+    devices: &mut ContactDevices,
     online_contacts: &HashSet<PeerId>,
     sessions: &HashMap<PeerId, RatchetSession>,
     events: &mpsc::UnboundedSender<ClientEvent>,
@@ -4528,16 +4972,27 @@ fn refresh_synced_state(
         .iter()
         .filter_map(|contact| contact.peer.parse::<PeerId>().ok())
         .collect::<HashSet<_>>();
+    // I dispositivi di un contatto restano validi: non sono voci di rubrica ma
+    // non vanno nemmeno rimossi dai peer noti.
     let removed = known_contacts
         .difference(&persisted)
         .copied()
+        .filter(|peer| !persisted.contains(&devices.canonical(*peer)))
         .collect::<Vec<_>>();
     for peer in removed {
         known_contacts.remove(&peer);
         peer_names.remove(&peer);
+        devices.forget(peer);
         let _ = events.send(ClientEvent::ContactRemoved {
             peer_id: peer.to_string(),
         });
+    }
+    // Un dispositivo riconosciuto di un contatto attivo non resta bloccato: la
+    // fusione dei duplicati arriva agli altri dispositivi come cancellazione.
+    for peer in known_contacts.iter().copied().collect::<Vec<_>>() {
+        if devices.is_device(peer) && ignored_contacts.remove(&peer) {
+            history.allow_contact(&peer.to_string())?;
+        }
     }
     for contact in contacts {
         let Ok(peer) = contact.peer.parse::<PeerId>() else {
@@ -4545,45 +5000,19 @@ fn refresh_synced_state(
         };
         known_contacts.insert(peer);
         peer_names.insert(peer, contact.name.clone());
+        if !contact.account_id.is_empty() {
+            devices.bind(peer, contact.account_id.clone());
+        }
         let _ = events.send(ClientEvent::ContactUpdated {
             contact: ClientContact {
                 peer_id: contact.peer.clone(),
                 name: contact.name,
-                online: online_contacts.contains(&peer),
-                secure: sessions.contains_key(&peer),
+                online: devices.online(peer, online_contacts),
+                secure: devices.secure(peer, sessions),
                 fingerprint: peer_fingerprint(peer),
             },
         });
-        let messages = history
-            .conversation(&contact.peer, 100)?
-            .into_iter()
-            .rev()
-            .map(|entry| {
-                let attachment = (entry.kind == "file")
-                    .then(|| decode_attachment(&entry.body))
-                    .flatten();
-                let text = (entry.kind == "text").then(|| decode_text_history(&entry.body));
-                ClientMessage {
-                    peer_id: entry.peer,
-                    direction: entry.direction,
-                    kind: entry.kind,
-                    body: text.as_ref().map_or_else(
-                        || {
-                            attachment
-                                .as_ref()
-                                .map_or(entry.body, |item| item.2.clone())
-                        },
-                        |message| message.text.clone(),
-                    ),
-                    timestamp_ms: entry.timestamp_ms,
-                    emoticons: text.as_ref().map(client_emoticon_spans).unwrap_or_default(),
-                    attachment_id: attachment.as_ref().map(|item| item.0.clone()),
-                    attachment_mime: attachment.map(|item| item.1),
-                    event_id: Some(entry.event_id),
-                    relayed: false,
-                }
-            })
-            .collect();
+        let messages = conversation_messages(history, &contact.peer)?;
         let _ = events.send(ClientEvent::ConversationLoaded {
             peer_id: contact.peer,
             messages,
@@ -4664,6 +5093,7 @@ fn send_group_definitions_for_peer(
     history: &History,
     swarm: &mut Swarm<Behaviour>,
     sessions: &mut HashMap<PeerId, RatchetSession>,
+    devices: &ContactDevices,
     sent_numbers: &mut HashMap<PeerId, u64>,
     local_peer_id: PeerId,
     peer: PeerId,
@@ -4680,6 +5110,7 @@ fn send_group_definitions_for_peer(
             send_event(
                 swarm,
                 sessions,
+                devices,
                 peer,
                 local_peer_id,
                 sent_numbers,
@@ -5445,6 +5876,211 @@ mod tests {
         fs::remove_file(path).ok();
     }
 
+    fn test_peer() -> PeerId {
+        PeerId::from(Keypair::generate_ed25519().public())
+    }
+
+    fn signed_presence(account: &AccountIdentity, device: PeerId) -> PresenceUpdate {
+        presence_update("Phillip", "online", true, &account.proof(device).ok())
+    }
+
+    fn card(peer: PeerId, link: &str) -> ContactEntry {
+        ContactEntry {
+            peer: peer.to_string(),
+            name: "Phillip".into(),
+            link: link.into(),
+            account_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn presence_stays_compatible_with_clients_without_account_proof() {
+        #[derive(Serialize)]
+        struct LegacyPresence {
+            display_name: String,
+            online: bool,
+            status: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct LegacyView {
+            display_name: String,
+            online: bool,
+        }
+
+        // Presence di un client vecchio: nessuna prova, nessun errore.
+        let legacy = cbor4ii::serde::to_vec(
+            Vec::new(),
+            &LegacyPresence {
+                display_name: "Alice".into(),
+                online: true,
+                status: "online".into(),
+            },
+        )
+        .unwrap();
+        let parsed: PresenceUpdate = cbor4ii::serde::from_slice(&legacy).unwrap();
+        assert_eq!(parsed.display_name, "Alice");
+        assert!(parsed.account.is_none());
+
+        // La nostra presence firmata resta leggibile da un client vecchio.
+        let account = AccountIdentity::from_account_key(&[13; 32]).unwrap();
+        let device = test_peer();
+        let current = presence_update("Alice", "online", true, &account.proof(device).ok());
+        assert!(current.account.is_some());
+        let bytes = cbor4ii::serde::to_vec(Vec::new(), &current).unwrap();
+        let view: LegacyView = cbor4ii::serde::from_slice(&bytes).unwrap();
+        assert_eq!(view.display_name, "Alice");
+        assert!(view.online);
+    }
+
+    #[test]
+    fn a_linked_device_of_a_known_contact_needs_no_approval() {
+        let account = AccountIdentity::from_account_key(&[9; 32]).unwrap();
+        let contact = test_peer();
+        let phone = test_peer();
+        let stranger = test_peer();
+        let known = HashSet::from([contact]);
+        let contacts = vec![card(contact, "msnnext://add/abc")];
+        let mut devices = ContactDevices::default();
+
+        // Il contatto presenta la prova: il legame con l'account va salvato.
+        let source = recognize_presence(
+            &mut devices,
+            &known,
+            &contacts,
+            contact,
+            &signed_presence(&account, contact),
+        );
+        assert_eq!(source.contact, Some(contact));
+        assert!(source.bind.is_some());
+        assert!(source.merge.is_none());
+
+        // Un suo dispositivo nuovo: riconosciuto, nessuna richiesta di contatto.
+        let source = recognize_presence(
+            &mut devices,
+            &known,
+            &contacts,
+            phone,
+            &signed_presence(&account, phone),
+        );
+        assert_eq!(source.contact, Some(contact));
+        assert!(source.bind.is_none());
+        assert_eq!(devices.canonical(phone), contact);
+        assert!(devices.is_device(phone));
+
+        // Prova rubata e rigiocata da un altro peer: resta uno sconosciuto.
+        let source = recognize_presence(
+            &mut devices,
+            &known,
+            &contacts,
+            stranger,
+            &signed_presence(&account, phone),
+        );
+        assert_eq!(source.contact, None);
+
+        // Sconosciuto senza prova: approvazione richiesta come prima.
+        let source = recognize_presence(
+            &mut devices,
+            &known,
+            &contacts,
+            stranger,
+            &presence_update("Mallory", "online", true, &None),
+        );
+        assert_eq!(source.contact, None);
+        assert!(source.account.is_none());
+
+        // Un altro account non eredita nulla del contatto.
+        let other = AccountIdentity::from_account_key(&[10; 32]).unwrap();
+        let source = recognize_presence(
+            &mut devices,
+            &known,
+            &contacts,
+            stranger,
+            &signed_presence(&other, stranger),
+        );
+        assert_eq!(source.contact, None);
+        assert!(source.account.is_some());
+    }
+
+    #[test]
+    fn duplicate_contacts_of_the_same_person_are_merged() {
+        let account = AccountIdentity::from_account_key(&[11; 32]).unwrap();
+        let contact = test_peer();
+        let duplicate = test_peer();
+        let known = HashSet::from([contact, duplicate]);
+        let contacts = vec![card(contact, "msnnext://add/abc"), card(duplicate, "")];
+        let mut devices = ContactDevices::default();
+
+        // Il duplicato (accettato per errore) lega per primo l'account.
+        let source = recognize_presence(
+            &mut devices,
+            &known,
+            &contacts,
+            duplicate,
+            &signed_presence(&account, duplicate),
+        );
+        assert_eq!(source.contact, Some(duplicate));
+
+        // Poi arriva il contatto vero: stessa persona, i due vanno fusi nel
+        // contatto importato da contact card.
+        let source = recognize_presence(
+            &mut devices,
+            &known,
+            &contacts,
+            contact,
+            &signed_presence(&account, contact),
+        );
+        assert_eq!(source.merge, Some((duplicate, contact)));
+        assert_eq!(source.contact, Some(contact));
+        assert_eq!(devices.canonical(duplicate), contact);
+    }
+
+    #[test]
+    fn merge_keeps_the_linked_contact_and_is_deterministic() {
+        let first = test_peer();
+        let second = test_peer();
+        let contacts = vec![card(first, ""), card(second, "msnnext://add/abc")];
+        assert_eq!(merge_target(&contacts, first, second), (second, first));
+        assert_eq!(merge_target(&contacts, second, first), (second, first));
+
+        // Nessun link da nessuna parte: ordine stabile su tutti i dispositivi.
+        let contacts = vec![card(first, ""), card(second, "")];
+        assert_eq!(
+            merge_target(&contacts, first, second),
+            merge_target(&contacts, second, first)
+        );
+    }
+
+    #[test]
+    fn messages_reach_the_contact_device_that_has_a_session() {
+        let account = AccountIdentity::from_account_key(&[12; 32]).unwrap();
+        let local = test_peer();
+        let contact = test_peer();
+        let phone = test_peer();
+        let mut devices = ContactDevices::default();
+        devices.bind(contact, "account".into());
+        devices.attach(phone, "account");
+
+        let mut sessions = HashMap::new();
+        // Nessuna sessione: si continua a puntare al contatto (il messaggio
+        // resta in coda finché non c'è un canale).
+        assert_eq!(devices.route(contact, &sessions), contact);
+        assert!(!devices.secure(contact, &sessions));
+
+        // Solo il telefono è raggiungibile: il messaggio va lì.
+        let (initiator, hello) = HybridInitiator::start(local, phone).unwrap();
+        let (response, phone_key) = respond_hybrid(&hello, local, phone).unwrap();
+        let local_key = initiator.finish(&response).unwrap();
+        drop(phone_key);
+        sessions.insert(phone, RatchetSession::new(local_key, local, phone));
+        assert_eq!(devices.route(contact, &sessions), phone);
+        assert!(devices.secure(contact, &sessions));
+
+        // Cancellare la persona scollega tutti i suoi dispositivi.
+        assert_eq!(devices.forget(contact), vec![phone]);
+        assert_eq!(devices.canonical(phone), phone);
+        let _ = account;
+    }
+
     #[test]
     fn envelope_round_trips_through_the_session_ratchet() {
         let alice = PeerId::from(Keypair::generate_ed25519().public());
@@ -5780,11 +6416,7 @@ mod tests {
 
     #[test]
     fn secure_handshake_starts_only_after_presence() {
-        let presence = ChatEvent::Presence(PresenceUpdate {
-            display_name: "Alice".into(),
-            online: true,
-            status: String::new(),
-        });
+        let presence = ChatEvent::Presence(presence_update("Alice", "", true, &None));
         let text = ChatEvent::Text(TextMessage {
             text: "ciao".into(),
             emoticons: vec![],

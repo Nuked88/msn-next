@@ -948,6 +948,11 @@ fn node_reject_contact_request(state: State<'_, NodeState>, peer_id: String) -> 
 }
 
 #[tauri::command]
+fn node_request_pending_contact_requests(state: State<'_, NodeState>) -> Result<(), String> {
+    send_command(&state, ClientCommand::RequestPendingContactRequests)
+}
+
+#[tauri::command]
 fn node_delete_message_for_me(state: State<'_, NodeState>, event_id: String) -> Result<(), String> {
     send_command(&state, ClientCommand::DeleteMessageForMe { event_id })
 }
@@ -1597,6 +1602,7 @@ pub fn run() {
             node_delete_contact,
             node_accept_contact_request,
             node_reject_contact_request,
+            node_request_pending_contact_requests,
             node_delete_message_for_me,
             node_delete_message_for_everyone,
             node_set_auto_accept_extensions,

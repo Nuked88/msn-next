@@ -190,6 +190,8 @@
   "setup.connecting": "Connecting…",
   "setup.goOnline": "Go online",
   "setup.restore": "Restore an existing account",
+  "setup.linkDevice": "Link with code/QR",
+  "setup.nameFirst": "Enter a name first",
   "setup.foot": "On the same network your saved contacts reconnect automatically.",
   "connect.step": "Add a contact",
   "connect.title": "Find a friend",

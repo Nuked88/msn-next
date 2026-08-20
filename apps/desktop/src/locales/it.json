@@ -190,6 +190,8 @@
   "setup.connecting": "Connessione in corso…",
   "setup.goOnline": "Vai online",
   "setup.restore": "Ripristina account esistente",
+  "setup.linkDevice": "Collega con codice/QR",
+  "setup.nameFirst": "Inserisci prima un nome",
   "setup.foot": "Sulla stessa rete i tuoi contatti salvati si ricollegano automaticamente.",
   "connect.step": "Aggiungi un contatto",
   "connect.title": "Trova un amico",

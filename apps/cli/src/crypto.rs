@@ -9,7 +9,8 @@ use chacha20poly1305::{
     aead::{rand_core::RngCore, Aead, OsRng, Payload},
     KeyInit, XChaCha20Poly1305, XNonce,
 };
-use libp2p::PeerId;
+use libp2p::{identity::ed25519, PeerId};
+use msnnext_protocol::AccountProof;
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};
 use zeroize::{ZeroizeOnDrop, Zeroizing};
@@ -39,6 +40,85 @@ impl MlDsaIdentity {
     pub(crate) fn verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
         ML_DSA_65.verify_sig(public_key, message, signature).is_ok()
     }
+}
+
+/// Identità dell'account (non del singolo dispositivo): derivata dalla chiave
+/// di account condivisa fra i dispositivi collegati. Firma un certificato per
+/// ogni dispositivo, così i contatti riconoscono i dispositivi di un account
+/// già noto senza doverli approvare di nuovo. La chiave di account non lascia
+/// mai il dispositivo: viaggiano solo chiavi pubbliche e firme.
+pub(crate) struct AccountIdentity {
+    classic: ed25519::Keypair,
+    ml_dsa: MlDsaIdentity,
+}
+
+impl AccountIdentity {
+    pub(crate) fn from_account_key(account_key: &[u8; 32]) -> Result<Self, Box<dyn Error>> {
+        let mut classic_seed = blake3::derive_key("msnnext account identity v1", account_key);
+        let classic = ed25519::Keypair::from(ed25519::SecretKey::try_from_bytes(&mut classic_seed)?);
+        let ml_dsa = MlDsaIdentity::from_seed(&blake3::derive_key(
+            "msnnext account ml-dsa v1",
+            account_key,
+        ))?;
+        Ok(Self { classic, ml_dsa })
+    }
+
+    /// Identificatore stabile dell'account: hash delle due chiavi pubbliche.
+    #[cfg(test)]
+    pub(crate) fn id(&self) -> String {
+        account_id(&self.classic.public().to_bytes(), self.ml_dsa.public_key())
+    }
+
+    pub(crate) fn proof(&self, device: PeerId) -> Result<AccountProof, Box<dyn Error>> {
+        let classic_public_key = self.classic.public().to_bytes().to_vec();
+        let ml_dsa_public_key = self.ml_dsa.public_key().to_vec();
+        let payload = account_proof_payload(&classic_public_key, &ml_dsa_public_key, device);
+        Ok(AccountProof {
+            classic_signature: self.classic.sign(&payload),
+            ml_dsa_signature: self.ml_dsa.sign(&payload)?,
+            classic_public_key,
+            ml_dsa_public_key,
+        })
+    }
+}
+
+/// Verifica che `proof` certifichi proprio `device` e restituisce l'id
+/// dell'account. Il peer id firmato impedisce di riusare la prova di un altro
+/// dispositivo: chi la rigioca da un peer diverso fallisce la verifica.
+pub(crate) fn verify_account_proof(proof: &AccountProof, device: PeerId) -> Option<String> {
+    let payload = account_proof_payload(
+        &proof.classic_public_key,
+        &proof.ml_dsa_public_key,
+        device,
+    );
+    let classic = ed25519::PublicKey::try_from_bytes(&proof.classic_public_key).ok()?;
+    if !classic.verify(&payload, &proof.classic_signature) {
+        return None;
+    }
+    if !MlDsaIdentity::verify(&proof.ml_dsa_public_key, &payload, &proof.ml_dsa_signature) {
+        return None;
+    }
+    Some(account_id(
+        &proof.classic_public_key,
+        &proof.ml_dsa_public_key,
+    ))
+}
+
+fn account_proof_payload(classic: &[u8], ml_dsa: &[u8], device: PeerId) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(classic.len() + ml_dsa.len() + 64);
+    payload.extend_from_slice(b"msnnext account device v1");
+    payload.extend_from_slice(classic);
+    payload.extend_from_slice(ml_dsa);
+    payload.extend_from_slice(&device.to_bytes());
+    payload
+}
+
+fn account_id(classic: &[u8], ml_dsa: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"msnnext account id v1");
+    hasher.update(classic);
+    hasher.update(ml_dsa);
+    hasher.finalize().to_hex().to_string()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -446,6 +526,36 @@ fn derive_session_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_proof_binds_the_device_peer() {
+        let account = AccountIdentity::from_account_key(&[3; 32]).unwrap();
+        let device = PeerId::from(libp2p::identity::Keypair::generate_ed25519().public());
+        let other = PeerId::from(libp2p::identity::Keypair::generate_ed25519().public());
+        let proof = account.proof(device).unwrap();
+
+        assert_eq!(
+            verify_account_proof(&proof, device),
+            Some(account.id())
+        );
+        // Prova rigiocata da un altro peer: rifiutata.
+        assert!(verify_account_proof(&proof, other).is_none());
+        // Stessa chiave di account su un altro dispositivo: stesso id.
+        let second = AccountIdentity::from_account_key(&[3; 32]).unwrap();
+        assert_eq!(second.id(), account.id());
+        assert_ne!(
+            AccountIdentity::from_account_key(&[4; 32]).unwrap().id(),
+            account.id()
+        );
+
+        let mut tampered = proof.clone();
+        tampered.classic_signature[0] ^= 1;
+        assert!(verify_account_proof(&tampered, device).is_none());
+        let mut tampered = proof;
+        tampered.ml_dsa_signature[0] ^= 1;
+        assert!(verify_account_proof(&tampered, device).is_none());
+    }
+
     use libp2p::{identity::Keypair, PeerId};
 
     #[test]

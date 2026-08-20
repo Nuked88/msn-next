@@ -27,6 +27,11 @@ pub struct ContactEntry {
     pub peer: String,
     pub name: String,
     pub link: String,
+    /// Account a cui appartiene il contatto: identifica la persona, non il
+    /// singolo dispositivo. Vuoto finché il contatto non presenta la prova.
+    /// `default` per compatibilità con i client più vecchi.
+    #[serde(default)]
+    pub account_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -158,6 +163,12 @@ impl History {
             changed_at_ms INTEGER NOT NULL
         );",
         )?;
+        if !column_exists(&connection, "contacts", "account_id")? {
+            connection.execute(
+                "ALTER TABLE contacts ADD COLUMN account_id TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
         if !column_exists(&connection, "events", "event_id")? {
             connection.execute("ALTER TABLE events ADD COLUMN event_id TEXT", [])?;
         }
@@ -345,8 +356,38 @@ impl History {
                 peer: peer.to_owned(),
                 name: name.to_owned(),
                 link: link.to_owned(),
+                account_id: String::new(),
             },
             changed_at_ms: added_at_ms,
+        })?;
+        Ok(())
+    }
+
+    /// Lega il contatto all'account che ha firmato la prova ricevuta nella
+    /// presence. Il legame viaggia nel log di sincronizzazione, così anche gli
+    /// altri dispositivi propri riconoscono i dispositivi di quel contatto.
+    pub fn bind_contact_account(
+        &self,
+        peer: &str,
+        account_id: &str,
+        changed_at_ms: u64,
+    ) -> Result<(), Box<dyn Error>> {
+        // Un peer senza riga in rubrica (per esempio il peer passato a mano con
+        // --connect) non ha nulla da legare: non è un errore.
+        let Some(contact) = self
+            .contacts()?
+            .into_iter()
+            .find(|contact| contact.peer == peer)
+            .filter(|contact| contact.account_id != account_id)
+        else {
+            return Ok(());
+        };
+        self.commit_local(SyncOperation::UpsertContact {
+            contact: ContactEntry {
+                account_id: account_id.to_owned(),
+                ..contact
+            },
+            changed_at_ms,
         })?;
         Ok(())
     }
@@ -398,6 +439,42 @@ impl History {
         Ok(())
     }
 
+    /// Fonde due contatti che si sono rivelati la stessa persona (stesso
+    /// account): la cronologia del duplicato passa sotto il contatto superstite
+    /// e la voce duplicata sparisce dalla rubrica. Usa solo operazioni di sync
+    /// già esistenti, così anche i dispositivi con una build più vecchia
+    /// restano sincronizzabili.
+    pub fn merge_contact(
+        &self,
+        from: &str,
+        into: &str,
+        changed_at_ms: u64,
+    ) -> Result<usize, Box<dyn Error>> {
+        if from == into {
+            return Ok(0);
+        }
+        let events = self.conversation(from, i64::MAX as usize)?;
+        // Prima la cancellazione, poi il travaso: sull'altro dispositivo le
+        // operazioni si applicano nello stesso ordine e la `DeleteContact`
+        // (che rimuove gli eventi del duplicato) non cancella quelli appena
+        // spostati.
+        self.commit_local(SyncOperation::DeleteContact {
+            peer: from.to_owned(),
+            changed_at_ms,
+        })?;
+        // Il duplicato non è una persona bloccata: è un dispositivo del
+        // contatto superstite e deve restare raggiungibile.
+        self.allow_contact(from)?;
+        let moved = events.len();
+        for event in events.into_iter().rev() {
+            self.commit_local(SyncOperation::RecordEvent(Entry {
+                peer: into.to_owned(),
+                ..event
+            }))?;
+        }
+        Ok(moved)
+    }
+
     pub fn allow_contact(&self, peer: &str) -> Result<(), Box<dyn Error>> {
         self.connection
             .execute("DELETE FROM ignored_contacts WHERE peer = ?1", [peer])?;
@@ -415,12 +492,15 @@ impl History {
     pub fn contacts(&self) -> Result<Vec<ContactEntry>, Box<dyn Error>> {
         let mut statement = self
             .connection
-            .prepare("SELECT peer, name, link FROM contacts ORDER BY name COLLATE NOCASE")?;
+            .prepare(
+                "SELECT peer, name, link, account_id FROM contacts ORDER BY name COLLATE NOCASE",
+            )?;
         let rows = statement.query_map([], |row| {
             Ok(ContactEntry {
                 peer: row.get(0)?,
                 name: row.get(1)?,
                 link: row.get(2)?,
+                account_id: row.get(3)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -725,12 +805,21 @@ impl History {
                     return Ok(false);
                 }
                 self.connection.execute(
-                    "INSERT INTO contacts (peer, name, link, added_at_ms) VALUES (?1, ?2, ?3, ?4)
+                    "INSERT INTO contacts (peer, name, link, added_at_ms, account_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
                      ON CONFLICT(peer) DO UPDATE SET
                         name = excluded.name,
                         link = CASE WHEN excluded.link = '' THEN contacts.link ELSE excluded.link END,
-                        added_at_ms = excluded.added_at_ms",
-                    params![contact.peer, contact.name, contact.link, changed_at_ms],
+                        added_at_ms = excluded.added_at_ms,
+                        account_id = CASE WHEN excluded.account_id = ''
+                            THEN contacts.account_id ELSE excluded.account_id END",
+                    params![
+                        contact.peer,
+                        contact.name,
+                        contact.link,
+                        changed_at_ms,
+                        contact.account_id
+                    ],
                 )?;
                 self.connection.execute(
                     "DELETE FROM ignored_contacts WHERE peer = ?1",
@@ -1073,6 +1162,59 @@ mod tests {
         assert!(history.ignored_contacts().unwrap().is_empty());
         drop(history);
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn merging_two_contacts_moves_the_chat_and_keeps_the_account() {
+        let path =
+            std::env::temp_dir().join(format!("msnnext-contact-merge-{}.db", std::process::id()));
+        fs::remove_file(&path).ok();
+        let history = History::open(&path, [11; 32]).unwrap();
+        history.save_contact("peer-a", "Phillip", "link", 1).unwrap();
+        history.save_contact("peer-b", "Amico", "", 2).unwrap();
+        history.record("peer-a", "in", "text", "sul pc", 3).unwrap();
+        history.record("peer-b", "in", "text", "dal telefono", 4).unwrap();
+
+        history.bind_contact_account("peer-a", "account-1", 5).unwrap();
+        // Un rename successivo non deve perdere il legame con l'account.
+        history.rename_contact("peer-a", "Phil").unwrap();
+        let contact = history
+            .contacts()
+            .unwrap()
+            .into_iter()
+            .find(|contact| contact.peer == "peer-a")
+            .unwrap();
+        assert_eq!(contact.account_id, "account-1");
+        assert_eq!(contact.name, "Phil");
+        assert_eq!(contact.link, "link");
+
+        assert_eq!(history.merge_contact("peer-b", "peer-a", 6).unwrap(), 1);
+        let contacts = history.contacts().unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].peer, "peer-a");
+        let conversation = history.conversation("peer-a", 10).unwrap();
+        assert_eq!(conversation.len(), 2);
+        assert!(conversation
+            .iter()
+            .any(|entry| entry.body == "dal telefono"));
+        assert!(history.conversation("peer-b", 10).unwrap().is_empty());
+        // Il duplicato è un dispositivo del contatto, non un bloccato.
+        assert!(history.ignored_contacts().unwrap().is_empty());
+
+        // La fusione viaggia nel log di sincronizzazione.
+        let twin_path = std::env::temp_dir()
+            .join(format!("msnnext-contact-merge-twin-{}.db", std::process::id()));
+        fs::remove_file(&twin_path).ok();
+        let twin = History::open(&twin_path, [11; 32]).unwrap();
+        twin.apply_sync_records(&history.sync_records_since(0, 500).unwrap())
+            .unwrap();
+        assert_eq!(twin.contacts().unwrap().len(), 1);
+        assert_eq!(twin.conversation("peer-a", 10).unwrap().len(), 2);
+
+        drop(history);
+        drop(twin);
+        fs::remove_file(path).ok();
+        fs::remove_file(twin_path).ok();
     }
 
     #[test]

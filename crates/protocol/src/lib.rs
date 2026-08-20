@@ -84,6 +84,23 @@ pub struct PresenceUpdate {
     /// compatibilità con i client più vecchi (che non lo inviano).
     #[serde(default)]
     pub status: String,
+    /// Prova che questo dispositivo appartiene a un account: permette al
+    /// destinatario di riconoscere i dispositivi collegati di un contatto già
+    /// noto senza chiedere una nuova approvazione. `default` per i client
+    /// più vecchi.
+    #[serde(default)]
+    pub account: Option<AccountProof>,
+}
+
+/// Firma ibrida (classica + post-quantum) con cui l'identità di account
+/// certifica un proprio dispositivo. Il payload firmato include il peer id del
+/// dispositivo: una prova rubata non è riutilizzabile da un altro peer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountProof {
+    pub classic_public_key: Vec<u8>,
+    pub ml_dsa_public_key: Vec<u8>,
+    pub classic_signature: Vec<u8>,
+    pub ml_dsa_signature: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
