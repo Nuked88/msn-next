@@ -1499,6 +1499,9 @@ pub fn run() {
                     ])
                     .build(),
             )?;
+            // Scanner QR con fotocamera nativa: solo mobile.
+            #[cfg(mobile)]
+            app.handle().plugin(tauri_plugin_barcode_scanner::init())?;
             // Tray e chiusura-in-tray sono solo desktop; su mobile non esistono.
             #[cfg(desktop)]
             {

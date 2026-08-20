@@ -328,6 +328,7 @@
   "pairing.joinBody": "Incolla il codice mostrato dal dispositivo già collegato, oppure apri un'immagine del QR.",
   "pairing.deviceCode": "Codice dispositivo",
   "pairing.openQr": "Apri QR",
+  "pairing.scanCamera": "Fotocamera",
   "pairing.linking": "Collegamento…",
   "pairing.link": "Collega",
   "backup.step": "Account msnnext",

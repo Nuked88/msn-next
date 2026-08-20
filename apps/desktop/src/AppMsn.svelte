@@ -7,6 +7,7 @@
   import { Image } from '@tauri-apps/api/image'
   import { PhysicalPosition } from '@tauri-apps/api/dpi'
   import { open, save } from '@tauri-apps/plugin-dialog'
+  import { scan, Format } from '@tauri-apps/plugin-barcode-scanner'
   import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
   import { relaunch } from '@tauri-apps/plugin-process'
   import { check, type Update } from '@tauri-apps/plugin-updater'
@@ -17,6 +18,7 @@
   import {
     Activity,
     BellOff,
+    Camera,
     CheckCircle2,
     Copy,
     Database,
@@ -219,6 +221,7 @@
   ]
 
   const appWindow = isTauri() ? getCurrentWindow() : null
+  const isMobile = typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
 
   // Angoli finestra arrotondati solo su desktop (su mobile è fullscreen). Va
   // impostato subito (non in onMount) così il contenuto è già ritagliato al
@@ -1807,6 +1810,20 @@
     }
   }
 
+  async function scanDevicePairingCamera() {
+    if (devicePairingBusy) return
+    try {
+      const result = await scan({ windowed: false, formats: [Format.QRCode] })
+      const content = typeof result === 'string' ? result : result?.content
+      if (content) {
+        devicePairingLink = content
+        await importDevicePairing()
+      }
+    } catch (error) {
+      showToast(String(error))
+    }
+  }
+
   async function scanDevicePairingQr() {
     const selected = await open({
       multiple: false,
@@ -2792,6 +2809,7 @@
         <p>{$t('pairing.joinBody')}</p>
         <label>{$t('pairing.deviceCode')}<textarea bind:value={devicePairingLink} rows="4" spellcheck="false" placeholder="msnnext://device/…"></textarea></label>
         <div class="device-pairing-actions">
+          {#if isMobile}<button class="secondary-button" disabled={devicePairingBusy} onclick={scanDevicePairingCamera}><Camera size={14} /> {$t('pairing.scanCamera')}</button>{/if}
           <button class="secondary-button" disabled={devicePairingBusy} onclick={scanDevicePairingQr}><QrCode size={14} /> {$t('pairing.openQr')}</button>
           <button class="primary-button" disabled={!devicePairingLink.trim() || devicePairingBusy} onclick={importDevicePairing}>{devicePairingBusy ? $t('pairing.linking') : $t('pairing.link')}</button>
         </div>
