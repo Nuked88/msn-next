@@ -2635,30 +2635,15 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
   box-shadow: var(--shadow-small);
 }
 
-.settings-style-row {
-  min-height: 46px;
-  display: flex;
+.settings-row-lead {
+  display: flex !important;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 18px;
-  padding: 5px 12px;
-  border: 1px solid var(--line);
-  border-radius: 11px;
-  background: var(--surface-soft);
+  gap: 11px;
+  min-width: 0;
 }
 
-.settings-style-row > span {
-  display: inline-flex;
-  align-items: center;
-  gap: 9px;
-  color: var(--text-strong);
-  font-size: 0.7rem;
-  font-weight: 700;
-}
-
-.settings-style-row select {
-  min-width: 140px;
+.settings-row-lead > span {
+  min-width: 0;
 }
 
 .palette-swatch {

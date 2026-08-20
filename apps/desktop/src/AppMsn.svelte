@@ -2650,13 +2650,8 @@
                 <button class:active={theme === 'dark'} onclick={() => setTheme('dark')}><Moon size={16} /> {$t('theme.dark')}</button>
                 <button class:active={theme === 'system'} onclick={() => setTheme('system')}><Monitor size={16} /> {$t('theme.system')}</button>
               </div>
-              <label class="settings-style-row">
-                <span><span class="palette-swatch" data-palette={palette} aria-hidden="true"></span>{$t('theme.styleGroup')}</span>
-                <select value={palette} onchange={(e) => setPalette(e.currentTarget.value as Palette)} aria-label={$t('theme.styleGroup')}>
-                  {#each palettes as p (p)}<option value={p}>{$t(`theme.palette.${p}`)}</option>{/each}
-                </select>
-              </label>
               <div class="settings-list">
+                <label class="settings-row"><span class="settings-row-lead"><span class="palette-swatch" data-palette={palette} aria-hidden="true"></span><span><strong>{$t('theme.styleGroup')}</strong><small>{$t('theme.styleHint')}</small></span></span><select value={palette} onchange={(e) => setPalette(e.currentTarget.value as Palette)} aria-label={$t('theme.styleGroup')}>{#each palettes as p (p)}<option value={p}>{$t(`theme.palette.${p}`)}</option>{/each}</select></label>
                 <label class="settings-row"><span><strong>{$t('settings.textSize.title')}</strong><small>{$t('settings.textSize.hint')}</small></span><select bind:value={fontScale} aria-label={$t('settings.textSize.title')}><option value={100}>{$t('settings.textSize.original')}</option><option value={115}>{$t('settings.textSize.comfortable')}</option><option value={125}>{$t('settings.textSize.large')}</option><option value={140}>{$t('settings.textSize.xlarge')}</option></select></label>
                 <label class="settings-row"><span><strong>{$t('settings.sentImages.title')}</strong><small>{$t('settings.sentImages.desc')}</small></span><input type="checkbox" bind:checked={previewSentImages} /></label>
                 <label class="settings-row"><span><strong>{$t('settings.recvImages.title')}</strong><small>{$t('settings.recvImages.desc')}</small></span><input type="checkbox" bind:checked={previewReceivedImages} /></label>
