@@ -8,3 +8,8 @@ apps/desktop/.playwright-cli/
 
 # Tauri mobile generated projects
 apps/desktop/src-tauri/gen/
+
+# Local agent tooling
+.agents/
+.claude/
+skills-lock.json
