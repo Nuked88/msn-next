@@ -136,8 +136,13 @@ button:disabled {
 }
 
 /* Angoli finestra arrotondati (solo desktop: la finestra è trasparente e
-   l'app-frame ritaglia i corner). Da massimizzata tornano squadrati. */
-:root.desktop body {
+   l'app-frame ritaglia i corner). Da massimizzata tornano squadrati.
+   IMPORTANTE: anche :root (html) va trasparente, altrimenti il suo sfondo pieno
+   riempie il rettangolo-finestra dietro l'app-frame e sbuca (quadrato) nei
+   corner ritagliati. */
+:root.desktop,
+:root.desktop body,
+:root.desktop #app {
   background: transparent;
 }
 

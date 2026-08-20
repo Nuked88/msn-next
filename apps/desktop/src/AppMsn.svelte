@@ -219,6 +219,15 @@
   ]
 
   const appWindow = isTauri() ? getCurrentWindow() : null
+
+  // Angoli finestra arrotondati solo su desktop (su mobile è fullscreen). Va
+  // impostato subito (non in onMount) così il contenuto è già ritagliato al
+  // primo paint, altrimenti il body opaco squadrato buca l'arrotondamento.
+  if (typeof document !== 'undefined' && typeof navigator !== 'undefined'
+      && !/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)) {
+    document.documentElement.classList.add('desktop')
+  }
+
   const securityIntroKey = 'msnnext-security-intro-v1'
   const notificationMutesKey = 'msnnext-notification-mutes-v1'
   const lastUpdateCheckKey = 'msnnext-update-last-check-v1'
@@ -469,11 +478,6 @@
         }, delay)
       }
       scheduleUpdateCheck()
-    }
-    // Angoli finestra arrotondati solo su desktop (su mobile è fullscreen).
-    // Da massimizzata gli angoli tornano squadrati (niente buchi agli angoli schermo).
-    if (typeof navigator !== 'undefined' && !/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)) {
-      document.documentElement.classList.add('desktop')
     }
     if (appWindow) {
       const syncMaximized = async () => {
