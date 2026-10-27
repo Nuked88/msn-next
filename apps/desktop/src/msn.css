@@ -3601,6 +3601,46 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
   font-size: 0.5rem;
 }
 
+.invite-code {
+  display: block;
+  margin: 12px 0 4px;
+  padding: 8px 12px;
+  border: 1px dashed var(--selected-border);
+  border-radius: 9px;
+  color: var(--text-strong);
+  background: var(--surface-raised);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.875rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-align: center;
+  user-select: all;
+  overflow-wrap: anywhere;
+}
+
+.invite-expiry {
+  margin-bottom: 9px;
+  color: var(--muted);
+  font-size: 0.5rem;
+  text-align: center;
+}
+
+.invite-section {
+  margin-bottom: 12px;
+}
+
+.connect-more {
+  margin-top: 14px;
+}
+
+.connect-more > summary {
+  margin-bottom: 10px;
+  color: var(--blue-strong);
+  font-size: 0.5625rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
 .or-divider::before,
 .or-divider::after {
   height: 1px;
