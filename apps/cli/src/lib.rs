@@ -950,8 +950,10 @@ async fn run_node(
     let sent_numbers = HashMap::<PeerId, u64>::new();
     let pending_offers = HashMap::<request_response::OutboundRequestId, PendingOffer>::new();
     let pending_transfers = HashMap::<request_response::OutboundRequestId, PendingTransfer>::new();
-    let pending_handshakes =
-        HashMap::<request_response::OutboundRequestId, (PeerId, HybridInitiator)>::new();
+    let pending_handshakes = Handshakes::new(
+        crypto::MlDsaIdentity::from_seed(&ml_dsa_seed)?,
+        args.session_rekey_interval,
+    );
     // Tentativi di handshake per peer: consente il retry se il primo invio
     // fallisce (frequente su mobile finché la connessione non è stabile).
     let handshake_retries = HashMap::<PeerId, u8>::new();
@@ -968,8 +970,9 @@ async fn run_node(
     let auto_accept_extensions = HashSet::<String>::new();
     // Stato di presenza comunicato ai contatti: "online" | "busy" | "away".
     let presence_status = String::from("online");
+    // (peer, chiave, rinnovo di una sessione attiva)
     let pending_inbound_handshakes =
-        HashMap::<request_response::InboundRequestId, (PeerId, SessionKey)>::new();
+        HashMap::<request_response::InboundRequestId, (PeerId, SessionKey, bool)>::new();
     let sessions = HashMap::<PeerId, RatchetSession>::new();
     // Errori di decifratura consecutivi per peer: oltre una soglia la sessione
     // è considerata rotta e si rifà l'handshake invece di rifiutare per sempre.
@@ -1262,7 +1265,7 @@ struct Node {
     sent_numbers: HashMap<PeerId, u64>,
     pending_offers: HashMap<request_response::OutboundRequestId, PendingOffer>,
     pending_transfers: HashMap<request_response::OutboundRequestId, PendingTransfer>,
-    pending_handshakes: HashMap<request_response::OutboundRequestId, (PeerId, HybridInitiator)>,
+    pending_handshakes: Handshakes,
     handshake_retries: HashMap<PeerId, u8>,
     outbox: HashMap<PeerId, VecDeque<(ChatEvent, u8)>>,
     pending_messages: HashMap<request_response::OutboundRequestId, PendingMessage>,
@@ -1273,7 +1276,8 @@ struct Node {
     held_responses: Vec<request_response::ResponseChannel<ProtocolResponse>>,
     auto_accept_extensions: HashSet<String>,
     presence_status: String,
-    pending_inbound_handshakes: HashMap<request_response::InboundRequestId, (PeerId, SessionKey)>,
+    pending_inbound_handshakes:
+        HashMap<request_response::InboundRequestId, (PeerId, SessionKey, bool)>,
     sessions: HashMap<PeerId, RatchetSession>,
     decrypt_failures: HashMap<PeerId, u8>,
     shared_emoticons: HashSet<(PeerId, [u8; 32])>,
@@ -1687,6 +1691,7 @@ impl Node {
                 );
             }
         }
+        pending_handshakes.rekey_due_sessions(swarm, sessions, local_peer_id);
         Ok(LoopFlow::Continue)
     }
 
@@ -2220,9 +2225,9 @@ impl Node {
                     let was_application_peer = peers.remove(&peer_id);
                     sessions.remove(&peer_id);
                     shared_emoticons.retain(|(peer, _)| *peer != peer_id);
-                    pending_handshakes.retain(|_, (pending_peer, _)| *pending_peer != peer_id);
+                    pending_handshakes.forget(peer_id);
                     pending_inbound_handshakes
-                        .retain(|_, (pending_peer, _)| *pending_peer != peer_id);
+                        .retain(|_, (pending_peer, _, _)| *pending_peer != peer_id);
                     handshake_retries.remove(&peer_id);
                     decrypt_failures.remove(&peer_id);
                     if !contact_devices.online(contact_devices.canonical(peer_id), peers) {
@@ -2387,8 +2392,7 @@ impl Node {
                     ..
                 },
             )) => {
-                pending_handshakes.remove(&request_id);
-                log::warn!("handshake ibrido fallito con {peer}: {error}");
+                pending_handshakes.pending.remove(&request_id);
                 log::warn!("handshake ibrido fallito con {peer}: {error}");
                 // Riprova finché il peer è connesso e non è già cifrato: evita
                 // di restare bloccati su "preparazione" per un invio transitorio.
@@ -2423,13 +2427,20 @@ impl Node {
                     peer, request_id, ..
                 },
             )) => {
-                if let Some((expected_peer, session_key)) =
+                if let Some((expected_peer, session_key, rekey)) =
                     pending_inbound_handshakes.remove(&request_id)
                 {
                     if expected_peer == peer {
-                        sessions
-                            .insert(peer, RatchetSession::new(session_key, local_peer_id, peer));
-                        log::info!("handshake ibrido completato: {peer}");
+                        let session = RatchetSession::new(session_key, local_peer_id, peer);
+                        if rekey && sessions.contains_key(&peer) {
+                            // Si continua a cifrare con la vecchia finché
+                            // l'iniziatore non usa la nuova: i messaggi già
+                            // in volo restano decifrabili da entrambi.
+                            pending_handshakes.stage(peer, session);
+                            log::info!("sessione rinnovata (responder): {peer}");
+                            return Ok(LoopFlow::Continue);
+                        }
+                        pending_handshakes.install(sessions, peer, session, false);
                         log::info!("handshake ibrido completato (responder): {peer}");
                         let contact = contact_devices.canonical(peer);
                         let _ = events.send(ClientEvent::ContactUpdated {
@@ -3100,13 +3111,7 @@ impl Node {
                     if ignored_contacts.contains(&peer) || ignored_contacts.contains(&contact) {
                         Err("contatto rimosso")
                     } else {
-                        sessions
-                            .get_mut(&peer)
-                            .ok_or(REJECT_NO_SESSION)
-                            .and_then(|session| {
-                                decrypt_envelope(session, peer, local_peer_id, &request)
-                                    .map_err(|_| REJECT_UNDECRYPTABLE)
-                            })
+                        pending_handshakes.decrypt(sessions, peer, local_peer_id, &request)
                     };
                 match &envelope {
                     Ok(_) => {
@@ -3552,6 +3557,9 @@ impl Node {
     ) -> Result<LoopFlow, Box<dyn Error>> {
         let Node {
             history,
+            display_name,
+            presence_status,
+            account_proof,
             ignored_contacts,
             local_peer_id,
             swarm,
@@ -3593,11 +3601,24 @@ impl Node {
                             None,
                         )
                     } else {
-                        match respond_hybrid(&request, peer, local_peer_id) {
+                        match respond_hybrid(
+                            &request,
+                            peer,
+                            local_peer_id,
+                            &pending_handshakes.identity,
+                        )
+                        .map_err(|error| error.to_string())
+                        .and_then(|(hello, handshaked)| {
+                            pin_pq_identity(history, peer, handshaked.peer_ml_dsa_key.as_deref())?;
+                            Ok((hello, handshaked.key))
+                        }) {
                             Ok((hello, session_key)) => {
                                 (HybridResponse::Accepted(hello), Some(session_key))
                             }
-                            Err(error) => (HybridResponse::Rejected(error.to_string()), None),
+                            Err(error) => {
+                                log::warn!("handshake da {peer} rifiutato: {error}");
+                                (HybridResponse::Rejected(error), None)
+                            }
                         }
                     };
                 if swarm
@@ -3607,7 +3628,8 @@ impl Node {
                     .is_ok()
                 {
                     if let Some(session_key) = pending_key {
-                        pending_inbound_handshakes.insert(request_id, (peer, session_key));
+                        pending_inbound_handshakes
+                            .insert(request_id, (peer, session_key, request.rekey));
                     }
                 } else {
                     log::warn!("risposta handshake non consegnata a {peer}");
@@ -3617,7 +3639,8 @@ impl Node {
                 request_id,
                 response,
             } => {
-                let Some((expected_peer, initiator)) = pending_handshakes.remove(&request_id)
+                let Some((expected_peer, initiator)) =
+                    pending_handshakes.pending.remove(&request_id)
                 else {
                     return Ok(LoopFlow::Continue);
                 };
@@ -3626,15 +3649,42 @@ impl Node {
                     return Ok(LoopFlow::Continue);
                 }
                 match response {
-                    HybridResponse::Accepted(hello) => match initiator.finish(&hello) {
+                    HybridResponse::Accepted(hello) => match initiator
+                        .finish(&hello)
+                        .map_err(|error| error.to_string())
+                        .and_then(|handshaked| {
+                            pin_pq_identity(history, peer, handshaked.peer_ml_dsa_key.as_deref())?;
+                            Ok(handshaked.key)
+                        }) {
                         Ok(session_key) => {
-                            sessions.insert(
+                            let rekey = sessions.contains_key(&peer);
+                            pending_handshakes.install(
+                                sessions,
                                 peer,
                                 RatchetSession::new(session_key, local_peer_id, peer),
+                                rekey,
                             );
                             handshake_retries.remove(&peer);
                             log::info!("handshake ibrido completato: {peer}");
-                            log::info!("handshake ibrido completato: {peer}");
+                            if rekey {
+                                // Il primo messaggio con la sessione nuova
+                                // dice al responder di passare a quella.
+                                send_event(
+                                    swarm,
+                                    sessions,
+                                    contact_devices,
+                                    peer,
+                                    local_peer_id,
+                                    sent_numbers,
+                                    ChatEvent::Presence(presence_update(
+                                        display_name,
+                                        presence_status,
+                                        true,
+                                        account_proof,
+                                    )),
+                                );
+                                return Ok(LoopFlow::Continue);
+                            }
                             let contact = contact_devices.canonical(peer);
                             let _ = events.send(ClientEvent::ContactUpdated {
                                 contact: ClientContact {
@@ -6640,32 +6690,184 @@ fn next_request_retry(attempts: u8) -> Option<u8> {
 
 fn maybe_start_hybrid_handshake(
     swarm: &mut Swarm<Behaviour>,
-    pending: &mut HashMap<request_response::OutboundRequestId, (PeerId, HybridInitiator)>,
+    handshakes: &mut Handshakes,
     established: &HashMap<PeerId, RatchetSession>,
     local_peer: PeerId,
     remote_peer: PeerId,
 ) {
-    let already_pending = pending
-        .values()
-        .any(|(pending_peer, _)| *pending_peer == remote_peer);
     if !needs_outbound_handshake(
         local_peer,
         remote_peer,
         established.contains_key(&remote_peer),
-        already_pending,
+        handshakes.pending_for(remote_peer),
     ) {
         return;
     }
+    handshakes.start(swarm, local_peer, remote_peer, false);
+}
 
-    match HybridInitiator::start(local_peer, remote_peer) {
-        Ok((initiator, hello)) => {
-            let request_id = swarm
-                .behaviour_mut()
-                .handshake
-                .send_request(&remote_peer, hello);
-            pending.insert(request_id, (remote_peer, initiator));
+/// Ogni quanto si rinnova una sessione cifrata con un nuovo handshake ibrido
+/// (ML-KEM + X25519, chiavi effimere fresche). Il ratchet è solo simmetrico:
+/// chi ruba lo stato di una sessione legge tutto ciò che segue, ma solo fino
+/// al rinnovo successivo (post-compromise security).
+const SESSION_REKEY_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Rinnovo anticipato dopo questo numero di messaggi nella stessa sessione.
+const SESSION_REKEY_MESSAGES: u64 = 1_000;
+/// Per quanto la sessione sostituita decifra ancora i messaggi in volo.
+const RETIRED_SESSION_GRACE: Duration = Duration::from_secs(120);
+
+#[cfg(test)]
+static SESSION_REKEYS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Handshake in corso e rinnovo periodico delle sessioni.
+struct Handshakes {
+    pending: HashMap<request_response::OutboundRequestId, (PeerId, HybridInitiator)>,
+    /// Chiave ML-DSA del dispositivo: firma ogni handshake.
+    identity: crypto::MlDsaIdentity,
+    rekey_interval: Duration,
+    /// Quando è nata ogni sessione attiva.
+    started: HashMap<PeerId, Instant>,
+    /// Sessione nuova del responder, in attesa del primo messaggio che la usa.
+    staged: HashMap<PeerId, RatchetSession>,
+    /// Sessione sostituita, ancora valida per i messaggi in volo.
+    retired: HashMap<PeerId, (RatchetSession, Instant)>,
+}
+
+impl Handshakes {
+    fn new(identity: crypto::MlDsaIdentity, rekey_interval: Duration) -> Self {
+        Self {
+            pending: HashMap::new(),
+            identity,
+            rekey_interval,
+            started: HashMap::new(),
+            staged: HashMap::new(),
+            retired: HashMap::new(),
         }
-        Err(error) => log::warn!("avvio handshake ibrido fallito: {error}"),
+    }
+
+    fn pending_for(&self, peer: PeerId) -> bool {
+        self.pending.values().any(|(pending, _)| *pending == peer)
+    }
+
+    fn start(&mut self, swarm: &mut Swarm<Behaviour>, local: PeerId, remote: PeerId, rekey: bool) {
+        match HybridInitiator::start(local, remote, &self.identity, rekey) {
+            Ok((initiator, hello)) => {
+                let request_id = swarm.behaviour_mut().handshake.send_request(&remote, hello);
+                self.pending.insert(request_id, (remote, initiator));
+            }
+            Err(error) => log::warn!("avvio handshake ibrido fallito: {error}"),
+        }
+    }
+
+    /// Installa la sessione nata da un handshake. Se è un rinnovo, la vecchia
+    /// resta per poco a decifrare i messaggi partiti prima.
+    fn install(
+        &mut self,
+        sessions: &mut HashMap<PeerId, RatchetSession>,
+        peer: PeerId,
+        session: RatchetSession,
+        rekey: bool,
+    ) {
+        self.staged.remove(&peer);
+        match sessions.insert(peer, session) {
+            Some(old) if rekey => {
+                #[cfg(test)]
+                SESSION_REKEYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.retired.insert(peer, (old, Instant::now()));
+            }
+            _ => {
+                self.retired.remove(&peer);
+            }
+        }
+        self.started.insert(peer, Instant::now());
+    }
+
+    fn stage(&mut self, peer: PeerId, session: RatchetSession) {
+        self.staged.insert(peer, session);
+    }
+
+    fn forget(&mut self, peer: PeerId) {
+        self.pending.retain(|_, (pending, _)| *pending != peer);
+        self.started.remove(&peer);
+        self.staged.remove(&peer);
+        self.retired.remove(&peer);
+    }
+
+    /// L'iniziatore rinnova le sessioni troppo vecchie o troppo usate.
+    fn rekey_due_sessions(
+        &mut self,
+        swarm: &mut Swarm<Behaviour>,
+        sessions: &HashMap<PeerId, RatchetSession>,
+        local: PeerId,
+    ) {
+        self.retired
+            .retain(|_, (_, retired_at)| retired_at.elapsed() < RETIRED_SESSION_GRACE);
+        self.started.retain(|peer, _| sessions.contains_key(peer));
+        self.staged.retain(|peer, _| sessions.contains_key(peer));
+        for (peer, session) in sessions {
+            let started = *self.started.entry(*peer).or_insert_with(Instant::now);
+            let due = started.elapsed() >= self.rekey_interval
+                || session.messages() >= SESSION_REKEY_MESSAGES;
+            if due && should_initiate(local, *peer) && !self.pending_for(*peer) {
+                log::info!("rinnovo della sessione con {peer}");
+                self.start(swarm, local, *peer, true);
+            }
+        }
+    }
+
+    /// Decifra con la sessione attiva; durante un rinnovo prova anche quella
+    /// nuova (che diventa attiva al primo messaggio) e quella appena ritirata.
+    fn decrypt(
+        &mut self,
+        sessions: &mut HashMap<PeerId, RatchetSession>,
+        peer: PeerId,
+        local: PeerId,
+        message: &RatchetMessage,
+    ) -> Result<Envelope, &'static str> {
+        let Some(current) = sessions.get_mut(&peer) else {
+            return Err(REJECT_NO_SESSION);
+        };
+        if let Ok(envelope) = decrypt_envelope(current, peer, local, message) {
+            return Ok(envelope);
+        }
+        if let Some(mut staged) = self.staged.remove(&peer) {
+            if let Ok(envelope) = decrypt_envelope(&mut staged, peer, local, message) {
+                self.install(sessions, peer, staged, true);
+                return Ok(envelope);
+            }
+            self.staged.insert(peer, staged);
+        }
+        if let Some((retired, _)) = self.retired.get_mut(&peer) {
+            if let Ok(envelope) = decrypt_envelope(retired, peer, local, message) {
+                return Ok(envelope);
+            }
+        }
+        Err(REJECT_UNDECRYPTABLE)
+    }
+}
+
+/// Fissa la chiave ML-DSA di un peer al primo handshake firmato e poi la
+/// esige: un peer che cambia chiave, o che smette di firmare dopo averlo
+/// fatto (downgrade), viene rifiutato. I peer che non hanno mai firmato
+/// (client vecchi) restano accettati con la sola autenticazione classica.
+fn pin_pq_identity(history: &History, peer: PeerId, key: Option<&[u8]>) -> Result<(), String> {
+    let peer = peer.to_string();
+    let pinned = history
+        .pq_identity(&peer)
+        .map_err(|error| error.to_string())?;
+    match (pinned, key) {
+        (Some(pinned), Some(key)) if pinned == key => Ok(()),
+        (Some(_), Some(_)) => Err("la chiave ML-DSA del contatto è cambiata".into()),
+        (Some(_), None) => Err("handshake senza firma ML-DSA da un contatto che la usava".into()),
+        (None, Some(key)) => history
+            .pin_pq_identity(&peer, key)
+            .map_err(|error| error.to_string()),
+        (None, None) => {
+            log::warn!(
+                "{peer} non firma l'handshake: client vecchio, solo autenticazione classica"
+            );
+            Ok(())
+        }
     }
 }
 
@@ -6935,10 +7137,7 @@ fn deliver_event(
     sent_numbers: &mut HashMap<PeerId, u64>,
     pending_messages: &mut HashMap<request_response::OutboundRequestId, PendingMessage>,
     outbox: &mut HashMap<PeerId, VecDeque<(ChatEvent, u8)>>,
-    pending_handshakes: &mut HashMap<
-        request_response::OutboundRequestId,
-        (PeerId, HybridInitiator),
-    >,
+    pending_handshakes: &mut Handshakes,
     local_peer_id: PeerId,
     peer: PeerId,
     event: ChatEvent,
@@ -8671,6 +8870,8 @@ pub struct ClientConfig {
     /// Legge comandi da stdin (solo CLI). L'app desktop e i test non lo usano:
     /// una lettura bloccata su stdin impedisce lo spegnimento del runtime.
     read_stdin: bool,
+    /// Ogni quanto si rinnovano le sessioni cifrate (configurabile nei test).
+    session_rekey_interval: Duration,
     name: String,
 }
 
@@ -8684,6 +8885,12 @@ impl ClientConfig {
         self.identity_bytes = Some(bytes);
         self.ml_dsa_seed = Some(ml_dsa_seed);
         Ok(self)
+    }
+
+    #[cfg(test)]
+    fn with_session_rekey_interval(mut self, interval: Duration) -> Self {
+        self.session_rekey_interval = interval;
+        self
     }
 
     pub fn with_account_key<F>(mut self, account_key: [u8; 32], store: F) -> Self
@@ -8739,6 +8946,7 @@ impl ClientConfig {
             history: data_dir.join("history.db"),
             notifications: true,
             read_stdin: false,
+            session_rekey_interval: SESSION_REKEY_INTERVAL,
             name,
         })
     }
@@ -8808,6 +9016,7 @@ impl ClientConfig {
             history,
             notifications,
             read_stdin: true,
+            session_rekey_interval: SESSION_REKEY_INTERVAL,
             name,
         })
     }
@@ -9338,9 +9547,21 @@ mod tests {
         assert!(!devices.secure(contact, &sessions));
 
         // Solo il telefono è raggiungibile: il messaggio va lì.
-        let (initiator, hello) = HybridInitiator::start(local, phone).unwrap();
-        let (response, phone_key) = respond_hybrid(&hello, local, phone).unwrap();
-        let local_key = initiator.finish(&response).unwrap();
+        let (initiator, hello) = HybridInitiator::start(
+            local,
+            phone,
+            &crypto::MlDsaIdentity::from_seed(&[1; 32]).unwrap(),
+            false,
+        )
+        .unwrap();
+        let (response, phone_key) = respond_hybrid(
+            &hello,
+            local,
+            phone,
+            &crypto::MlDsaIdentity::from_seed(&[2; 32]).unwrap(),
+        )
+        .unwrap();
+        let local_key = initiator.finish(&response).unwrap().key;
         drop(phone_key);
         sessions.insert(phone, RatchetSession::new(local_key, local, phone));
         assert_eq!(devices.route(contact, &sessions), phone);
@@ -9356,11 +9577,23 @@ mod tests {
     fn envelope_round_trips_through_the_session_ratchet() {
         let alice = PeerId::from(Keypair::generate_ed25519().public());
         let bob = PeerId::from(Keypair::generate_ed25519().public());
-        let (initiator, hello) = HybridInitiator::start(alice, bob).unwrap();
-        let (response, bob_key) = respond_hybrid(&hello, alice, bob).unwrap();
-        let alice_key = initiator.finish(&response).unwrap();
+        let (initiator, hello) = HybridInitiator::start(
+            alice,
+            bob,
+            &crypto::MlDsaIdentity::from_seed(&[1; 32]).unwrap(),
+            false,
+        )
+        .unwrap();
+        let (response, bob_key) = respond_hybrid(
+            &hello,
+            alice,
+            bob,
+            &crypto::MlDsaIdentity::from_seed(&[2; 32]).unwrap(),
+        )
+        .unwrap();
+        let alice_key = initiator.finish(&response).unwrap().key;
         let mut alice_session = RatchetSession::new(alice_key, alice, bob);
-        let mut bob_session = RatchetSession::new(bob_key, bob, alice);
+        let mut bob_session = RatchetSession::new(bob_key.key, bob, alice);
         let envelope = Envelope {
             protocol_version: PROTOCOL_VERSION,
             conversation_id: conversation_id(alice, bob),
@@ -9685,6 +9918,77 @@ mod tests {
                 bob.shutdown().await;
             })
             .await;
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Audit #18: le sessioni si rinnovano con un handshake nuovo mentre la
+    /// conversazione continua, senza perdere messaggi in nessuna direzione.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(windows, ignore = "il teardown libp2p può bloccare l'harness Windows")]
+    async fn sessions_rekey_periodically_without_losing_messages() {
+        let root = test_root("rekey");
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let fast = Duration::from_millis(500);
+                let mut alice = TestNode::start(
+                    loopback_config("Alice", &root.join("alice"), None)
+                        .with_session_rekey_interval(fast),
+                )
+                .await;
+                let mut bob = TestNode::start(
+                    loopback_config("Bob", &root.join("bob"), None)
+                        .with_session_rekey_interval(fast),
+                )
+                .await;
+                connect_pair(&mut alice, &mut bob).await;
+                let before = SESSION_REKEYS.load(std::sync::atomic::Ordering::Relaxed);
+
+                for round in 0..8 {
+                    alice.send(ClientCommand::SendText {
+                        peer: bob.peer,
+                        text: format!("da Alice {round}"),
+                    });
+                    bob.until_text(&format!("da Alice {round}")).await;
+                    bob.send(ClientCommand::SendText {
+                        peer: alice.peer,
+                        text: format!("da Bob {round}"),
+                    });
+                    alice.until_text(&format!("da Bob {round}")).await;
+                    tokio::time::sleep(Duration::from_millis(900)).await;
+                }
+
+                // Ogni rinnovo conta due volte: iniziatore e responder.
+                let rekeys = SESSION_REKEYS.load(std::sync::atomic::Ordering::Relaxed) - before;
+                assert!(rekeys >= 4, "sessione rinnovata solo {rekeys} volte");
+                alice.shutdown().await;
+                bob.shutdown().await;
+            })
+            .await;
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn pq_identity_is_pinned_and_enforced() {
+        let root = test_root("pq-pin");
+        fs::create_dir_all(&root).unwrap();
+        let history = History::open(&root.join("history.db"), [4; 32]).unwrap();
+        let peer = test_peer();
+        let first = crypto::MlDsaIdentity::from_seed(&[1; 32]).unwrap();
+        let other = crypto::MlDsaIdentity::from_seed(&[2; 32]).unwrap();
+
+        // Client vecchio mai visto firmare: accettato.
+        assert!(pin_pq_identity(&history, peer, None).is_ok());
+        // Primo handshake firmato: la chiave si fissa.
+        assert!(pin_pq_identity(&history, peer, Some(first.public_key())).is_ok());
+        assert!(pin_pq_identity(&history, peer, Some(first.public_key())).is_ok());
+        // Chiave diversa o firma sparita (downgrade): rifiutati.
+        assert!(pin_pq_identity(&history, peer, Some(other.public_key())).is_err());
+        assert!(pin_pq_identity(&history, peer, None).is_err());
+        // Rimuovere il contatto azzera la chiave fissata.
+        history.delete_contact(&peer.to_string()).unwrap();
+        assert!(pin_pq_identity(&history, peer, Some(other.public_key())).is_ok());
+        drop(history);
         fs::remove_dir_all(root).ok();
     }
 
