@@ -1,6 +1,5 @@
 use std::{
     collections::HashSet,
-    io::Cursor,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -18,16 +17,116 @@ use chacha20poly1305::{
 };
 use msnnext_core::{ClientCommand, ClientConfig, ClientEvent, GroupModeration, MAX_TEXT_BYTES};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 #[cfg(desktop)]
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     WindowEvent,
 };
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 use tokio::sync::mpsc;
 
 type CommandSender = mpsc::UnboundedSender<ClientCommand>;
+
+/// Percorsi scelti dall'utente (dialog nativi o drag & drop): i comandi che
+/// leggono o scrivono file accettano solo questi, così la WebView non può
+/// indicare un percorso arbitrario del disco.
+#[derive(Default)]
+struct ApprovedPaths(Mutex<HashSet<String>>);
+
+impl ApprovedPaths {
+    fn approve(&self, path: impl Into<String>) {
+        if let Ok(mut paths) = self.0.lock() {
+            paths.insert(path.into());
+        }
+    }
+
+    fn check(&self, path: &str) -> Result<PathBuf, String> {
+        let approved = self
+            .0
+            .lock()
+            .map_err(|_| "path state unavailable".to_owned())?
+            .contains(path);
+        if approved {
+            Ok(PathBuf::from(path))
+        } else {
+            Err("this file was not chosen by the user".into())
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct DialogFilter {
+    name: String,
+    extensions: Vec<String>,
+}
+
+fn file_dialog(
+    app: &AppHandle,
+    filters: Vec<DialogFilter>,
+) -> tauri_plugin_dialog::FileDialogBuilder<tauri::Wry> {
+    use tauri_plugin_dialog::DialogExt;
+    let mut dialog = app.dialog().file();
+    for filter in filters {
+        let extensions: Vec<&str> = filter.extensions.iter().map(String::as_str).collect();
+        dialog = dialog.add_filter(filter.name, &extensions);
+    }
+    dialog
+}
+
+#[tauri::command]
+async fn dialog_open(
+    app: AppHandle,
+    multiple: Option<bool>,
+    filters: Option<Vec<DialogFilter>>,
+) -> Result<Vec<String>, String> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let dialog = file_dialog(&app, filters.unwrap_or_default());
+    if multiple.unwrap_or(false) {
+        dialog.pick_files(move |paths| {
+            let _ = sender.send(paths.unwrap_or_default());
+        });
+    } else {
+        dialog.pick_file(move |path| {
+            let _ = sender.send(path.into_iter().collect());
+        });
+    }
+    let paths: Vec<String> = receiver
+        .await
+        .map_err(|_| "dialog closed".to_owned())?
+        .into_iter()
+        .map(|path| path.to_string())
+        .collect();
+    let approved = app.state::<ApprovedPaths>();
+    for path in &paths {
+        approved.approve(path.clone());
+    }
+    Ok(paths)
+}
+
+#[tauri::command]
+async fn dialog_save(
+    app: AppHandle,
+    default_path: Option<String>,
+    filters: Option<Vec<DialogFilter>>,
+) -> Result<Option<String>, String> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let mut dialog = file_dialog(&app, filters.unwrap_or_default());
+    if let Some(name) = default_path {
+        dialog = dialog.set_file_name(name);
+    }
+    dialog.save_file(move |path| {
+        let _ = sender.send(path);
+    });
+    let path = receiver
+        .await
+        .map_err(|_| "dialog closed".to_owned())?
+        .map(|path| path.to_string());
+    if let Some(path) = &path {
+        app.state::<ApprovedPaths>().approve(path.clone());
+    }
+    Ok(path)
+}
 type RunningNode = (u64, CommandSender);
 
 const MAX_ACCOUNT_HISTORY_BYTES: u64 = 128 * 1024 * 1024;
@@ -247,9 +346,8 @@ fn load_identity_secret(data_dir: &Path) -> Result<Option<Vec<u8>>, String> {
     match identity_entry()?.get_secret() {
         Ok(bytes) => {
             save_identity_secret(data_dir, &bytes)?;
-            let _ = identity_entry().and_then(|entry| {
-                entry.delete_credential().map_err(|error| error.to_string())
-            });
+            let _ = identity_entry()
+                .and_then(|entry| entry.delete_credential().map_err(|error| error.to_string()));
             Ok(Some(bytes))
         }
         Err(keyring::Error::NoEntry) => Ok(None),
@@ -280,7 +378,11 @@ mod macos_identity_tests {
     fn encrypted_identity_round_trips_and_rejects_tampering() {
         let secret = b"nuked-identity-bytes-\x00\x01\x02\xff".to_vec();
         let blob = macos_encrypt(&secret).expect("encrypt");
-        assert_ne!(&blob[25..], secret.as_slice(), "ciphertext must differ from plaintext");
+        assert_ne!(
+            &blob[25..],
+            secret.as_slice(),
+            "ciphertext must differ from plaintext"
+        );
         assert_eq!(macos_decrypt(&blob).expect("decrypt"), secret);
         // Truncated and tampered blobs are rejected, never mis-decrypted.
         assert!(macos_decrypt(&blob[..20]).is_err());
@@ -294,7 +396,9 @@ mod macos_identity_tests {
 fn load_identity_secret(data_dir: &Path) -> Result<Option<Vec<u8>>, String> {
     let path = data_dir.join("identity.v1.json");
     if path.exists() {
-        Ok(Some(std::fs::read(path).map_err(|error| error.to_string())?))
+        Ok(Some(
+            std::fs::read(path).map_err(|error| error.to_string())?,
+        ))
     } else {
         Ok(None)
     }
@@ -379,8 +483,8 @@ fn normalize_identity(mut identity: StoredIdentity) -> StoredIdentity {
 }
 
 fn store_account_key(data_dir: &Path, account_key: [u8; 32]) -> Result<(), String> {
-    let encoded = load_identity_secret(data_dir)?
-        .ok_or_else(|| "identity not initialized".to_owned())?;
+    let encoded =
+        load_identity_secret(data_dir)?.ok_or_else(|| "identity not initialized".to_owned())?;
     let mut identity: StoredIdentity = serde_json::from_slice(&encoded)
         .map(normalize_identity)
         .map_err(|_| "invalid identity in keystore".to_owned())?;
@@ -466,8 +570,7 @@ fn decrypt_account_backup(contents: &str, password: &str) -> Result<AccountBacku
             history: None,
         }
     } else {
-        serde_json::from_slice(&plaintext)
-            .map_err(|_| "invalid backup content".to_owned())?
+        serde_json::from_slice(&plaintext).map_err(|_| "invalid backup content".to_owned())?
     };
     payload.identity = normalize_identity(payload.identity);
     if payload.identity.version != 2
@@ -614,10 +717,7 @@ fn wait_for_worker(
     generation: u64,
     timeout: Duration,
 ) -> Result<bool, String> {
-    let running = workers
-        .0
-        .lock()
-        .map_err(|_| "worker state unavailable")?;
+    let running = workers.0.lock().map_err(|_| "worker state unavailable")?;
     let (running, _) = workers
         .1
         .wait_timeout_while(running, timeout, |workers| workers.contains(&generation))
@@ -683,7 +783,9 @@ async fn node_start(
     let client_config = ClientConfig::desktop(config.name, data_dir, config.connect, config.relay)
         .and_then(|config| config.with_identity_bytes(identity.classic, identity.ml_dsa_seed))
         .map(|config| {
-            config.with_account_key(account_key, move |key| store_account_key(&account_key_dir, key))
+            config.with_account_key(account_key, move |key| {
+                store_account_key(&account_key_dir, key)
+            })
         })
         .map_err(|error| error.to_string())?;
     let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -837,6 +939,7 @@ fn node_set_notification_mute(
 #[tauri::command]
 fn node_send_file(
     state: State<'_, NodeState>,
+    approved: State<'_, ApprovedPaths>,
     peer_id: String,
     path: String,
 ) -> Result<(), String> {
@@ -844,14 +947,17 @@ fn node_send_file(
         &state,
         ClientCommand::SendFile {
             peer: parse_peer(&peer_id)?,
-            path: PathBuf::from(path),
+            path: approved.check(&path)?,
         },
     )
 }
 
 #[tauri::command]
-fn node_cancel_file_transfers(state: State<'_, NodeState>) -> Result<(), String> {
-    send_command(&state, ClientCommand::CancelFileTransfers)
+fn node_cancel_file_transfers(
+    state: State<'_, NodeState>,
+    conversation: Option<String>,
+) -> Result<(), String> {
+    send_command(&state, ClientCommand::CancelFileTransfers { conversation })
 }
 
 #[tauri::command]
@@ -867,13 +973,14 @@ fn node_reject_attachment(state: State<'_, NodeState>, offer_id: u64) -> Result<
 #[tauri::command]
 fn node_create_emoticon(
     state: State<'_, NodeState>,
+    approved: State<'_, ApprovedPaths>,
     path: String,
     trigger: String,
 ) -> Result<(), String> {
     send_command(
         &state,
         ClientCommand::CreateEmoticon {
-            path: PathBuf::from(path),
+            path: approved.check(&path)?,
             trigger,
         },
     )
@@ -977,7 +1084,10 @@ fn node_set_auto_accept_extensions(
     state: State<'_, NodeState>,
     extensions: Vec<String>,
 ) -> Result<(), String> {
-    send_command(&state, ClientCommand::SetAutoAcceptExtensions { extensions })
+    send_command(
+        &state,
+        ClientCommand::SetAutoAcceptExtensions { extensions },
+    )
 }
 
 #[tauri::command]
@@ -991,6 +1101,36 @@ fn node_clear_conversation(state: State<'_, NodeState>, peer_id: String) -> Resu
         &state,
         ClientCommand::ClearConversation {
             peer: parse_peer(&peer_id)?,
+        },
+    )
+}
+
+#[tauri::command]
+fn node_load_older_messages(
+    state: State<'_, NodeState>,
+    peer_id: String,
+    before_event_id: String,
+) -> Result<(), String> {
+    send_command(
+        &state,
+        ClientCommand::LoadOlderMessages {
+            peer: parse_peer(&peer_id)?,
+            before_event_id,
+        },
+    )
+}
+
+#[tauri::command]
+fn node_load_older_group_messages(
+    state: State<'_, NodeState>,
+    group_id: String,
+    before_event_id: String,
+) -> Result<(), String> {
+    send_command(
+        &state,
+        ClientCommand::LoadOlderGroupMessages {
+            group_id,
+            before_event_id,
         },
     )
 }
@@ -1021,9 +1161,9 @@ fn node_moderate_group(
         "member" => GroupModeration::SetAdmin(false),
         "silence" => GroupModeration::SetSilenced(true),
         "unsilence" => GroupModeration::SetSilenced(false),
-        "tempBan" => GroupModeration::Ban(Some(
-            duration_ms.ok_or("choose a temporary ban duration")?,
-        )),
+        "tempBan" => {
+            GroupModeration::Ban(Some(duration_ms.ok_or("choose a temporary ban duration")?))
+        }
         "permaBan" => GroupModeration::Ban(None),
         "unban" => GroupModeration::Unban,
         _ => return Err("invalid moderation action".into()),
@@ -1051,6 +1191,7 @@ fn node_send_group_text(
 #[tauri::command]
 fn node_send_group_file(
     state: State<'_, NodeState>,
+    approved: State<'_, ApprovedPaths>,
     group_id: String,
     path: String,
 ) -> Result<(), String> {
@@ -1058,7 +1199,7 @@ fn node_send_group_file(
         &state,
         ClientCommand::SendGroupFile {
             group_id,
-            path: PathBuf::from(path),
+            path: approved.check(&path)?,
         },
     )
 }
@@ -1081,16 +1222,26 @@ fn node_read_attachment(
     state: State<'_, NodeState>,
     id: String,
     mime: String,
+    thumbnail: Option<bool>,
 ) -> Result<(), String> {
-    send_command(&state, ClientCommand::ReadAttachment { id, mime })
+    send_command(
+        &state,
+        ClientCommand::ReadAttachment {
+            id,
+            mime,
+            thumbnail: thumbnail.unwrap_or(false),
+        },
+    )
 }
 
 #[tauri::command]
 fn node_export_attachment(
     state: State<'_, NodeState>,
+    approved: State<'_, ApprovedPaths>,
     id: String,
-    path: PathBuf,
+    path: String,
 ) -> Result<(), String> {
+    let path = approved.check(&path)?;
     send_command(&state, ClientCommand::ExportAttachment { id, path })
 }
 
@@ -1110,17 +1261,47 @@ fn node_request_device_link(state: State<'_, NodeState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn node_revoke_device(state: State<'_, NodeState>, peer_id: String) -> Result<(), String> {
+    send_command(
+        &state,
+        ClientCommand::RevokeDevice {
+            peer: parse_peer(&peer_id)?,
+        },
+    )
+}
+
+#[tauri::command]
+fn node_answer_account_rotation(
+    state: State<'_, NodeState>,
+    request_id: u64,
+    accept: bool,
+) -> Result<(), String> {
+    send_command(
+        &state,
+        ClientCommand::AnswerAccountRotation { request_id, accept },
+    )
+}
+
+#[tauri::command]
 fn node_import_device_link(state: State<'_, NodeState>, link: String) -> Result<(), String> {
     send_command(&state, ClientCommand::ImportDeviceLink { link })
 }
 
 #[tauri::command]
-fn scan_contact_qr(path: String) -> Result<String, String> {
-    decode_qr_image(Path::new(&path))
+fn scan_contact_qr(approved: State<'_, ApprovedPaths>, path: String) -> Result<String, String> {
+    decode_qr_image(&approved.check(&path)?)
 }
 
 #[tauri::command]
-fn save_contact_qr(path: PathBuf, data_url: String) -> Result<(), String> {
+fn save_contact_qr(
+    approved: State<'_, ApprovedPaths>,
+    path: String,
+    data_url: String,
+) -> Result<(), String> {
+    write_contact_qr(&approved.check(&path)?, &data_url)
+}
+
+fn write_contact_qr(path: &Path, data_url: &str) -> Result<(), String> {
     const MAX_QR_BYTES: usize = 5 * 1024 * 1024;
     let encoded = data_url
         .strip_prefix("data:image/png;base64,")
@@ -1134,30 +1315,6 @@ fn save_contact_qr(path: PathBuf, data_url: String) -> Result<(), String> {
         return Err("invalid QR code".into());
     }
     std::fs::write(path, bytes).map_err(|error| format!("QR code could not be saved: {error}"))
-}
-
-#[tauri::command]
-fn image_preview(path: String) -> Result<String, String> {
-    const MAX_PREVIEW_SOURCE_BYTES: u64 = 100 * 1024 * 1024;
-    let path = Path::new(&path);
-    if std::fs::metadata(path)
-        .map_err(|error| format!("image could not be read: {error}"))?
-        .len()
-        > MAX_PREVIEW_SOURCE_BYTES
-    {
-        return Err("image is too large for preview".into());
-    }
-    let image = image::open(path)
-        .map_err(|error| format!("image could not be read: {error}"))?
-        .thumbnail(1280, 1280);
-    let mut bytes = Cursor::new(Vec::new());
-    image
-        .write_to(&mut bytes, image::ImageFormat::Png)
-        .map_err(|error| format!("preview could not be created: {error}"))?;
-    Ok(format!(
-        "data:image/png;base64,{}",
-        BASE64.encode(bytes.into_inner())
-    ))
 }
 
 #[tauri::command]
@@ -1180,6 +1337,7 @@ fn profile_load(app: AppHandle) -> Result<Option<ProfileView>, String> {
 fn profile_save(
     app: AppHandle,
     state: State<'_, NodeState>,
+    approved: State<'_, ApprovedPaths>,
     name: String,
     avatar_path: Option<String>,
     clear_avatar: bool,
@@ -1234,7 +1392,7 @@ fn profile_save(
         .unwrap_or_default()
         .trim()
         .to_owned();
-    if relay_address.len() > 512
+    if relay_address.len() > 1024
         || ClientConfig::desktop(
             name.to_owned(),
             data_dir.clone(),
@@ -1254,7 +1412,8 @@ fn profile_save(
         }
         None
     } else if let Some(path) = avatar_path {
-        let image = image::open(path).map_err(|error| format!("avatar could not be read: {error}"))?;
+        let image = image::open(approved.check(&path)?)
+            .map_err(|error| format!("avatar could not be read: {error}"))?;
         let file = "profile-avatar.png".to_owned();
         image
             .thumbnail(256, 256)
@@ -1294,9 +1453,11 @@ fn profile_save(
 fn account_backup_export(
     app: AppHandle,
     state: State<'_, NodeState>,
+    approved: State<'_, ApprovedPaths>,
     password: String,
-    path: PathBuf,
+    path: String,
 ) -> Result<(), String> {
+    let path = approved.check(&path)?;
     if node_status(state)? {
         return Err("go offline before creating an account backup".into());
     }
@@ -1317,9 +1478,11 @@ fn account_backup_export(
 fn account_backup_import(
     app: AppHandle,
     state: State<'_, NodeState>,
+    approved: State<'_, ApprovedPaths>,
     password: String,
-    path: PathBuf,
+    path: String,
 ) -> Result<(), String> {
+    let path = approved.check(&path)?;
     if node_status(state)? {
         return Err("go offline before restoring an account".into());
     }
@@ -1465,7 +1628,12 @@ fn autostart_get(app: AppHandle) -> Result<bool, String> {
 fn autostart_set(app: AppHandle, enabled: bool) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt;
     let manager = app.autolaunch();
-    if enabled { manager.enable() } else { manager.disable() }.map_err(|error| error.to_string())
+    if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    }
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(not(desktop))]
@@ -1484,6 +1652,16 @@ fn autostart_set(_app: AppHandle, _enabled: bool) -> Result<(), String> {
 pub fn run() {
     let builder = tauri::Builder::default()
         .manage(NodeState::default())
+        .manage(ApprovedPaths::default())
+        .on_webview_event(|webview, event| {
+            // I file trascinati nella finestra contano come scelti dall'utente.
+            if let tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
+                let approved = webview.state::<ApprovedPaths>();
+                for path in paths {
+                    approved.approve(path.to_string_lossy().into_owned());
+                }
+            }
+        })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init())
@@ -1520,8 +1698,7 @@ pub fn run() {
                     }
                 }
                 let autostart_on = app.autolaunch().is_enabled().unwrap_or(false);
-                let open =
-                    MenuItem::with_id(app, "tray-open", "Open msnnext", true, None::<&str>)?;
+                let open = MenuItem::with_id(app, "tray-open", "Open msnnext", true, None::<&str>)?;
                 let autostart_item = CheckMenuItem::with_id(
                     app,
                     "tray-autostart",
@@ -1541,7 +1718,11 @@ pub fn run() {
                         "tray-autostart" => {
                             let manager = app.autolaunch();
                             let next = !manager.is_enabled().unwrap_or(false);
-                            let _ = if next { manager.enable() } else { manager.disable() };
+                            let _ = if next {
+                                manager.enable()
+                            } else {
+                                manager.disable()
+                            };
                             let _ = autostart_item.set_checked(next);
                         }
                         "tray-quit" => app.exit(0),
@@ -1584,6 +1765,8 @@ pub fn run() {
 
     builder
         .invoke_handler(tauri::generate_handler![
+            dialog_open,
+            dialog_save,
             node_start,
             node_send_text,
             node_send_nudge,
@@ -1606,6 +1789,8 @@ pub fn run() {
             node_set_auto_accept_extensions,
             node_set_presence_status,
             node_clear_conversation,
+            node_load_older_messages,
+            node_load_older_group_messages,
             node_create_chat_group,
             node_moderate_group,
             node_send_group_text,
@@ -1618,9 +1803,10 @@ pub fn run() {
             node_request_contact_link,
             node_request_device_link,
             node_import_device_link,
+            node_revoke_device,
+            node_answer_account_rotation,
             scan_contact_qr,
             save_contact_qr,
-            image_preview,
             profile_load,
             profile_save,
             account_backup_export,
@@ -1735,6 +1921,18 @@ mod tests {
     }
 
     #[test]
+    fn approved_paths_only_accept_user_choices() {
+        let approved = ApprovedPaths::default();
+        assert!(approved.check("/etc/passwd").is_err());
+        approved.approve("/home/user/photo.png");
+        assert_eq!(
+            approved.check("/home/user/photo.png").unwrap(),
+            PathBuf::from("/home/user/photo.png")
+        );
+        assert!(approved.check("/home/user/../user/photo.png").is_err());
+    }
+
+    #[test]
     fn qr_images_yield_contact_links() {
         let payload = "msnnext://add/test-contact";
         let path =
@@ -1744,13 +1942,13 @@ mod tests {
             .render::<image::Luma<u8>>()
             .min_dimensions(1024, 1024)
             .build();
-        let mut png = Cursor::new(Vec::new());
+        let mut png = std::io::Cursor::new(Vec::new());
         image::DynamicImage::ImageLuma8(image)
             .write_to(&mut png, image::ImageFormat::Png)
             .unwrap();
-        save_contact_qr(
-            path.clone(),
-            format!("data:image/png;base64,{}", BASE64.encode(png.into_inner())),
+        write_contact_qr(
+            &path,
+            &format!("data:image/png;base64,{}", BASE64.encode(png.into_inner())),
         )
         .unwrap();
 
