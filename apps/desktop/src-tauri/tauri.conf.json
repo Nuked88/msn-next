@@ -55,6 +55,11 @@
     }
   },
   "plugins": {
+    "deep-link": {
+      "mobile": [
+        { "scheme": ["msnnext"], "appLink": false }
+      ]
+    },
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEMyRkI0RUZDN0I2RUMzNzkKUldSNXcyNTcvRTc3d2o4eXhZUWc4V0xWSlRsUk1jQlZ2amZtMmJwUWx2S3g4ZExMTm9lTGlIL1UK",
       "endpoints": [

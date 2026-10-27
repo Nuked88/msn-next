@@ -17,6 +17,7 @@
   import { Image } from '@tauri-apps/api/image'
   import { PhysicalPosition } from '@tauri-apps/api/dpi'
   import { scan, Format } from '@tauri-apps/plugin-barcode-scanner'
+  import { getCurrent as getDeepLinks, onOpenUrl } from '@tauri-apps/plugin-deep-link'
   import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
   import { relaunch } from '@tauri-apps/plugin-process'
   import { check, type Update } from '@tauri-apps/plugin-updater'
@@ -496,6 +497,7 @@
     let unlistenDrop: UnlistenFn | undefined
     let unlistenFocus: UnlistenFn | undefined
     let unlistenResize: UnlistenFn | undefined
+    let unlistenDeepLink: UnlistenFn | undefined
     let updateTimer: ReturnType<typeof setTimeout> | undefined
     const blockNativeMenu = (event: MouseEvent) => event.preventDefault()
     const openPreferences = (event: KeyboardEvent) => {
@@ -512,6 +514,11 @@
     document.addEventListener('visibilitychange', refreshPendingContactRequests)
     if (isTauri()) {
       void getVersion().then((version) => appVersion = version)
+      // Android: il QR letto dalla fotocamera di sistema apre msnnext://add/…
+      if (isMobile) {
+        void getDeepLinks().then((urls) => urls && handleOpenUrls(urls)).catch(() => {})
+        void onOpenUrl(handleOpenUrls).then((stop) => unlistenDeepLink = stop).catch(() => {})
+      }
       void initializeApp().then((stop) => unlisten = stop)
       const scheduleUpdateCheck = () => {
         const elapsed = Date.now() - lastUpdateCheck
@@ -553,6 +560,7 @@
       unlistenDrop?.()
       unlistenFocus?.()
       unlistenResize?.()
+      unlistenDeepLink?.()
       if (updateTimer) clearTimeout(updateTimer)
       window.removeEventListener('contextmenu', blockNativeMenu)
       window.removeEventListener('keydown', openPreferences)
@@ -894,6 +902,7 @@
       displayName = event.displayName
       running = true
       setupOpen = false
+      if (pendingContactLink) void addContactFromLink()
       if (effectsSounds) sounds.signIn()
       void applyAutoAccept()
       if (presenceStatus !== 'online') void invoke('node_set_presence_status', { status: presenceStatus })
@@ -1934,6 +1943,30 @@
     }
   }
 
+  // Link aperto da fuori (fotocamera, browser): chiede conferma, perché
+  // qualunque pagina può aprire un msnnext://add/.
+  let pendingContactLink = ''
+
+  function handleOpenUrls(urls: string[]) {
+    const link = urls.find((url) => url.startsWith('msnnext://add/'))
+    if (!link) return
+    pendingContactLink = link
+    if (running) void addContactFromLink()
+  }
+
+  async function addContactFromLink() {
+    const link = pendingContactLink
+    pendingContactLink = ''
+    const accepted = await askConfirm({
+      title: $t('deepLink.addTitle'),
+      body: $t('deepLink.addBody'),
+      confirmLabel: $t('connect.addToList'),
+    })
+    if (!accepted) return
+    contactLink = link
+    await importContact()
+  }
+
   async function scanContactQr() {
     const selected = await pickFile([{ name: 'QR images', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] }])
     if (!selected) return
@@ -1983,6 +2016,18 @@
       await invoke('node_join_invite', { code })
     } catch (error) {
       joiningInvite = false
+      showToast(String(error))
+    }
+  }
+
+  async function scanContactCamera() {
+    try {
+      const result = await scan({ windowed: false, formats: [Format.QRCode] })
+      const content = typeof result === 'string' ? result : result?.content
+      if (!content) return
+      contactLink = content
+      await importContact()
+    } catch (error) {
       showToast(String(error))
     }
   }
@@ -2904,6 +2949,7 @@
 
       <div class="or-divider"><span>{$t('connect.orAdd')}</span></div>
       <label>{$t('connect.receivedLink')}<input bind:value={contactLink} placeholder="msnnext://add/…" /></label>
+      {#if isMobile}<button class="scan-button" onclick={scanContactCamera}><Camera size={16} /> {$t('connect.scanCamera')}</button>{/if}
       <button class="scan-button" onclick={scanContactQr}><QrCode size={16} /> {$t('connect.scanQr')}</button>
       <button class="primary-button wide" disabled={!running || !contactLink.trim()} onclick={importContact}>
         <Link2 size={16} /> {$t('connect.addToList')}

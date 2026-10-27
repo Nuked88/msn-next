@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -24,6 +25,7 @@ use tauri::{
     WindowEvent,
 };
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
+use tauri_plugin_fs::{FilePath, FsExt, OpenOptions as FsOpenOptions};
 use tokio::sync::mpsc;
 
 type CommandSender = mpsc::UnboundedSender<ClientCommand>;
@@ -725,8 +727,8 @@ fn wait_for_worker(
     Ok(!running.contains(&generation))
 }
 
-fn decode_qr_image(path: &Path) -> Result<String, String> {
-    let image = image::open(path)
+fn decode_qr_image(bytes: &[u8]) -> Result<String, String> {
+    let image = image::load_from_memory(bytes)
         .map_err(|error| format!("image could not be read: {error}"))?
         .to_luma8();
     let mut prepared = rqrr::PreparedImage::prepare(image);
@@ -1366,21 +1368,42 @@ fn node_import_device_link(state: State<'_, NodeState>, link: String) -> Result<
     send_command(&state, ClientCommand::ImportDeviceLink { link })
 }
 
+// Su Android il dialog restituisce URI content:// e non percorsi: std::fs
+// fallisce con "No such file or directory", il plugin fs invece li apre.
 #[tauri::command]
-fn scan_contact_qr(approved: State<'_, ApprovedPaths>, path: String) -> Result<String, String> {
-    decode_qr_image(&approved.check(&path)?)
+fn scan_contact_qr(
+    app: AppHandle,
+    approved: State<'_, ApprovedPaths>,
+    path: String,
+) -> Result<String, String> {
+    approved.check(&path)?;
+    let file: FilePath = path.parse().map_err(|_| "invalid path".to_owned())?;
+    let bytes = app
+        .fs()
+        .read(file)
+        .map_err(|error| format!("image could not be read: {error}"))?;
+    decode_qr_image(&bytes)
 }
 
 #[tauri::command]
 fn save_contact_qr(
+    app: AppHandle,
     approved: State<'_, ApprovedPaths>,
     path: String,
     data_url: String,
 ) -> Result<(), String> {
-    write_contact_qr(&approved.check(&path)?, &data_url)
+    approved.check(&path)?;
+    let bytes = contact_qr_png(&data_url)?;
+    let file: FilePath = path.parse().map_err(|_| "invalid path".to_owned())?;
+    let mut options = FsOpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    app.fs()
+        .open(file, options)
+        .and_then(|mut out| out.write_all(&bytes))
+        .map_err(|error| format!("QR code could not be saved: {error}"))
 }
 
-fn write_contact_qr(path: &Path, data_url: &str) -> Result<(), String> {
+fn contact_qr_png(data_url: &str) -> Result<Vec<u8>, String> {
     const MAX_QR_BYTES: usize = 5 * 1024 * 1024;
     let encoded = data_url
         .strip_prefix("data:image/png;base64,")
@@ -1393,7 +1416,7 @@ fn write_contact_qr(path: &Path, data_url: &str) -> Result<(), String> {
     {
         return Err("invalid QR code".into());
     }
-    std::fs::write(path, bytes).map_err(|error| format!("QR code could not be saved: {error}"))
+    Ok(bytes)
 }
 
 #[tauri::command]
@@ -1742,6 +1765,7 @@ pub fn run() {
             }
         })
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -1762,6 +1786,9 @@ pub fn run() {
             // Scanner QR con fotocamera nativa: solo mobile.
             #[cfg(mobile)]
             app.handle().plugin(tauri_plugin_barcode_scanner::init())?;
+            // Link msnnext:// aperti da fuori (es. QR letto dalla fotocamera).
+            #[cfg(mobile)]
+            app.handle().plugin(tauri_plugin_deep_link::init())?;
             // Tray e chiusura-in-tray sono solo desktop; su mobile non esistono.
             #[cfg(desktop)]
             {
@@ -2055,8 +2082,6 @@ mod tests {
     #[test]
     fn qr_images_yield_contact_links() {
         let payload = "msnnext://add/test-contact";
-        let path =
-            std::env::temp_dir().join(format!("msnnext-contact-qr-{}.png", std::process::id()));
         let image = qrcode::QrCode::new(payload)
             .unwrap()
             .render::<image::Luma<u8>>()
@@ -2066,14 +2091,23 @@ mod tests {
         image::DynamicImage::ImageLuma8(image)
             .write_to(&mut png, image::ImageFormat::Png)
             .unwrap();
-        write_contact_qr(
-            &path,
-            &format!("data:image/png;base64,{}", BASE64.encode(png.into_inner())),
-        )
+        let bytes = contact_qr_png(&format!(
+            "data:image/png;base64,{}",
+            BASE64.encode(png.into_inner())
+        ))
         .unwrap();
 
-        assert_eq!(decode_qr_image(&path).unwrap(), payload);
+        assert_eq!(decode_qr_image(&bytes).unwrap(), payload);
+        assert!(contact_qr_png("data:image/png;base64,AAAA").is_err());
+    }
 
-        std::fs::remove_file(path).ok();
+    #[test]
+    fn android_content_uris_stay_uris() {
+        let uri: FilePath = "content://com.android.providers.media.documents/document/image%3A42"
+            .parse()
+            .unwrap();
+        assert!(matches!(uri, FilePath::Url(_)));
+        let path: FilePath = "/home/user/qr.png".parse().unwrap();
+        assert!(matches!(path, FilePath::Path(_)));
     }
 }
