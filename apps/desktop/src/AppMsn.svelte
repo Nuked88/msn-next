@@ -1,4 +1,13 @@
 <script lang="ts">
+  import {
+    BUILTIN_EMOTICONS,
+    formatBytes,
+    messageParts as splitMessage,
+    parseExtensions,
+    prependOlderMessages,
+    type Emoticon,
+    type MessagePart as MessagePartOf,
+  } from './lib/messages'
   import { version as packageVersion } from '../package.json'
   import { invoke, isTauri } from '@tauri-apps/api/core'
   import { getVersion } from '@tauri-apps/api/app'
@@ -192,8 +201,7 @@
   type Theme = 'light' | 'dark' | 'system'
   type SettingsSection = 'profile' | 'appearance' | 'devices' | 'data' | 'updates' | 'network'
   type UpdateStatus = 'idle' | 'checking' | 'available' | 'downloading' | 'installing' | 'current' | 'error'
-  type Emoticon = { glyph: string; shortcut: string; label: string }
-  type MessagePart = { text: string; emoticon?: Emoticon; custom?: ClientEmoticon }
+  type MessagePart = MessagePartOf<ClientEmoticon>
   type Profile = {
     name: string
     avatarDataUrl: string | null
@@ -208,27 +216,7 @@
   /** Limite del protocollo per un messaggio di testo (crates/protocol MAX_TEXT_BYTES). */
   const MAX_TEXT_BYTES = 16_384
 
-  const emoticons: Emoticon[] = [
-    { glyph: '🙂', shortcut: ':)', label: 'Sorriso' },
-    { glyph: '😄', shortcut: ':D', label: 'Risata' },
-    { glyph: '😉', shortcut: ';)', label: 'Occhiolino' },
-    { glyph: '😛', shortcut: ':P', label: 'Linguaccia' },
-    { glyph: '😢', shortcut: ':(', label: 'Triste' },
-    { glyph: '😮', shortcut: ':o', label: 'Sorpresa' },
-    { glyph: '❤️', shortcut: '<3', label: 'Cuore' },
-    { glyph: '😎', shortcut: '8)', label: 'Forte' },
-    { glyph: '😐', shortcut: ':|', label: 'Neutro' },
-    { glyph: '😳', shortcut: ':$', label: 'Imbarazzato' },
-    { glyph: '😘', shortcut: ':*', label: 'Bacio' },
-    { glyph: '😠', shortcut: ':@', label: 'Arrabbiato' },
-    { glyph: '😇', shortcut: 'O:)', label: 'Angelo' },
-    { glyph: '😈', shortcut: '}:)', label: 'Diavoletto' },
-    { glyph: '😴', shortcut: '|-)', label: 'Assonnato' },
-    { glyph: '👍', shortcut: '(y)', label: 'Pollice su' },
-    { glyph: '👎', shortcut: '(n)', label: 'Pollice giù' },
-    { glyph: '🌹', shortcut: '@}-', label: 'Rosa' },
-    { glyph: '🎉', shortcut: '\\o/', label: 'Festa' },
-  ]
+  const emoticons = BUILTIN_EMOTICONS
 
   const appWindow = isTauri() ? getCurrentWindow() : null
   const isMobile = typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
@@ -284,9 +272,6 @@
     ? ''
     : (localStorage.getItem(autoAcceptExtKey) || '')
   let autoAcceptAll = typeof localStorage !== 'undefined' && localStorage.getItem(autoAcceptAllKey) === '1'
-  function parseExtensions(value: string): string[] {
-    return value.split(/[\s,]+/).map((ext) => ext.trim().replace(/^\./, '').toLowerCase()).filter(Boolean)
-  }
   async function applyAutoAccept() {
     if (!isTauri()) return
     const extensions = autoAcceptAll ? ['*'] : parseExtensions(autoAcceptExtensions)
@@ -1294,45 +1279,8 @@
     return contact.secure ? $t('subtitle.protected') : contact.online ? $t('subtitle.connecting') : $t('subtitle.offline')
   }
 
-  function builtinMessageParts(text: string): MessagePart[] {
-    const escaped = emoticons
-      .map((item) => item.shortcut.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-      .join('|')
-    const matcher = new RegExp(`(${escaped})`, 'g')
-    return text.split(matcher).filter(Boolean).map((part) => ({
-      text: part,
-      emoticon: emoticons.find((item) => item.shortcut === part),
-    }))
-  }
-
-  function textIndexAtByteOffset(text: string, offset: number) {
-    let bytes = 0
-    let index = 0
-    for (const character of text) {
-      if (bytes >= offset) break
-      bytes += new TextEncoder().encode(character).length
-      index += character.length
-    }
-    return index
-  }
-
   function messageParts(message: ChatMessage, availableEmoticons: ClientEmoticon[]): MessagePart[] {
-    if (!message.emoticons.length) return builtinMessageParts(message.body)
-    const parts: MessagePart[] = []
-    let cursor = 0
-    for (const span of [...message.emoticons].sort((a, b) => a.start - b.start)) {
-      const start = textIndexAtByteOffset(message.body, span.start)
-      const end = textIndexAtByteOffset(message.body, span.end)
-      if (start < cursor || end <= start) continue
-      parts.push(...builtinMessageParts(message.body.slice(cursor, start)))
-      const custom = availableEmoticons.find((item) => item.assetId === span.assetId)
-      parts.push(custom
-        ? { text: message.body.slice(start, end), custom }
-        : { text: message.body.slice(start, end) })
-      cursor = end
-    }
-    parts.push(...builtinMessageParts(message.body.slice(cursor)))
-    return parts
+    return splitMessage(message.body, message.emoticons, availableEmoticons)
   }
 
   function draftText(node: Node): string {
@@ -1450,12 +1398,10 @@
   }
 
   function prependOlder(key: string, older: ChatMessage[], hasMore: boolean) {
-    const current = conversations[key] || []
-    const known = new Set(current.map((message) => message.id))
     const previousHeight = messageList?.scrollHeight ?? 0
     conversations = {
       ...conversations,
-      [key]: [...older.filter((message) => !known.has(message.id)), ...current],
+      [key]: prependOlderMessages(conversations[key] || [], older),
     }
     olderAvailable = { ...olderAvailable, [key]: hasMore }
     if (loadingOlder === key) loadingOlder = ''
@@ -1574,13 +1520,6 @@
     } catch (error) {
       showToast(String(error))
     }
-  }
-
-  function formatBytes(bytes: number) {
-    if (bytes < 1024) return `${bytes} B`
-    if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`
-    if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`
-    return `${(bytes / 1024 ** 3).toFixed(2)} GB`
   }
 
   async function sendFiles(paths: string[]) {

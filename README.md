@@ -165,7 +165,7 @@ npm run build
 npx tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
 ```
 
-The current standard suite passes with 68 tests. A test using two real sockets is excluded from the automated suite because libp2p teardown can block the harness on Windows. Its scenario should be replaced with deterministic desktop end-to-end testing.
+CI runs `cargo test`, `cargo clippy -D warnings`, `npm run check` and `npm test` on every pull request. The core tests include two-node scenarios over loopback; the frontend tests (`apps/desktop/tests`) cover message parsing and translations.
 
 Installers are generated in:
 
