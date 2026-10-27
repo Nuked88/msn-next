@@ -5,6 +5,11 @@ name: Build release bundles
 # draft, intasando la coda dei runner (soprattutto macOS).
 on:
   workflow_dispatch:
+    inputs:
+      android_only:
+        description: Solo APK Android (lo aggiunge alla release esistente, senza ricrearla)
+        type: boolean
+        default: false
 
 # Un nuovo avvio sullo stesso branch annulla quello vecchio.
 concurrency:
@@ -34,7 +39,7 @@ jobs:
 
       - name: Create draft release
         id: create
-        if: github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch
+        if: github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch && !inputs.android_only
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -52,6 +57,7 @@ jobs:
   build:
     name: ${{ matrix.name }}
     needs: create-release
+    if: ${{ !inputs.android_only }}
     strategy:
       fail-fast: false
       # I tre job girano in parallelo: nessuno tocca latest.json, che viene
@@ -142,10 +148,132 @@ jobs:
           path: ${{ matrix.files }}
           if-no-files-found: error
 
+  android:
+    name: Android APK
+    needs: create-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ needs.create-release.outputs.version }}
+      RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache Rust dependencies and build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: android
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      # Il progetto Gradle (src-tauri/gen/android) non è nel repo: lo
+      # rigeneriamo qui con l'NDK già presente sul runner.
+      - name: Generate Android project
+        working-directory: apps/desktop
+        run: |
+          echo "NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+          NDK_HOME="$ANDROID_NDK_LATEST_HOME" npm run tauri -- android init --ci
+
+      # Firma con il keystore nei secret; senza secret ripiega sulla chiave
+      # debug del runner (installabile, ma cambia a ogni build: per
+      # aggiornare serve disinstallare).
+      - name: Configure signing
+        working-directory: apps/desktop/src-tauri/gen/android
+        run: |
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            cat >> app/build.gradle.kts <<'KTS'
+
+          android {
+              signingConfigs {
+                  create("release") {
+                      storeFile = file(System.getenv("ANDROID_KEYSTORE_PATH"))
+                      storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                      keyAlias = System.getenv("ANDROID_KEY_ALIAS")
+                      keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
+                  }
+              }
+              buildTypes { getByName("release") { signingConfig = signingConfigs.getByName("release") } }
+          }
+          KTS
+          else
+            echo "::warning::ANDROID_KEYSTORE_BASE64 non impostato: APK firmato con chiave debug"
+            cat >> app/build.gradle.kts <<'KTS'
+
+          android {
+              buildTypes { getByName("release") { signingConfig = signingConfigs.getByName("debug") } }
+          }
+          KTS
+          fi
+
+      - name: Build APK
+        working-directory: apps/desktop
+        run: npm run tauri -- android build --apk --target aarch64
+
+      - name: Collect APK
+        run: |
+          APK=$(find apps/desktop/src-tauri/gen/android/app/build/outputs/apk -name '*-release*.apk' | head -n 1)
+          test -n "$APK"
+          mkdir -p out
+          cp "$APK" "out/msnnext_${VERSION}_android-arm64.apk"
+          ls -l out
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: msnnext-${{ env.VERSION }}-android-arm64
+          path: out/*.apk
+          if-no-files-found: error
+
+      - name: Attach APK to release
+        if: github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANDROID_ONLY: ${{ inputs.android_only }}
+        run: |
+          NAME="msnnext_${VERSION}_android-arm64.apk"
+          if [ -n "$RELEASE_ID" ]; then
+            # Release draft appena creata: upload per id.
+            gh api --method POST -H "Content-Type: application/vnd.android.package-archive" \
+              --input "out/$NAME" \
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$NAME" > /dev/null
+          elif [ "$ANDROID_ONLY" = "true" ]; then
+            # Solo Android: aggiunge l'APK alla release già pubblicata.
+            gh release upload "v$VERSION" "out/$NAME" --clobber --repo "$GITHUB_REPOSITORY"
+          fi
+
   publish:
     name: Publish signed update
-    if: github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch
-    needs: [create-release, build]
+    if: github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch && !inputs.android_only
+    needs: [create-release, build, android]
     runs-on: ubuntu-latest
     steps:
       - name: Upload updater latest.json
