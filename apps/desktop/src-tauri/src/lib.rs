@@ -1256,6 +1256,21 @@ fn node_request_contact_link(state: State<'_, NodeState>) -> Result<(), String> 
 }
 
 #[tauri::command]
+fn node_create_invite(state: State<'_, NodeState>) -> Result<(), String> {
+    send_command(&state, ClientCommand::CreateInvite)
+}
+
+#[tauri::command]
+fn node_cancel_invite(state: State<'_, NodeState>) -> Result<(), String> {
+    send_command(&state, ClientCommand::CancelInvite)
+}
+
+#[tauri::command]
+fn node_join_invite(state: State<'_, NodeState>, code: String) -> Result<(), String> {
+    send_command(&state, ClientCommand::JoinInvite { code })
+}
+
+#[tauri::command]
 fn node_request_device_link(state: State<'_, NodeState>) -> Result<(), String> {
     send_command(&state, ClientCommand::RequestDeviceLink)
 }
@@ -1865,6 +1880,9 @@ pub fn run() {
             node_export_attachment,
             node_import_contact,
             node_request_contact_link,
+            node_create_invite,
+            node_cancel_invite,
+            node_join_invite,
             node_request_device_link,
             node_import_device_link,
             device_link_preview,

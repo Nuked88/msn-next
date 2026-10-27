@@ -179,6 +179,9 @@
     | { type: 'emoticonOffered'; peerId: string; emoticon: ClientEmoticon }
     | { type: 'emoticonRemoved'; assetId: string }
     | { type: 'contactLink'; link: string; qrLink: string }
+    | { type: 'invite'; code: string; expiresAtMs: number }
+    | { type: 'inviteCompleted'; peerId: string; name: string }
+    | { type: 'inviteFailed'; inviter: boolean; message: string }
     | { type: 'deviceLink'; link: string; qrLink: string; expiresAtMs: number }
     | { type: 'devicesUpdated'; devices: LinkedDevice[] }
     | { type: 'deviceSynchronized'; peerId: string; applied: number; paired: boolean }
@@ -334,6 +337,12 @@
   let messageText = ''
   let contactLink = ''
   let ownContactLink = ''
+  // Codice d'invito corto: quello mostrato da noi e quello inserito.
+  let inviteCode = ''
+  let inviteExpiresAt = 0
+  let inviteRequested = false
+  let joinCode = ''
+  let joiningInvite = false
   let ownContactQr = ''
   let peerId = ''
   let ownFingerprint = ''
@@ -827,6 +836,7 @@
     ownFingerprint = ''
     ownContactLink = ''
     ownContactQr = ''
+    resetInvite()
     contacts = []
     conversations = {}
     chatGroups = []
@@ -951,6 +961,28 @@
         event.emoticon,
       ]
       showToast($t('toast.newEmoticonFrom', { name: contacts.find((item) => item.peerId === event.peerId)?.name || $t('toast.aContact') }))
+      return
+    }
+    if (event.type === 'invite') {
+      inviteCode = event.code
+      inviteExpiresAt = event.expiresAtMs
+      inviteRequested = false
+      return
+    }
+    if (event.type === 'inviteCompleted') {
+      resetInvite()
+      connectOpen = false
+      showToast($t('toast.inviteCompleted', { name: event.name }))
+      return
+    }
+    if (event.type === 'inviteFailed') {
+      if (event.inviter) {
+        inviteCode = ''
+        inviteRequested = false
+      } else {
+        joiningInvite = false
+      }
+      showToast(event.message)
       return
     }
     if (event.type === 'contactLink') {
@@ -1913,6 +1945,48 @@
     }
   }
 
+  function resetInvite() {
+    inviteCode = ''
+    inviteExpiresAt = 0
+    inviteRequested = false
+    joinCode = ''
+    joiningInvite = false
+  }
+
+  async function createInvite() {
+    if (!running) return
+    inviteRequested = true
+    try {
+      await invoke('node_create_invite')
+    } catch (error) {
+      inviteRequested = false
+      showToast(String(error))
+    }
+  }
+
+  async function cancelInvite() {
+    inviteCode = ''
+    try { await invoke('node_cancel_invite') } catch (error) { showToast(String(error)) }
+  }
+
+  async function copyInviteCode() {
+    if (!inviteCode) return
+    await navigator.clipboard.writeText(inviteCode)
+    showToast($t('toast.inviteCopied'))
+  }
+
+  async function joinInvite() {
+    const code = joinCode.trim()
+    if (!running || !code || joiningInvite) return
+    joiningInvite = true
+    try {
+      await invoke('node_join_invite', { code })
+    } catch (error) {
+      joiningInvite = false
+      showToast(String(error))
+    }
+  }
+
   async function createContactLink() {
     if (!running) return
     linkRequested = true
@@ -2155,6 +2229,7 @@
       ownFingerprint = ''
       ownContactLink = ''
       ownContactQr = ''
+      resetInvite()
       contacts = []
       conversations = {}
       selectedPeerId = ''
@@ -2791,6 +2866,27 @@
       </div>
       <p>{$t('connect.body')}</p>
 
+      <section class="share-section invite-section">
+        <header><span><strong>{$t('connect.inviteTitle')}</strong><small>{$t('connect.inviteHint')}</small></span><Sparkles size={19} /></header>
+        {#if inviteCode && inviteExpiresAt > Date.now()}
+          <output class="invite-code" aria-live="polite">{inviteCode}</output>
+          <small class="invite-expiry">{$t('connect.inviteWaiting', { time: new Date(inviteExpiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) })}</small>
+          <div class="contact-share-actions">
+            <button class="copy-link" onclick={copyInviteCode}><Copy size={15} /> {$t('connect.inviteCopy')}</button>
+            <button class="copy-link" onclick={cancelInvite}><X size={15} /> {$t('connect.inviteCancel')}</button>
+          </div>
+        {:else}
+          <button class="secondary-button" disabled={!running || inviteRequested} onclick={createInvite}>{$t('connect.inviteCreate')}</button>
+        {/if}
+      </section>
+
+      <label>{$t('connect.inviteReceived')}<input bind:value={joinCode} placeholder="1234-parola-parola-parola" autocomplete="off" autocapitalize="off" spellcheck="false" onkeydown={(event) => event.key === 'Enter' && joinInvite()} /></label>
+      <button class="primary-button wide" disabled={!running || !joinCode.trim() || joiningInvite} onclick={joinInvite}>
+        <UserRoundPlus size={16} /> {joiningInvite ? $t('connect.inviteJoining') : $t('connect.inviteJoin')}
+      </button>
+
+      <details class="connect-more">
+        <summary>{$t('connect.otherMethods')}</summary>
       <section class="share-section">
         <header><span><strong>{$t('connect.yourContact')}</strong><small>{$t('connect.yourContactHint')}</small></span><QrCode size={19} /></header>
         {#if ownContactQr}
@@ -2812,6 +2908,7 @@
       <button class="primary-button wide" disabled={!running || !contactLink.trim()} onclick={importContact}>
         <Link2 size={16} /> {$t('connect.addToList')}
       </button>
+      </details>
     </div>
   </div>
 {/if}

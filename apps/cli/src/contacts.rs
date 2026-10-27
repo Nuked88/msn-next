@@ -97,6 +97,50 @@ pub fn share_links(
     ))
 }
 
+/// Scheda completa (con ML-DSA) da scambiare dentro un invito a codice.
+pub fn invite_card(
+    display_name: &str,
+    peer_id: PeerId,
+    identity: &libp2p::identity::Keypair,
+    ml_dsa_identity: &MlDsaIdentity,
+    addresses: impl Iterator<Item = Multiaddr>,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    encode(display_name, peer_id, identity, ml_dsa_identity, addresses)
+}
+
+#[derive(Clone)]
+pub struct InviteCard {
+    pub name: String,
+    pub peer_id: PeerId,
+    pub addresses: Vec<Multiaddr>,
+    pub ml_dsa_public_key: Vec<u8>,
+    /// Link equivalente, salvato in rubrica come per i contatti da link.
+    pub link: String,
+}
+
+/// Verifica una scheda ricevuta con un invito: solo la versione firmata anche
+/// con ML-DSA, così la chiave post-quantum si fissa subito e non al primo
+/// handshake.
+pub fn decode_invite_card(bytes: &[u8]) -> Result<InviteCard, Box<dyn Error>> {
+    let (name, peer_id, addresses) = decode(bytes)?;
+    let card: ContactCard = cbor4ii::serde::from_slice(bytes)?;
+    if card.version != 2 {
+        return Err("scheda invito senza firma ML-DSA".into());
+    }
+    let ml_dsa_public_key = URL_SAFE_NO_PAD.decode(
+        card.ml_dsa_public_key
+            .as_deref()
+            .ok_or("chiave ML-DSA mancante")?,
+    )?;
+    Ok(InviteCard {
+        name,
+        peer_id,
+        addresses,
+        ml_dsa_public_key,
+        link: encoded_link(bytes),
+    })
+}
+
 pub fn render_qr(payload: &str) -> Result<String, Box<dyn Error>> {
     let code = QrCode::new(payload.as_bytes())?;
     Ok(code.render::<unicode::Dense1x2>().quiet_zone(true).build())
@@ -239,6 +283,35 @@ mod tests {
         fs::write(&path, cbor4ii::serde::to_vec(Vec::new(), &card).unwrap()).unwrap();
         assert!(import(&path).is_err());
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn invite_cards_carry_the_ml_dsa_key_and_refuse_qr_cards() {
+        let identity = Keypair::generate_ed25519();
+        let ml_dsa = MlDsaIdentity::from_seed(&[9; 32]).unwrap();
+        let peer_id = PeerId::from(identity.public());
+        let address: Multiaddr = "/ip4/127.0.0.1/tcp/4040".parse().unwrap();
+
+        let bytes = invite_card(
+            "Alice",
+            peer_id,
+            &identity,
+            &ml_dsa,
+            std::iter::once(address.clone()),
+        )
+        .unwrap();
+        let card = decode_invite_card(&bytes).unwrap();
+        assert_eq!(card.name, "Alice");
+        assert_eq!(card.peer_id, peer_id);
+        assert_eq!(card.ml_dsa_public_key, ml_dsa.public_key());
+        assert_eq!(import_link(&card.link).unwrap().1, peer_id);
+
+        // La scheda QR (v3) non ha ML-DSA: dentro un invito non basta.
+        let qr = qr_link("Alice", peer_id, &identity, std::iter::once(address)).unwrap();
+        let qr_bytes = URL_SAFE_NO_PAD
+            .decode(qr.strip_prefix("msnnext://add/").unwrap())
+            .unwrap();
+        assert!(decode_invite_card(&qr_bytes).is_err());
     }
 
     #[test]
