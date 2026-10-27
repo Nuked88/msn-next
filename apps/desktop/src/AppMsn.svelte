@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { version as packageVersion } from '../package.json'
   import { invoke, isTauri } from '@tauri-apps/api/core'
   import { getVersion } from '@tauri-apps/api/app'
   import { listen, type UnlistenFn } from '@tauri-apps/api/event'
@@ -424,7 +425,7 @@
   let notificationMutes = loadNotificationMutes()
   let overlayIcon: Image | undefined
   let taskbarUpdate = 0
-  let appVersion = '0.2.0'
+  let appVersion = packageVersion
   let updateCandidate: Update | null = null
   let updateStatus: UpdateStatus = 'idle'
   let updateMessage = ''

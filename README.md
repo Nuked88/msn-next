@@ -170,8 +170,8 @@ The current standard suite passes with 68 tests. A test using two real sockets i
 Installers are generated in:
 
 ```text
-target/release/bundle/msi/msnnext_0.2.0_x64_en-US.msi
-target/release/bundle/nsis/msnnext_0.2.0_x64-setup.exe
+target/release/bundle/msi/msnnext_<version>_x64_en-US.msi
+target/release/bundle/nsis/msnnext_<version>_x64-setup.exe
 ```
 
 ## Creating releases and installers

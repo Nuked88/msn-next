@@ -744,8 +744,35 @@ fn build_swarm(
         .build())
 }
 
+/// Logger della CLI: i messaggi del nodo su stdout, avvisi ed errori su
+/// stderr. Le librerie (libp2p) restano silenziose come prima.
+struct CliLogger;
+
+impl log::Log for CliLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Info && metadata.target().starts_with("msnnext")
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        if record.level() <= log::Level::Warn {
+            eprintln!("{}", record.args());
+        } else {
+            println!("{}", record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
 #[tokio::main]
 pub async fn run_cli() -> Result<(), Box<dyn Error>> {
+    // La GUI raccoglie i log con tauri-plugin-log; da terminale li stampiamo.
+    if log::set_logger(&CliLogger).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
     let args = ClientConfig::parse()?;
     let (_command_tx, command_rx) = mpsc::unbounded_channel();
     let (event_tx, _event_rx) = mpsc::unbounded_channel();
@@ -821,7 +848,7 @@ async fn run_node(
         let (peer, base) = split_peer_address(address)?;
         swarm.behaviour_mut().kad.add_address(&peer, base);
         if let Err(error) = swarm.dial(address.clone()) {
-            eprintln!("bootstrap non raggiungibile {peer}: {error}");
+            log::warn!("bootstrap non raggiungibile {peer}: {error}");
         }
     }
     if !args.bootstrap.is_empty() {
@@ -836,13 +863,13 @@ async fn run_node(
         let (peer, _) = split_peer_address(address)?;
         if !bootstrap_peers.contains(&peer) {
             if let Err(error) = swarm.dial(address.clone()) {
-                eprintln!("relay non raggiungibile {address}: {error}");
+                log::warn!("relay non raggiungibile {address}: {error}");
             }
         }
     }
 
-    println!("peer: {local_peer_id}");
-    println!("comandi: text <messaggio> | emote <trigger> <file> | file <percorso> | contact qr | contact export/import <file> | nudge | history | quit");
+    log::info!("peer: {local_peer_id}");
+    log::info!("comandi: text <messaggio> | emote <trigger> <file> | file <percorso> | contact qr | contact export/import <file> | nudge | history | quit");
     let mut display_name = args.name.clone();
     let _ = events.send(ClientEvent::Started {
         peer_id: local_peer_id.to_string(),
@@ -1156,7 +1183,7 @@ async fn run_node(
                         }});
                     }
                     FileTarget::AllPeers => {
-                        println!("offerta file: {} ({} chunk)", manifest.filename, manifest.chunks.len());
+                        log::info!("offerta file: {} ({} chunk)", manifest.filename, manifest.chunks.len());
                         for peer in &peers {
                             record(&history, peer, "out", "file", &manifest.filename);
                             if let Some(request_id) = send_event(&mut swarm, &mut sessions, &contact_devices, *peer, local_peer_id, &mut sent_numbers, ChatEvent::AttachmentOffer(manifest.clone())) {
@@ -1172,7 +1199,7 @@ async fn run_node(
                     .unwrap_or_else(|| HashSet::from([None]));
                 match done.result {
                     Ok(completed) => {
-                        println!("{}: file ricevuto nell'archivio cifrato", done.peer);
+                        log::info!("{}: file ricevuto nell'archivio cifrato", done.peer);
                         let should_notify = args.notifications && destinations.iter().any(|group_id| {
                             let conversation = group_id
                                 .as_ref()
@@ -1275,7 +1302,7 @@ async fn run_node(
                 {
                     if let Err(error) = swarm.dial(DialOpts::peer_id(peer).build()) {
                         dialing.remove(&peer);
-                        eprintln!("riconnessione fallita per {peer}: {error}");
+                        log::warn!("riconnessione fallita per {peer}: {error}");
                         schedule_reconnect(
                             peer,
                             &mut reconnect_at,
@@ -1288,9 +1315,9 @@ async fn run_node(
                 Some(line) if line == "quit" => return Ok(LoopFlow::Stop),
                 Some(line) if line == "history" => match history.latest(20) {
                     Ok(entries) => for entry in entries.iter().rev() {
-                        println!("{} {} {} {}: {}", entry.timestamp_ms, entry.direction, entry.peer, entry.kind, entry.body);
+                        log::info!("{} {} {} {}: {}", entry.timestamp_ms, entry.direction, entry.peer, entry.kind, entry.body);
                     },
-                    Err(error) => eprintln!("cronologia non disponibile: {error}"),
+                    Err(error) => log::warn!("cronologia non disponibile: {error}"),
                 },
                 Some(line) if line.starts_with("contact export ") => {
                     let path = Path::new(line[15..].trim());
@@ -1302,8 +1329,8 @@ async fn run_node(
                         &ml_dsa_identity,
                         contact_addresses(&swarm, &args.relays, local_peer_id).into_iter(),
                     ) {
-                        Ok(()) => println!("scheda contatto salvata in {}", path.display()),
-                        Err(error) => eprintln!("esportazione contatto fallita: {error}"),
+                        Ok(()) => log::info!("scheda contatto salvata in {}", path.display()),
+                        Err(error) => log::warn!("esportazione contatto fallita: {error}"),
                     }
                 },
                 Some(line) if line == "contact qr" => {
@@ -1319,15 +1346,15 @@ async fn run_node(
                         Ok((link, qr))
                     });
                     match result {
-                        Ok((link, qr)) => println!("{qr}\n{link}"),
-                        Err(error) => eprintln!("generazione QR fallita: {error}"),
+                        Ok((link, qr)) => log::info!("{qr}\n{link}"),
+                        Err(error) => log::warn!("generazione QR fallita: {error}"),
                     }
                 },
                 Some(line) if line.starts_with("contact import-link ") => match contacts::import_link(line[20..].trim()) {
                     Ok((name, peer_id, addresses)) => {
                         peer_names.insert(peer_id, name.clone());
                         known_contacts.insert(peer_id);
-                        println!("identità contatto verificata: {name} ({peer_id})");
+                        log::info!("identità contatto verificata: {name} ({peer_id})");
                         connect_contact(
                             &mut swarm,
                             peer_id,
@@ -1338,13 +1365,13 @@ async fn run_node(
                             &mut pending_dht,
                         );
                     }
-                    Err(error) => eprintln!("link contatto rifiutato: {error}"),
+                    Err(error) => log::warn!("link contatto rifiutato: {error}"),
                 },
                 Some(line) if line.starts_with("contact import ") => match contacts::import(Path::new(line[15..].trim())) {
                     Ok((name, peer_id, addresses)) => {
                         peer_names.insert(peer_id, name.clone());
                         known_contacts.insert(peer_id);
-                        println!("contatto importato: {name} ({peer_id})");
+                        log::info!("contatto importato: {name} ({peer_id})");
                         connect_contact(
                             &mut swarm,
                             peer_id,
@@ -1355,7 +1382,7 @@ async fn run_node(
                             &mut pending_dht,
                         );
                     }
-                    Err(error) => eprintln!("importazione contatto fallita: {error}"),
+                    Err(error) => log::warn!("importazione contatto fallita: {error}"),
                 },
                 Some(line) if line == "nudge" => {
                     nudge_counter += 1;
@@ -1363,14 +1390,14 @@ async fn run_node(
                     let mut id = [0; 16];
                     id[..8].copy_from_slice(&now.to_be_bytes());
                     id[8..].copy_from_slice(&nudge_counter.to_be_bytes());
-                    if peers.is_empty() { eprintln!("nessun peer collegato"); }
+                    if peers.is_empty() { log::warn!("nessun peer collegato"); }
                     for peer in &peers {
                         match nudge_limits.entry(*peer).or_default().try_acquire(now) {
                             Ok(()) => {
                                 send_event(&mut swarm, &mut sessions, &contact_devices, *peer, local_peer_id, &mut sent_numbers, ChatEvent::Nudge(Nudge { id, intensity: 1, timestamp_ms: now }));
                                 record(&history, peer, "out", "nudge", "trillo");
                             }
-                            Err(wait_ms) => eprintln!("trillo limitato per {peer}: riprova tra {}s", wait_ms.div_ceil(1_000)),
+                            Err(wait_ms) => log::warn!("trillo limitato per {peer}: riprova tra {}s", wait_ms.div_ceil(1_000)),
                         }
                     }
                 }
@@ -1387,20 +1414,20 @@ async fn run_node(
                 }
                 Some(line) if line.starts_with("emote ") => match parse_emote_command(&line, &args.emotes, &mut triggers) {
                     Ok(offer) => {
-                        println!("emoticon salvata: {}", offer.metadata.name);
+                        log::info!("emoticon salvata: {}", offer.metadata.name);
                         for peer in &peers { record(&history, peer, "out", "emote", &offer.metadata.name); }
                         broadcast(&mut swarm, &mut sessions, &contact_devices, &peers, local_peer_id, &mut sent_numbers, ChatEvent::EmoticonOffer(offer));
                     }
-                    Err(error) => eprintln!("emoticon rifiutata: {error}"),
+                    Err(error) => log::warn!("emoticon rifiutata: {error}"),
                 },
                 Some(line) if line.starts_with("file ") => {
                     if peers.is_empty() {
-                        eprintln!("nessun peer collegato");
+                        log::warn!("nessun peer collegato");
                     } else {
                         prepare_file(&prepared_files_tx, FileTarget::AllPeers, PathBuf::from(line[5..].trim()));
                     }
                 }
-                Some(_) => eprintln!("comando non valido"),
+                Some(_) => log::warn!("comando non valido"),
                 None => stdin_open = false,
             },
             command = commands.recv(), if commands_open => match command {
@@ -2219,7 +2246,7 @@ async fn run_node(
                     } else {
                         address.with(Protocol::P2p(local_peer_id))
                     };
-                    println!("ascolto: {address}");
+                    log::info!("ascolto: {address}");
                     if contact_link_requested {
                         let addresses = contact_addresses(&swarm, &args.relays, local_peer_id);
                         if !addresses.is_empty() {
@@ -2286,7 +2313,7 @@ async fn run_node(
                             if let Err(error) =
                                 swarm.listen_on(address.clone().with(Protocol::P2pCircuit))
                             {
-                                eprintln!("prenotazione relay fallita: {error}");
+                                log::warn!("prenotazione relay fallita: {error}");
                                 log::warn!("prenotazione relay fallita: {error}");
                             }
                         }
@@ -2342,7 +2369,7 @@ async fn run_node(
                         known_contacts.insert(peer_id);
                     }
                     if (known_contacts.contains(&peer_id) || is_manual) && peers.insert(peer_id) {
-                        println!("connesso: {peer_id}");
+                        log::info!("connesso: {peer_id}");
                         log::info!("connesso: {peer_id}");
                         // La UI conosce il contatto, non il suo singolo dispositivo.
                         let contact = contact_devices.canonical(peer_id);
@@ -2387,7 +2414,7 @@ async fn run_node(
                         nudge_limits.remove(&peer_id);
                         incoming_nudge_limits.remove(&peer_id);
                         if was_application_peer {
-                            println!("offline: {} ({cause:?})", peer_names.get(&peer_id).map_or_else(|| peer_id.to_string(), Clone::clone));
+                            log::info!("offline: {} ({cause:?})", peer_names.get(&peer_id).map_or_else(|| peer_id.to_string(), Clone::clone));
                             log::info!("offline: {peer_id} ({cause:?})");
                             // Un contatto va offline solo quando cade l'ultimo dei
                             // suoi dispositivi.
@@ -2534,7 +2561,7 @@ async fn run_node(
                                 ) {
                                     known_contacts.insert(peer);
                                     peers.insert(peer);
-                                    println!("connesso: {peer}");
+                                    log::info!("connesso: {peer}");
                                     send_event(
                                         &mut swarm,
                                         &mut sessions,
@@ -2801,7 +2828,7 @@ async fn run_node(
                                 ProtocolResponse::MissingChunks(indices) => {
                                     match validate_missing_chunks(indices, pending.manifest.chunks.len()) {
                                         Ok(remaining) => {
-                                            println!("invio {}: {} chunk richiesti", pending.manifest.filename, remaining.len());
+                                            log::info!("invio {}: {} chunk richiesti", pending.manifest.filename, remaining.len());
                                             let total = remaining.len();
                                             let _ = events.send(ClientEvent::AttachmentProgress {
                                                 filename: pending.manifest.filename.clone(),
@@ -2932,7 +2959,7 @@ async fn run_node(
                                 report_file_failed(&events, &pending.manifest.filename, "sessione cifrata persa");
                             }
                         } else {
-                            eprintln!("offerta file fallita definitivamente per {peer}: {error}");
+                            log::warn!("offerta file fallita definitivamente per {peer}: {error}");
                             report_file_failed(&events, &pending.manifest.filename, &error.to_string());
                         }
                     } else if let Some(mut transfer) = pending_transfers.remove(&request_id) {
@@ -2949,7 +2976,7 @@ async fn run_node(
                                 transfer,
                             );
                         } else {
-                            eprintln!("trasferimento file fallito definitivamente per {peer}: {error}");
+                            log::warn!("trasferimento file fallito definitivamente per {peer}: {error}");
                             report_file_failed(&events, &transfer.manifest.filename, &error.to_string());
                         }
                     } else if let Some((msg_peer, event, retries, _)) = pending_messages.remove(&request_id) {
@@ -2957,16 +2984,16 @@ async fn run_node(
                         if let Some(next) = next_delivery_attempt(retries) {
                             resend_pending(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, local_peer_id, msg_peer, event, next);
                         } else {
-                            eprintln!("messaggio non consegnato definitivamente a {peer}: {error}");
+                            log::warn!("messaggio non consegnato definitivamente a {peer}: {error}");
                             report_undelivered(&events, &mut shared_emoticons, msg_peer, &event, &error.to_string());
                         }
                     } else {
-                        eprintln!("invio cifrato fallito per {peer}: {error}");
+                        log::warn!("invio cifrato fallito per {peer}: {error}");
                     }
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::SecureChat(request_response::Event::InboundFailure { peer, request_id, error, .. })) => {
                     pending_inbound_offers.retain(|_, pending| pending.request_id != request_id);
-                    eprintln!("messaggio cifrato non ricevibile da {peer}: {error}");
+                    log::warn!("messaggio cifrato non ricevibile da {peer}: {error}");
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::SecureChat(request_response::Event::ResponseSent { .. })) => {}
                 SwarmEvent::Behaviour(BehaviourEvent::Handshake(request_response::Event::Message { peer, message, .. })) => match message {
@@ -2999,7 +3026,7 @@ async fn run_node(
                                 pending_inbound_handshakes.insert(request_id, (peer, session_key));
                             }
                         } else {
-                            eprintln!("risposta handshake non consegnata a {peer}");
+                            log::warn!("risposta handshake non consegnata a {peer}");
                         }
                     }
                     request_response::Message::Response { request_id, response } => {
@@ -3007,7 +3034,7 @@ async fn run_node(
                             return Ok(LoopFlow::Continue);
                         };
                         if expected_peer != peer {
-                            eprintln!("risposta handshake ricevuta dal peer errato");
+                            log::warn!("risposta handshake ricevuta dal peer errato");
                             return Ok(LoopFlow::Continue);
                         }
                         match response {
@@ -3018,7 +3045,7 @@ async fn run_node(
                                         RatchetSession::new(session_key, local_peer_id, peer),
                                     );
                                     handshake_retries.remove(&peer);
-                                    println!("handshake ibrido completato: {peer}");
+                                    log::info!("handshake ibrido completato: {peer}");
                                     log::info!("handshake ibrido completato: {peer}");
                                     let contact = contact_devices.canonical(peer);
                                     let _ = events.send(ClientEvent::ContactUpdated {
@@ -3047,17 +3074,17 @@ async fn run_node(
                                         offer_file(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_offers, &history, &events, local_peer_id, offer);
                                     }
                                 }
-                                Err(error) => eprintln!("handshake ibrido fallito con {peer}: {error}"),
+                                Err(error) => log::warn!("handshake ibrido fallito con {peer}: {error}"),
                             },
                             HybridResponse::Rejected(error) => {
-                                eprintln!("handshake ibrido rifiutato da {peer}: {error:?}");
+                                log::warn!("handshake ibrido rifiutato da {peer}: {error:?}");
                             }
                         }
                     }
                 },
                 SwarmEvent::Behaviour(BehaviourEvent::Handshake(request_response::Event::OutboundFailure { peer, request_id, error, .. })) => {
                     pending_handshakes.remove(&request_id);
-                    eprintln!("handshake ibrido fallito con {peer}: {error}");
+                    log::warn!("handshake ibrido fallito con {peer}: {error}");
                     log::warn!("handshake ibrido fallito con {peer}: {error}");
                     // Riprova finché il peer è connesso e non è già cifrato: evita
                     // di restare bloccati su "preparazione" per un invio transitorio.
@@ -3069,7 +3096,7 @@ async fn run_node(
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Handshake(request_response::Event::InboundFailure { peer, request_id, error, .. })) => {
                     pending_inbound_handshakes.remove(&request_id);
-                    eprintln!("richiesta handshake non valida da {peer}: {error}");
+                    log::warn!("richiesta handshake non valida da {peer}: {error}");
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Handshake(request_response::Event::ResponseSent { peer, request_id, .. })) => {
                     if let Some((expected_peer, session_key)) = pending_inbound_handshakes.remove(&request_id) {
@@ -3078,7 +3105,7 @@ async fn run_node(
                                 peer,
                                 RatchetSession::new(session_key, local_peer_id, peer),
                             );
-                            println!("handshake ibrido completato: {peer}");
+                            log::info!("handshake ibrido completato: {peer}");
                             log::info!("handshake ibrido completato (responder): {peer}");
                             let contact = contact_devices.canonical(peer);
                             let _ = events.send(ClientEvent::ContactUpdated {
@@ -3411,7 +3438,7 @@ async fn run_node(
                     let _ = events.send(ClientEvent::Error { message: format!("sincronizzazione con {peer} fallita: {error}") });
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Devices(request_response::Event::InboundFailure { peer, error, .. })) => {
-                    eprintln!("sincronizzazione non ricevibile da {peer}: {error}");
+                    log::warn!("sincronizzazione non ricevibile da {peer}: {error}");
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Devices(request_response::Event::ResponseSent { .. })) => {}
                 SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
@@ -3432,18 +3459,18 @@ async fn run_node(
                     }
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Autonat(autonat::Event::StatusChanged { new, .. })) => {
-                    println!("raggiungibilità: {new:?}");
+                    log::info!("raggiungibilità: {new:?}");
                     log::info!("raggiungibilità (autonat): {new:?}");
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::RelayClient(event)) => {
-                    println!("relay client: {event:?}");
+                    log::info!("relay client: {event:?}");
                     log::info!("relay client: {event:?}");
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::RelayServer(event)) => {
-                    println!("relay server: {event:?}");
+                    log::info!("relay server: {event:?}");
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Dcutr(event)) => {
-                    println!("hole punching: {event:?}");
+                    log::info!("hole punching: {event:?}");
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Ping(_)) => {}
                 SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(discovered))) => {
@@ -3470,14 +3497,14 @@ async fn run_node(
                             && mdns_dialing.insert(peer_id)
                         {
                             dialing.insert(peer_id);
-                            println!("peer LAN trovato: {peer_id}");
+                            log::info!("peer LAN trovato: {peer_id}");
                             let address = base.with(Protocol::P2p(peer_id));
                             let options = DialOpts::peer_id(peer_id)
                                 .condition(PeerCondition::Always)
                                 .addresses(vec![address])
                                 .build();
                             if let Err(error) = swarm.dial(options) {
-                                eprintln!("dial mDNS fallito: {error}");
+                                log::warn!("dial mDNS fallito: {error}");
                             }
                         }
                     }
@@ -3487,13 +3514,13 @@ async fn run_node(
                     if let Some(peer_id) = peer_id {
                         mdns_dialing.remove(&peer_id);
                         if peers.contains(&peer_id) || online_devices.contains(&peer_id) {
-                            eprintln!("dial duplicato ignorato per peer già connesso: {peer_id}");
+                            log::warn!("dial duplicato ignorato per peer già connesso: {peer_id}");
                         } else if let Some(address) = bootstrap_fallbacks.get_mut(&peer_id).and_then(VecDeque::pop_front) {
-                            eprintln!("bootstrap fallito, provo il prossimo indirizzo: {error}");
-                            if let Err(next_error) = swarm.dial(address) { eprintln!("indirizzo non raggiungibile: {next_error}"); }
+                            log::warn!("bootstrap fallito, provo il prossimo indirizzo: {error}");
+                            if let Err(next_error) = swarm.dial(address) { log::warn!("indirizzo non raggiungibile: {next_error}"); }
                         } else {
                             dialing.remove(&peer_id);
-                            eprintln!("connessione fallita: {error}");
+                            log::warn!("connessione fallita: {error}");
                             log::warn!("connessione fallita: {error}");
                             if pending_pair_targets.contains_key(&peer_id) {
                                 let _ = events.send(ClientEvent::Error {
@@ -3510,7 +3537,7 @@ async fn run_node(
                                 );
                             }
                         }
-                    } else { eprintln!("connessione fallita: {error}"); }
+                    } else { log::warn!("connessione fallita: {error}"); }
                 }
                 _ => {}
             }
@@ -3844,7 +3871,7 @@ enum LoopFlow {
 /// Un errore durante la gestione di un evento non deve spegnere il nodo:
 /// viene mostrato all'utente e il loop prosegue con l'evento successivo.
 fn report_loop_error(events: &mpsc::UnboundedSender<ClientEvent>, error: &dyn Error) {
-    eprintln!("errore gestito nel loop: {error}");
+    log::warn!("errore gestito nel loop: {error}");
     log::warn!("errore gestito nel loop: {error}");
     let _ = events.send(ClientEvent::Error {
         message: error.to_string(),
@@ -4150,7 +4177,7 @@ fn apply_presence_source(
             context
                 .history
                 .merge_contact(&duplicate.to_string(), &keep.to_string(), now_ms())?;
-        println!("contatti uniti: {duplicate} -> {keep} ({moved} messaggi)");
+        log::info!("contatti uniti: {duplicate} -> {keep} ({moved} messaggi)");
         log::info!("contatti uniti: {duplicate} -> {keep} ({moved} messaggi)");
         context.peer_names.remove(&duplicate);
         let _ = context.events.send(ClientEvent::ContactRemoved {
@@ -4169,7 +4196,7 @@ fn apply_presence_source(
     // contatto, nessun duplicato in rubrica. Vale esattamente i permessi del
     // contatto a cui appartiene.
     if context.known_contacts.insert(peer) {
-        println!("dispositivo di {contact} riconosciuto: {peer}");
+        log::info!("dispositivo di {contact} riconosciuto: {peer}");
         log::info!("dispositivo di {contact} riconosciuto: {peer}");
     }
     if context.pending_contact_requests.remove(&peer).is_some() {
@@ -4400,7 +4427,7 @@ fn maybe_start_hybrid_handshake(
                 .send_request(&remote_peer, hello);
             pending.insert(request_id, (remote_peer, initiator));
         }
-        Err(error) => eprintln!("avvio handshake ibrido fallito: {error}"),
+        Err(error) => log::warn!("avvio handshake ibrido fallito: {error}"),
     }
 }
 
@@ -4446,8 +4473,8 @@ fn connect_contact(
                 swarm.behaviour_mut().kad.add_address(&peer, base);
                 valid.push_back(address);
             }
-            Ok(_) => eprintln!("indirizzo ignorato: Peer ID diverso dal contatto"),
-            Err(error) => eprintln!("indirizzo contatto ignorato: {error}"),
+            Ok(_) => log::warn!("indirizzo ignorato: Peer ID diverso dal contatto"),
+            Err(error) => log::warn!("indirizzo contatto ignorato: {error}"),
         }
     }
 
@@ -4455,7 +4482,7 @@ fn connect_contact(
         dialing.insert(peer);
         direct_fallbacks.insert(peer, valid);
         if let Err(error) = swarm.dial(address) {
-            eprintln!("indirizzo non raggiungibile: {error}");
+            log::warn!("indirizzo non raggiungibile: {error}");
             let recovery = planner.after_failure(peer);
             execute_recovery(swarm, pending_dht, planner, peer, recovery);
         }
@@ -4486,34 +4513,34 @@ fn execute_recovery(
     loop {
         match recovery {
             Recovery::SearchDht(target) => {
-                println!("cerco {target} nella DHT");
+                log::info!("cerco {target} nella DHT");
                 let query = swarm.behaviour_mut().kad.get_closest_peers(target);
                 pending_dht.insert(query, target);
                 return;
             }
             Recovery::DialPeer(target) => {
-                println!("provo indirizzi DHT per {target}");
+                log::info!("provo indirizzi DHT per {target}");
                 match swarm.dial(DialOpts::peer_id(target).build()) {
                     Ok(()) => return,
                     Err(error) => {
-                        eprintln!("dial DHT fallito: {error}");
+                        log::warn!("dial DHT fallito: {error}");
                         recovery = planner.after_failure(peer);
                     }
                 }
             }
             Recovery::ViaRelay(address) => {
-                println!("provo il relay: {address}");
+                log::info!("provo il relay: {address}");
                 log::info!("provo il relay: {address}");
                 match swarm.dial(address) {
                     Ok(()) => return,
                     Err(error) => {
-                        eprintln!("dial relay fallito: {error}");
+                        log::warn!("dial relay fallito: {error}");
                         recovery = planner.after_failure(peer);
                     }
                 }
             }
             Recovery::Exhausted => {
-                eprintln!("nessun altro percorso disponibile");
+                log::warn!("nessun altro percorso disponibile");
                 log::warn!("nessun altro percorso disponibile per {peer}");
                 return;
             }
@@ -4558,7 +4585,7 @@ fn broadcast(
     event: ChatEvent,
 ) {
     if peers.is_empty() {
-        eprintln!("nessun peer collegato");
+        log::warn!("nessun peer collegato");
     }
     for peer in peers {
         send_event(
@@ -4756,14 +4783,14 @@ fn send_event(
     let peer = devices.route(peer, sessions);
     let secure = sessions.contains_key(&peer);
     if !secure && !matches!(event, ChatEvent::Presence(_)) {
-        eprintln!("sessione sicura non pronta per {peer}");
+        log::warn!("sessione sicura non pronta per {peer}");
         return None;
     }
     let previous = sent_numbers.get(&peer).copied().unwrap_or_default();
     let number = match previous.checked_add(1) {
         Some(number) => number,
         None => {
-            eprintln!("contatore messaggi esaurito per {peer}");
+            log::warn!("contatore messaggi esaurito per {peer}");
             return None;
         }
     };
@@ -4779,7 +4806,7 @@ fn send_event(
         let encrypted = match encrypt_envelope(session, local_peer_id, peer, &envelope) {
             Ok(encrypted) => encrypted,
             Err(error) => {
-                eprintln!("cifratura messaggio fallita per {peer}: {error}");
+                log::warn!("cifratura messaggio fallita per {peer}: {error}");
                 return None;
             }
         };
@@ -4806,7 +4833,7 @@ fn send_next_transfer_chunk(
     mut transfer: PendingTransfer,
 ) {
     let Some(index) = transfer.remaining.pop_front() else {
-        println!("invio completato: {}", transfer.manifest.filename);
+        log::info!("invio completato: {}", transfer.manifest.filename);
         let _ = events.send(ClientEvent::AttachmentSent {
             peer_id: transfer.peer.to_string(),
             filename: transfer.manifest.filename,
@@ -4858,7 +4885,7 @@ fn send_current_transfer_chunk(
     let chunk = match read_chunk(&transfer.path, &transfer.manifest, transfer.current) {
         Ok(chunk) => chunk,
         Err(error) => {
-            eprintln!("invio interrotto: {error}");
+            log::warn!("invio interrotto: {error}");
             report_file_failed(events, &transfer.manifest.filename, &error.to_string());
             return;
         }
@@ -5000,7 +5027,7 @@ fn already_received(history: &History, event: &ChatEvent) -> bool {
 fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) -> ProtocolResponse {
     match event {
         ChatEvent::Text(message) => {
-            println!(
+            log::info!(
                 "{peer}: {} [{} emoticon]",
                 message.text,
                 message.emoticons.len()
@@ -5254,7 +5281,7 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
             .try_acquire(now_ms())
         {
             Ok(()) => {
-                println!("{peer}: *** TRILLO ***");
+                log::info!("{peer}: *** TRILLO ***");
                 record(context.history, &peer, "in", "nudge", "trillo");
                 notify(
                     notification_allowed(context, &format!("peer:{peer}")),
@@ -5264,7 +5291,7 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                 ProtocolResponse::Ack
             }
             Err(_) => {
-                eprintln!("{peer}: trillo ricevuto ignorato per rate limit");
+                log::warn!("{peer}: trillo ricevuto ignorato per rate limit");
                 ProtocolResponse::Ack
             }
         },
@@ -5293,7 +5320,7 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                     peer_id: peer.to_string(),
                     emoticon: client_emoticon(offer, &trigger, false),
                 });
-                println!("{peer}: emoticon ricevuta, in attesa di salvataggio");
+                log::info!("{peer}: emoticon ricevuta, in attesa di salvataggio");
                 record(context.history, &peer, "in", "emote", &offer.metadata.name);
                 ProtocolResponse::Ack
             }
@@ -5311,7 +5338,7 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                     );
                     match completed {
                         Some(Completion::Ready(completed)) => {
-                            println!("{peer}: file già presente nell'archivio cifrato");
+                            log::info!("{peer}: file già presente nell'archivio cifrato");
                             notify(
                                 notification_allowed(context, &format!("peer:{peer}")),
                                 "File ricevuto",
@@ -5350,7 +5377,7 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                 .peer_names
                 .entry(peer)
                 .or_insert_with(|| presence.display_name.clone());
-            println!(
+            log::info!(
                 "{} è {}",
                 presence.display_name,
                 if presence.online { "online" } else { "offline" }
@@ -5403,7 +5430,7 @@ fn emit_attachment_received(
 
 fn record(history: &History, peer: &PeerId, direction: &str, kind: &str, body: &str) {
     if let Err(error) = history.record(&peer.to_string(), direction, kind, body, now_ms()) {
-        eprintln!("cronologia non aggiornata: {error}");
+        log::warn!("cronologia non aggiornata: {error}");
     }
 }
 
@@ -5445,10 +5472,10 @@ fn record_text(history: &History, peer: &PeerId, direction: &str, message: &Text
                 )
             };
             if let Err(error) = result {
-                eprintln!("cronologia non aggiornata: {error}");
+                log::warn!("cronologia non aggiornata: {error}");
             }
         }
-        Err(error) => eprintln!("cronologia non aggiornata: {error}"),
+        Err(error) => log::warn!("cronologia non aggiornata: {error}"),
     }
 }
 
