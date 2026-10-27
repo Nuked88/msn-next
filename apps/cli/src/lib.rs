@@ -37,7 +37,7 @@ use libp2p::{
 use msnnext_protocol::{
     resolve_emoticons, validate_text_message, validate_triggers, AccountProof, AttachmentManifest,
     ChatEvent,
-    DeleteRequest, Emoticon, EmoticonOffer, EmoticonSpan, Envelope, GroupAttachmentOffer, GroupBan,
+    AttachmentCancel, DeleteRequest, Emoticon, EmoticonOffer, EmoticonSpan, Envelope, GroupAttachmentOffer, GroupBan,
     GroupDefinition, GroupTextMessage, Mime, Nudge, NudgeRateLimit, PresenceUpdate,
     ProtocolResponse, TextMessage, Trigger, PROTOCOL_VERSION,
 };
@@ -65,6 +65,8 @@ const MAX_EMOTICON_SIDE: usize = 512;
 const MAX_REQUEST_RETRIES: u8 = 2;
 const CHAT_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const TEXT_HISTORY_PREFIX: &str = "msnnext-text-v1:";
+/// Richieste di contatto mostrate e in attesa di risposta.
+const MAX_PENDING_CONTACT_REQUESTS: usize = 20;
 const MAX_PENDING_INBOUND_OFFERS: usize = 8;
 const ATTACHMENT_DECISION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Entro quanto un messaggio deve essere confermato prima del reinvio. Il
@@ -168,7 +170,11 @@ pub enum ClientCommand {
         id: String,
         path: PathBuf,
     },
-    CancelFileTransfers,
+    /// Annulla gli invii di file di una conversazione (id del contatto o
+    /// `group:<id>`); senza conversazione, tutti.
+    CancelFileTransfers {
+        conversation: Option<String>,
+    },
     AcceptAttachment {
         offer_id: u64,
     },
@@ -262,7 +268,7 @@ impl ClientCommand {
             | Self::DeleteChatGroup { .. }
             | Self::ReadAttachment { .. }
             | Self::ExportAttachment { .. }
-            | Self::CancelFileTransfers
+            | Self::CancelFileTransfers { .. }
             | Self::AcceptAttachment { .. }
             | Self::RejectAttachment { .. }
             | Self::RequestPendingContactRequests
@@ -492,6 +498,13 @@ pub enum ClientEvent {
         total_chunks: usize,
     },
     AttachmentTransfersCancelled,
+    /// Il mittente ha annullato un file in arrivo; `offer_id` se l'offerta
+    /// era ancora in attesa di risposta.
+    IncomingAttachmentCancelled {
+        peer_id: String,
+        attachment_id: String,
+        offer_id: Option<u64>,
+    },
     /// Un invio di file si è fermato senza arrivare: la UI chiude la barra di
     /// avanzamento di quel file e mostra il motivo.
     AttachmentFailed {
@@ -508,6 +521,10 @@ pub enum ClientEvent {
     },
     ContactRemoved {
         peer_id: String,
+        /// "deleted", "rejected", "merged" (era un duplicato della stessa
+        /// persona) o "withdrawn" (richiesta ritirata): la UI avvisa solo
+        /// quando serve, e con il messaggio giusto.
+        reason: String,
     },
     ConversationCleared {
         peer_id: String,
@@ -580,6 +597,7 @@ struct PendingTransfer {
     peer: PeerId,
     path: PathBuf,
     manifest: AttachmentManifest,
+    group_id: Option<[u8; 16]>,
     remaining: VecDeque<u32>,
     current: u32,
     retries: u8,
@@ -1795,7 +1813,7 @@ async fn run_node(
                             reconnect_at.remove(&peer);
                             reconnect_attempts.remove(&peer);
                             let _ = swarm.disconnect_peer_id(peer);
-                            let _ = events.send(ClientEvent::ContactRemoved { peer_id: peer.to_string() });
+                            let _ = events.send(ClientEvent::ContactRemoved { peer_id: peer.to_string(), reason: "deleted".into() });
                         }
                         Err(error) => { let _ = events.send(ClientEvent::Error { message: error.to_string() }); }
                     }
@@ -1831,12 +1849,15 @@ async fn run_node(
                 Some(ClientCommand::RejectContactRequest { peer }) => {
                     pending_contact_requests.remove(&peer);
                     pending_accounts.remove(&peer);
+                    // Il rifiuto resta dopo un riavvio e arriva agli altri
+                    // dispositivi: lo stesso sconosciuto non può richiedere di nuovo.
+                    history.delete_contact(&peer.to_string())?;
                     ignored_contacts.insert(peer);
                     known_contacts.remove(&peer);
                     peers.remove(&peer);
                     sessions.remove(&peer);
                     let _ = swarm.disconnect_peer_id(peer);
-                    let _ = events.send(ClientEvent::ContactRemoved { peer_id: peer.to_string() });
+                    let _ = events.send(ClientEvent::ContactRemoved { peer_id: peer.to_string(), reason: "rejected".into() });
                 }
                 Some(ClientCommand::RequestPendingContactRequests) => {
                     // Gli eventi UI non vengono conservati da Tauri. Su mobile la
@@ -2095,9 +2116,41 @@ async fn run_node(
                         Err(message) => { let _ = events.send(ClientEvent::Error { message }); }
                     }
                 }
-                Some(ClientCommand::CancelFileTransfers) => {
-                    pending_offers.clear();
-                    pending_transfers.clear();
+                Some(ClientCommand::CancelFileTransfers { conversation }) => {
+                    // Solo gli invii della conversazione aperta, e il destinatario
+                    // lo viene a sapere invece di restare con un file a metà.
+                    let in_scope = |peer: PeerId, group_id: Option<[u8; 16]>| match conversation.as_deref() {
+                        None => true,
+                        Some(key) => match key.strip_prefix("group:") {
+                            Some(group) => group_id.is_some_and(|id| hex_group_id(&id) == group),
+                            None => group_id.is_none() && contact_devices.canonical(peer).to_string() == key,
+                        },
+                    };
+                    let mut cancelled = Vec::new();
+                    pending_offers.retain(|_, offer| {
+                        let keep = !in_scope(offer.peer, offer.group_id);
+                        if !keep {
+                            cancelled.push((offer.peer, offer.manifest.attachment_id));
+                        }
+                        keep
+                    });
+                    pending_transfers.retain(|_, transfer| {
+                        let keep = !in_scope(transfer.peer, transfer.group_id);
+                        if !keep {
+                            cancelled.push((transfer.peer, transfer.manifest.attachment_id));
+                        }
+                        keep
+                    });
+                    waiting_offers.retain(|_, offers| {
+                        offers.retain(|offer| !in_scope(offer.peer, offer.group_id));
+                        !offers.is_empty()
+                    });
+                    for (peer, attachment_id) in cancelled {
+                        // Avviso senza retry: se non arriva, il destinatario scarta
+                        // comunque le parti quando l'offerta scade.
+                        send_event(&mut swarm, &mut sessions, &contact_devices, peer, local_peer_id, &mut sent_numbers,
+                            ChatEvent::AttachmentCancelled(AttachmentCancel { attachment_id }));
+                    }
                     let _ = events.send(ClientEvent::AttachmentTransfersCancelled);
                 }
                 Some(ClientCommand::AcceptAttachment { offer_id }) => {
@@ -2415,12 +2468,20 @@ async fn run_node(
                                 // Presence non sollecitata da uno sconosciuto: niente
                                 // auto-aggiunta. Chiedi conferma all'utente una volta.
                                 if let ChatEvent::Presence(presence) = &request.event {
-                                    if !ignored_contacts.contains(&peer) {
+                                    // Tetto alle richieste in attesa: uno spam di
+                                    // peer nuovi non riempie memoria e UI.
+                                    let accepting = !ignored_contacts.contains(&peer)
+                                        && (pending_contact_requests.contains_key(&peer)
+                                            || pending_contact_requests.len() < MAX_PENDING_CONTACT_REQUESTS);
+                                    if !accepting && !ignored_contacts.contains(&peer) {
+                                        log::warn!("richiesta di contatto da {peer} ignorata: troppe in attesa");
+                                    }
+                                    if accepting {
                                         if let Some(account) = &source_account {
                                             pending_accounts.insert(peer, account.clone());
                                         }
                                     }
-                                    if !ignored_contacts.contains(&peer)
+                                    if accepting
                                         && pending_contact_requests
                                             .insert(peer, presence.display_name.clone())
                                             .is_none()
@@ -2616,6 +2677,31 @@ async fn run_node(
                                             return Ok(LoopFlow::Continue);
                                         }
                                     }
+                                    // Annullato un file ancora in attesa di risposta:
+                                    // chiudi l'offerta invece di lasciarla aperta.
+                                    if let ChatEvent::AttachmentCancelled(cancel) = &envelope.event {
+                                        let offers = pending_inbound_offers
+                                            .iter()
+                                            .filter(|(_, pending)| {
+                                                pending.peer == contact
+                                                    && offered_attachment_id(&pending.event) == Some(cancel.attachment_id)
+                                            })
+                                            .map(|(offer_id, _)| *offer_id)
+                                            .collect::<Vec<_>>();
+                                        for offer_id in offers {
+                                            if let Some(pending) = pending_inbound_offers.remove(&offer_id) {
+                                                swarm.behaviour_mut().secure_chat.send_response(
+                                                    pending.channel,
+                                                    ProtocolResponse::Rejected("invio annullato dal mittente".into()),
+                                                ).ok();
+                                                let _ = events.send(ClientEvent::IncomingAttachmentCancelled {
+                                                    peer_id: contact.to_string(),
+                                                    attachment_id: hex_asset_id(&cancel.attachment_id),
+                                                    offer_id: Some(offer_id),
+                                                });
+                                            }
+                                        }
+                                    }
                                     let client_event = client_event_from_chat(
                                         contact, &envelope.event, "in", true,
                                         peer_names.get(&contact).map(String::as_str),
@@ -2718,6 +2804,7 @@ async fn run_node(
                                                     peer: pending.peer,
                                                     path: pending.path,
                                                     manifest: pending.manifest,
+                                                    group_id: pending.group_id,
                                                     remaining,
                                                     current: 0,
                                                     retries: 0,
@@ -2730,6 +2817,19 @@ async fn run_node(
                                             report_file_failed(&events, &pending.manifest.filename, &format!("richiesta chunk non valida: {error}"));
                                         }
                                     }
+                                }
+                                // Come per i messaggi: un'offerta cifrata con una
+                                // sessione che il destinatario non ha più va
+                                // riproposta dopo un nuovo handshake, non persa.
+                                ProtocolResponse::Rejected(reason)
+                                    if is_session_rejection(&reason) && pending.retries < MAX_DELIVERY_ATTEMPTS =>
+                                {
+                                    log::info!("offerta file rifiutata da {peer} ({reason}): nuova sessione e reinvio");
+                                    sessions.remove(&peer);
+                                    let mut offer = pending;
+                                    offer.retries += 1;
+                                    waiting_offers.entry(offer.peer).or_default().push(offer);
+                                    maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
                                 }
                                 ProtocolResponse::Rejected(error) => {
                                     report_file_failed(&events, &pending.manifest.filename, &format!("file rifiutato: {error}"));
@@ -2801,13 +2901,7 @@ async fn run_node(
                     if let Some(mut pending) = pending_offers.remove(&request_id) {
                         if let Some(retries) = next_request_retry(pending.retries) {
                             pending.retries = retries;
-                            let event = pending.group_id.map_or_else(
-                                || ChatEvent::AttachmentOffer(pending.manifest.clone()),
-                                |group_id| ChatEvent::GroupAttachmentOffer(GroupAttachmentOffer {
-                                    group_id,
-                                    manifest: pending.manifest.clone(),
-                                }),
-                            );
+                            let event = offer_event(&pending);
                             if let Some(next_id) = send_event(
                                 &mut swarm,
                                 &mut sessions,
@@ -3496,6 +3590,15 @@ fn report_undelivered(
 
 /// Un invio di file finito male: la UI deve chiudere la barra di quel file,
 /// altrimenti resta ferma per sempre.
+/// L'allegato proposto da un'offerta di file (diretta o di gruppo).
+fn offered_attachment_id(event: &ChatEvent) -> Option<[u8; 32]> {
+    match event {
+        ChatEvent::AttachmentOffer(manifest) => Some(manifest.attachment_id),
+        ChatEvent::GroupAttachmentOffer(offer) => Some(offer.manifest.attachment_id),
+        _ => None,
+    }
+}
+
 fn report_file_failed(events: &mpsc::UnboundedSender<ClientEvent>, filename: &str, reason: &str) {
     log::warn!("invio file {filename} non riuscito: {reason}");
     let _ = events.send(ClientEvent::AttachmentFailed {
@@ -3504,8 +3607,9 @@ fn report_file_failed(events: &mpsc::UnboundedSender<ClientEvent>, filename: &st
     });
 }
 
-/// Invia l'offerta di un file a un contatto. Va in cronologia e in chat solo
-/// se parte davvero; altrimenti la UI riceve `AttachmentFailed`.
+/// Invia l'offerta di un file a un contatto. La prima volta va in cronologia
+/// e in chat solo se parte davvero; altrimenti la UI riceve `AttachmentFailed`.
+/// Un reinvio (dopo un nuovo handshake) non crea un secondo messaggio.
 #[allow(clippy::too_many_arguments)]
 fn offer_file(
     swarm: &mut Swarm<Behaviour>,
@@ -3525,11 +3629,15 @@ fn offer_file(
         offer.peer,
         local_peer_id,
         sent_numbers,
-        ChatEvent::AttachmentOffer(offer.manifest.clone()),
+        offer_event(&offer),
     ) else {
         report_file_failed(events, &offer.manifest.filename, "canale cifrato non pronto");
         return;
     };
+    if offer.retries > 0 || offer.group_id.is_some() {
+        pending_offers.insert(request_id, offer);
+        return;
+    }
     record(history, &offer.peer, "out", "file", &encode_attachment(&offer.manifest));
     let _ = events.send(ClientEvent::Message {
         message: ClientMessage {
@@ -3546,6 +3654,16 @@ fn offer_file(
         },
     });
     pending_offers.insert(request_id, offer);
+}
+
+fn offer_event(offer: &PendingOffer) -> ChatEvent {
+    match offer.group_id {
+        Some(group_id) => ChatEvent::GroupAttachmentOffer(GroupAttachmentOffer {
+            group_id,
+            manifest: offer.manifest.clone(),
+        }),
+        None => ChatEvent::AttachmentOffer(offer.manifest.clone()),
+    }
 }
 
 /// Le offerte in attesa per un peer, cercate anche sul contatto a cui
@@ -3981,6 +4099,7 @@ fn apply_presence_source(
         context.peer_names.remove(&duplicate);
         let _ = context.events.send(ClientEvent::ContactRemoved {
             peer_id: duplicate.to_string(),
+            reason: "merged".into(),
         });
         let _ = context.events.send(ClientEvent::ConversationLoaded {
             peer_id: keep.to_string(),
@@ -4002,6 +4121,7 @@ fn apply_presence_source(
         // rivelato un dispositivo di un contatto noto: ritira la domanda.
         let _ = context.events.send(ClientEvent::ContactRemoved {
             peer_id: peer.to_string(),
+            reason: "withdrawn".into(),
         });
     }
     if context.ignored_contacts.remove(&peer) {
@@ -4129,7 +4249,7 @@ fn client_event_from_chat(
         }),
         ChatEvent::EmoticonOffer(_) => None,
         ChatEvent::AttachmentChunk(_) => None,
-        ChatEvent::DeleteMessage(_) => None,
+        ChatEvent::DeleteMessage(_) | ChatEvent::AttachmentCancelled(_) => None,
         ChatEvent::GroupDefinition(_)
         | ChatEvent::GroupText(_)
         | ChatEvent::GroupAttachmentOffer(_) => None,
@@ -4792,6 +4912,23 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                 "Nuovo messaggio",
                 &message.text,
             );
+            ProtocolResponse::Ack
+        }
+        ChatEvent::AttachmentCancelled(cancel) => {
+            // Solo chi ha offerto il file può annullarlo: le parti ricevute
+            // vengono eliminate e la UI avvisata.
+            if context
+                .incoming_attachments
+                .remove(&(peer, cancel.attachment_id))
+                .is_some()
+            {
+                context.attachments.cancel(&cancel.attachment_id);
+                let _ = context.events.send(ClientEvent::IncomingAttachmentCancelled {
+                    peer_id: peer.to_string(),
+                    attachment_id: hex_asset_id(&cancel.attachment_id),
+                    offer_id: None,
+                });
+            }
             ProtocolResponse::Ack
         }
         ChatEvent::DeleteMessage(request) => {
@@ -5662,6 +5799,7 @@ fn refresh_synced_state(
         devices.forget(peer);
         let _ = events.send(ClientEvent::ContactRemoved {
             peer_id: peer.to_string(),
+            reason: "deleted".into(),
         });
     }
     // Un dispositivo riconosciuto di un contatto attivo non resta bloccato: la
@@ -7406,6 +7544,109 @@ mod tests {
                 };
                 assert_eq!(filename, "doc.bin");
                 assert!(reason.contains("sessione"), "{reason}");
+                alice.shutdown().await;
+                bob.shutdown().await;
+            })
+            .await;
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Audit #15 e #16: il rifiuto di una richiesta di contatto non
+    /// sopravviveva al riavvio, e la UI lo annunciava come "contatto eliminato".
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(windows, ignore = "il teardown libp2p può bloccare l'harness Windows")]
+    async fn rejected_contact_request_stays_rejected_after_restart() {
+        let root = test_root("reject-request");
+        let alice_dir = root.join("alice");
+        let alice_port = available_udp_port();
+        let alice_listen: Multiaddr = format!("/ip4/127.0.0.1/udp/{alice_port}/quic-v1").parse().unwrap();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut alice = TestNode::start(loopback_config("Alice", &alice_dir, Some(alice_listen.clone()))).await;
+                let bob = TestNode::start(loopback_config("Bob", &root.join("bob"), None)).await;
+                alice.send(ClientCommand::RequestContactLink);
+                let ClientEvent::ContactLink { link, .. } = alice
+                    .until(|event| matches!(event, ClientEvent::ContactLink { .. }))
+                    .await
+                else {
+                    unreachable!()
+                };
+                bob.send(ClientCommand::ImportContactLink { link: link.clone() });
+                alice.until(|event| matches!(event, ClientEvent::ContactRequest { .. })).await;
+                alice.send(ClientCommand::RejectContactRequest { peer: bob.peer });
+                alice
+                    .until(|event| matches!(event, ClientEvent::ContactRemoved { reason, .. } if reason == "rejected"))
+                    .await;
+                alice.shutdown().await;
+
+                let mut alice = TestNode::restart(|| {
+                    loopback_config("Alice", &alice_dir, Some(alice_listen.clone()))
+                })
+                .await;
+                bob.send(ClientCommand::ImportContactLink { link });
+                let again = tokio::time::timeout(
+                    Duration::from_secs(6),
+                    alice.until(|event| matches!(event, ClientEvent::ContactRequest { .. })),
+                )
+                .await;
+                assert!(again.is_err(), "la richiesta rifiutata è ricomparsa: {again:?}");
+                alice.shutdown().await;
+                bob.shutdown().await;
+            })
+            .await;
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Audit #14: "Annulla" fermava gli invii di tutte le chat e il
+    /// destinatario restava con l'offerta aperta. Ora vale solo per la chat
+    /// indicata e il destinatario viene avvisato.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(windows, ignore = "il teardown libp2p può bloccare l'harness Windows")]
+    async fn cancel_is_scoped_and_reaches_the_recipient() {
+        let root = test_root("cancel-file");
+        fs::create_dir_all(&root).unwrap();
+        let first = root.join("primo.bin");
+        let second = root.join("secondo.bin");
+        fs::write(&first, vec![1u8; attachments::CHUNK_SIZE + 10]).unwrap();
+        fs::write(&second, vec![2u8; attachments::CHUNK_SIZE + 20]).unwrap();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut alice = TestNode::start(loopback_config("Alice", &root.join("alice"), None)).await;
+                let mut bob = TestNode::start(loopback_config("Bob", &root.join("bob"), None)).await;
+                connect_pair(&mut alice, &mut bob).await;
+
+                // Annullare un'altra chat non tocca l'invio a Bob.
+                alice.send(ClientCommand::SendFile { peer: bob.peer, path: first.clone() });
+                let ClientEvent::IncomingAttachmentOffered { offer_id, .. } = bob
+                    .until(|event| matches!(event, ClientEvent::IncomingAttachmentOffered { .. }))
+                    .await
+                else {
+                    unreachable!()
+                };
+                alice.send(ClientCommand::CancelFileTransfers { conversation: Some(format!("group:{}", "ab".repeat(16))) });
+                alice.until(|event| matches!(event, ClientEvent::AttachmentTransfersCancelled)).await;
+                bob.send(ClientCommand::AcceptAttachment { offer_id });
+                bob.until(|event| matches!(event, ClientEvent::AttachmentReceived { filename, .. } if filename == "primo.bin"))
+                    .await;
+
+                // Annullare la chat con Bob chiude la sua offerta.
+                alice.send(ClientCommand::SendFile { peer: bob.peer, path: second.clone() });
+                let ClientEvent::IncomingAttachmentOffered { offer_id, .. } = bob
+                    .until(|event| matches!(event, ClientEvent::IncomingAttachmentOffered { .. }))
+                    .await
+                else {
+                    unreachable!()
+                };
+                alice.send(ClientCommand::CancelFileTransfers { conversation: Some(bob.peer.to_string()) });
+                let ClientEvent::IncomingAttachmentCancelled { offer_id: cancelled, .. } = bob
+                    .until(|event| matches!(event, ClientEvent::IncomingAttachmentCancelled { .. }))
+                    .await
+                else {
+                    unreachable!()
+                };
+                assert_eq!(cancelled, Some(offer_id));
                 alice.shutdown().await;
                 bob.shutdown().await;
             })

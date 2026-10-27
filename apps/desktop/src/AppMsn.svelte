@@ -173,7 +173,8 @@
     | { type: 'attachmentTransfersCancelled' }
     | { type: 'attachmentFailed'; filename: string; reason: string }
     | ({ type: 'incomingAttachmentOffered' } & IncomingAttachmentOffer)
-    | { type: 'contactRemoved'; peerId: string }
+    | { type: 'incomingAttachmentCancelled'; peerId: string; attachmentId: string; offerId?: number }
+    | { type: 'contactRemoved'; peerId: string; reason: 'deleted' | 'rejected' | 'merged' | 'withdrawn' }
     | { type: 'conversationCleared'; peerId: string }
     | { type: 'groupChatsUpdated'; groups: Omit<GroupChat, 'unread'>[] }
     | { type: 'groupConversationLoaded'; groupId: string; messages: ClientGroupMessage[] }
@@ -946,6 +947,14 @@
       showToast($t('toast.sendCancelled'))
       return
     }
+    if (event.type === 'incomingAttachmentCancelled') {
+      if (event.offerId != null) {
+        incomingAttachmentOffers = incomingAttachmentOffers.filter((offer) => offer.offerId !== event.offerId)
+      }
+      const name = contacts.find((item) => item.peerId === event.peerId)?.name || $t('toast.aContact')
+      showToast($t('toast.incomingCancelled', { name }))
+      return
+    }
     if (event.type === 'incomingAttachmentOffered') {
       incomingAttachmentOffers = [...incomingAttachmentOffers, event]
       return
@@ -970,7 +979,10 @@
       conversations = remaining
       if (selectedPeerId === event.peerId) selectedPeerId = contacts[0]?.peerId || ''
       detailsOpen = false
-      showToast($t('toast.contactDeleted'))
+      // Una fusione di duplicati o una richiesta ritirata non sono
+      // cancellazioni: niente toast "contatto eliminato".
+      if (event.reason === 'deleted') showToast($t('toast.contactDeleted'))
+      else if (event.reason === 'rejected') showToast($t('toast.requestRejected'))
       return
     }
     if (event.type === 'groupChatsUpdated') {
@@ -1538,7 +1550,7 @@
   }
 
   async function cancelFileTransfers() {
-    await invoke('node_cancel_file_transfers').catch((error) => showToast(String(error)))
+    await invoke('node_cancel_file_transfers', { conversation: conversationKey || null }).catch((error) => showToast(String(error)))
   }
 
   async function answerAttachmentOffer(offer: IncomingAttachmentOffer, accept: boolean) {

@@ -281,6 +281,13 @@ impl Receiver {
         self.vault.read(id)
     }
 
+    /// Il mittente ha annullato: niente più chunk per questo file, e le
+    /// parti già ricevute vengono eliminate.
+    pub fn cancel(&mut self, id: &[u8; 32]) {
+        self.active.remove(id);
+        let _ = fs::remove_dir_all(self.vault.parts_dir(id));
+    }
+
     /// Il vault da usare fuori dal loop (thread bloccanti).
     pub fn vault(&self) -> Vault {
         self.vault.clone()

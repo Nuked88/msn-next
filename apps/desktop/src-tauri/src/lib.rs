@@ -849,8 +849,11 @@ fn node_send_file(
 }
 
 #[tauri::command]
-fn node_cancel_file_transfers(state: State<'_, NodeState>) -> Result<(), String> {
-    send_command(&state, ClientCommand::CancelFileTransfers)
+fn node_cancel_file_transfers(
+    state: State<'_, NodeState>,
+    conversation: Option<String>,
+) -> Result<(), String> {
+    send_command(&state, ClientCommand::CancelFileTransfers { conversation })
 }
 
 #[tauri::command]

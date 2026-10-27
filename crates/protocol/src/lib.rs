@@ -31,6 +31,15 @@ pub enum ChatEvent {
     /// destinatario. Solo il mittente originale può inviarla (verificato dal
     /// destinatario) ed entro una finestra temporale.
     DeleteMessage(DeleteRequest),
+    /// Il mittente ha annullato l'invio di un file: il destinatario chiude
+    /// l'offerta o libera le parti già ricevute. Un client precedente non la
+    /// riconosce e la rifiuta, senza altri effetti.
+    AttachmentCancelled(AttachmentCancel),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentCancel {
+    pub attachment_id: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
