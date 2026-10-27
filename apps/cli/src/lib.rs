@@ -188,6 +188,12 @@ pub enum ClientCommand {
     ForgetSession {
         peer: PeerId,
     },
+    /// Solo test: sostituisce la sessione con una dalle chiavi sbagliate, come
+    /// dopo una perdita di sincronizzazione del ratchet.
+    #[cfg(test)]
+    ScrambleSession {
+        peer: PeerId,
+    },
     Shutdown,
 }
 
@@ -204,7 +210,7 @@ impl ClientCommand {
             | Self::DeleteMessageForEveryone { peer, .. }
             | Self::ClearConversation { peer } => Some(*peer),
             #[cfg(test)]
-            Self::ForgetSession { peer } => Some(*peer),
+            Self::ForgetSession { peer } | Self::ScrambleSession { peer } => Some(*peer),
             Self::CreateEmoticon { .. }
             | Self::DeleteMessageForMe { .. }
             | Self::SetAutoAcceptExtensions { .. }
@@ -812,6 +818,9 @@ async fn run_node(
     let mut pending_inbound_handshakes =
         HashMap::<request_response::InboundRequestId, (PeerId, SessionKey)>::new();
     let mut sessions = HashMap::<PeerId, RatchetSession>::new();
+    // Errori di decifratura consecutivi per peer: oltre una soglia la sessione
+    // è considerata rotta e si rifà l'handshake invece di rifiutare per sempre.
+    let mut decrypt_failures = HashMap::<PeerId, u8>::new();
     let mut shared_emoticons = HashSet::<(PeerId, [u8; 32])>::new();
     let mut pending_emoticons = HashMap::<[u8; 32], EmoticonOffer>::new();
     let mut attachment_receiver = Receiver::new(args.downloads.clone(), attachment_key);
@@ -1194,6 +1203,14 @@ async fn run_node(
                         status: "session-forgotten".into(),
                     });
                 }
+                #[cfg(test)]
+                Some(ClientCommand::ScrambleSession { peer }) => {
+                    sessions.insert(peer, RatchetSession::new(SessionKey::random_for_test(), local_peer_id, peer));
+                    let _ = events.send(ClientEvent::ContactStatus {
+                        peer_id: peer.to_string(),
+                        status: "session-scrambled".into(),
+                    });
+                }
                 Some(ClientCommand::RequestContactLink) => {
                     contact_link_requested = true;
                     let addresses = contact_addresses(&swarm, &args.relays, local_peer_id);
@@ -1452,7 +1469,10 @@ async fn run_node(
                     // Affidabilità: se la sessione cifrata è pronta invia e traccia
                     // per il retry; altrimenti accoda e avvia l'handshake — il
                     // messaggio parte al completamento (niente drop silenziosi).
-                    if contact_devices.secure(peer, &sessions) {
+                    // Con messaggi ancora in coda il nuovo va in fondo: non deve
+                    // superare quelli in attesa di reinvio.
+                    let queue_empty = outbox.get(&peer).is_none_or(VecDeque::is_empty);
+                    if contact_devices.secure(peer, &sessions) && queue_empty {
                         match send_event(&mut swarm, &mut sessions, &contact_devices, peer, local_peer_id, &mut sent_numbers, event.clone()) {
                             Some(request_id) => {
                                 pending_messages.insert(request_id, (peer, event, 0));
@@ -1461,6 +1481,9 @@ async fn run_node(
                                 outbox.entry(peer).or_default().push_back((event, 0));
                             }
                         }
+                    } else if contact_devices.secure(peer, &sessions) {
+                        outbox.entry(peer).or_default().push_back((event, 0));
+                        flush_outbox(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, local_peer_id, peer);
                     } else {
                         outbox.entry(peer).or_default().push_back((event, 0));
                         maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
@@ -2268,6 +2291,7 @@ async fn run_node(
                         pending_inbound_handshakes
                             .retain(|_, (pending_peer, _)| *pending_peer != peer_id);
                         handshake_retries.remove(&peer_id);
+                        decrypt_failures.remove(&peer_id);
                         nudge_limits.remove(&peer_id);
                         incoming_nudge_limits.remove(&peer_id);
                         if was_application_peer {
@@ -2472,6 +2496,29 @@ async fn run_node(
                                         .map_err(|_| REJECT_UNDECRYPTABLE)
                                 })
                         };
+                        match &envelope {
+                            Ok(_) => {
+                                decrypt_failures.remove(&peer);
+                            }
+                            Err(reason) if *reason == REJECT_UNDECRYPTABLE => {
+                                let failures = decrypt_failures.entry(peer).or_insert(0);
+                                *failures += 1;
+                                if *failures >= MAX_DECRYPT_FAILURES {
+                                    decrypt_failures.remove(&peer);
+                                    log::warn!("sessione con {peer} non decifrabile: nuovo handshake");
+                                    sessions.remove(&peer);
+                                    if should_initiate(local_peer_id, peer) {
+                                        maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
+                                    } else {
+                                        // Senza sessione la presence parte in chiaro:
+                                        // per l'iniziatore è il segnale di rifare
+                                        // l'handshake.
+                                        send_event(&mut swarm, &mut sessions, &contact_devices, peer, local_peer_id, &mut sent_numbers, ChatEvent::Presence(presence_update(&display_name, &presence_status, true, &account_proof)));
+                                    }
+                                }
+                            }
+                            Err(_) => {}
+                        }
                         let response = match envelope {
                             Ok(envelope) => match validate_envelope(peer, local_peer_id, &envelope) {
                                 Ok(()) => {
@@ -2697,7 +2744,7 @@ async fn run_node(
                                 {
                                     log::info!("messaggio rifiutato da {peer} ({reason}): nuova sessione e reinvio");
                                     sessions.remove(&peer);
-                                    outbox.entry(msg_peer).or_default().push_front((event, attempts + 1));
+                                    requeue_in_order(outbox.entry(msg_peer).or_default(), event, attempts + 1);
                                     maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
                                 }
                                 ProtocolResponse::Rejected(reason) => {
@@ -3326,11 +3373,24 @@ fn check_outgoing_text(text: &str) -> Result<(), String> {
 /// riconosce per rifare l'handshake e reinviare invece di perdere il messaggio.
 const REJECT_NO_SESSION: &str = "sessione sicura non disponibile";
 const REJECT_UNDECRYPTABLE: &str = "messaggio cifrato non valido";
+/// Errori di decifratura consecutivi dopo cui una sessione si considera rotta.
+const MAX_DECRYPT_FAILURES: u8 = 3;
 /// Tentativi di consegna di un messaggio di testo, handshake compresi.
 const MAX_DELIVERY_ATTEMPTS: u8 = 4;
 
 fn is_session_rejection(reason: &str) -> bool {
     reason == REJECT_NO_SESSION || reason == REJECT_UNDECRYPTABLE
+}
+
+/// Rimette in coda un messaggio da reinviare prima di quelli mai partiti ma
+/// dopo gli altri già in reinvio: le risposte arrivano nell'ordine di invio,
+/// quindi l'ordine originale si conserva.
+fn requeue_in_order(queue: &mut VecDeque<(ChatEvent, u8)>, event: ChatEvent, attempts: u8) {
+    let position = queue
+        .iter()
+        .position(|(_, queued_attempts)| *queued_attempts == 0)
+        .unwrap_or(queue.len());
+    queue.insert(position, (event, attempts));
 }
 
 /// Un messaggio non è arrivato: l'utente deve saperlo, e per i testi la UI
@@ -6662,6 +6722,40 @@ mod tests {
                     text: "dopo la sessione persa".into(),
                 });
                 alice.until_text("dopo la sessione persa").await;
+                alice.shutdown().await;
+                bob.shutdown().await;
+            })
+            .await;
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Audit #4: con le chiavi del ratchet fuori sincronia ogni messaggio in
+    /// arrivo veniva rifiutato fino alla riconnessione. Ora la sessione si
+    /// rinegozia e i messaggi arrivano.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(windows, ignore = "il teardown libp2p può bloccare l'harness Windows")]
+    async fn desynchronized_session_recovers_without_reconnecting() {
+        let root = test_root("scrambled");
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut alice = TestNode::start(loopback_config("Alice", &root.join("alice"), None)).await;
+                let mut bob = TestNode::start(loopback_config("Bob", &root.join("bob"), None)).await;
+                connect_pair(&mut alice, &mut bob).await;
+
+                alice.send(ClientCommand::ScrambleSession { peer: bob.peer });
+                alice
+                    .until(|event| matches!(event, ClientEvent::ContactStatus { status, .. } if status == "session-scrambled"))
+                    .await;
+                for index in 0..3 {
+                    bob.send(ClientCommand::SendText {
+                        peer: alice.peer,
+                        text: format!("messaggio {index}"),
+                    });
+                }
+                for index in 0..3 {
+                    alice.until_text(&format!("messaggio {index}")).await;
+                }
                 alice.shutdown().await;
                 bob.shutdown().await;
             })

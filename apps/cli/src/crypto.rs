@@ -13,11 +13,17 @@ use libp2p::{identity::ed25519, PeerId};
 use msnnext_protocol::AccountProof;
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};
-use zeroize::{ZeroizeOnDrop, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const HYBRID_HANDSHAKE_VERSION: u16 = 1;
 const RATCHET_VERSION: u16 = 1;
+/// Chiavi di messaggi saltati conservate per la consegna fuori ordine. Oltre
+/// questo numero si scartano le più vecchie: quei messaggi, se arrivano,
+/// vengono rifiutati, ma la sessione continua ad avanzare.
 const MAX_SKIPPED_MESSAGE_KEYS: u64 = 64;
+/// Buco massimo accettato in un singolo salto in avanti. Un salto più grande
+/// viene rifiutato e il mittente rifà l'handshake.
+const MAX_MESSAGE_GAP: u64 = 4096;
 
 pub(crate) struct MlDsaIdentity(PqdsaKeyPair);
 
@@ -154,6 +160,13 @@ pub(crate) struct SessionKey([u8; 32]);
 
 impl SessionKey {
     #[cfg(test)]
+    pub(crate) fn random_for_test() -> Self {
+        let mut key = [0; 32];
+        OsRng.fill_bytes(&mut key);
+        Self(key)
+    }
+
+    #[cfg(test)]
     pub(crate) fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -270,29 +283,55 @@ impl RatchetSession {
                 .ok_or(RatchetError::OutOfOrder)?;
             let message_key = Zeroizing::new(self.skipped_message_keys[position].1);
             let plaintext = decrypt_ratchet_message(message, associated_data, &message_key)?;
-            self.skipped_message_keys.swap_remove(position);
+            // `remove` (non `swap_remove`) mantiene l'ordine: le chiavi più
+            // vecchie restano in testa e sono le prime a essere scartate.
+            let (_, mut used) = self.skipped_message_keys.remove(position);
+            used.zeroize();
             return Ok(plaintext);
         }
 
         let gap = message.number - self.receive_number;
-        let skipped_count = gap.saturating_sub(1);
-        if self.skipped_message_keys.len() as u64 + skipped_count > MAX_SKIPPED_MESSAGE_KEYS {
+        if gap > MAX_MESSAGE_GAP {
             return Err(RatchetError::OutOfOrder);
         }
 
+        // Dei messaggi saltati servono solo le chiavi degli ultimi
+        // MAX_SKIPPED_MESSAGE_KEYS: quelli più vecchi si considerano persi.
+        // Prima un buco oltre il limite bloccava la sessione per sempre.
+        let first_kept = message
+            .number
+            .saturating_sub(MAX_SKIPPED_MESSAGE_KEYS)
+            .max(self.receive_number + 1);
         let mut next_chain = self.receive_chain;
-        let mut skipped = Vec::with_capacity(skipped_count as usize);
+        let mut skipped = Vec::new();
         for number in self.receive_number + 1..message.number {
-            skipped.push((number, ratchet_message_key(&next_chain, number)));
+            if number >= first_kept {
+                skipped.push((number, ratchet_message_key(&next_chain, number)));
+            }
             next_chain = advance_chain(&next_chain);
         }
         let message_key = Zeroizing::new(ratchet_message_key(&next_chain, message.number));
-        let plaintext = decrypt_ratchet_message(message, associated_data, &message_key)?;
+        let plaintext = match decrypt_ratchet_message(message, associated_data, &message_key) {
+            Ok(plaintext) => plaintext,
+            Err(error) => {
+                for (_, key) in &mut skipped {
+                    key.zeroize();
+                }
+                return Err(error);
+            }
+        };
         next_chain = advance_chain(&next_chain);
 
         self.receive_chain = next_chain;
         self.receive_number = message.number;
         self.skipped_message_keys.extend(skipped);
+        let excess = self
+            .skipped_message_keys
+            .len()
+            .saturating_sub(MAX_SKIPPED_MESSAGE_KEYS as usize);
+        for (_, mut expired) in self.skipped_message_keys.drain(..excess) {
+            expired.zeroize();
+        }
         Ok(plaintext)
     }
 }
@@ -757,23 +796,69 @@ mod tests {
         );
     }
 
+    /// Audit #4: dopo 64 messaggi persi la sessione rifiutava per sempre ogni
+    /// nuovo buco. Ora le chiavi più vecchie scadono e la sessione avanza.
     #[test]
-    fn symmetric_ratchet_limits_total_skipped_keys() {
+    fn symmetric_ratchet_recovers_after_many_lost_messages() {
         let (alice, bob) = peers();
         let mut alice_session = RatchetSession::new(SessionKey([15; 32]), alice, bob);
         let mut bob_session = RatchetSession::new(SessionKey([15; 32]), bob, alice);
+        let lost = (0..100)
+            .map(|_| alice_session.encrypt(b"perso", b"conversation").unwrap())
+            .collect::<Vec<_>>();
+        let after = alice_session.encrypt(b"dopo", b"conversation").unwrap();
+
+        assert_eq!(bob_session.decrypt(&after, b"conversation").unwrap(), b"dopo");
+        // I più recenti dei messaggi persi si possono ancora leggere...
+        assert_eq!(
+            bob_session.decrypt(&lost[99], b"conversation").unwrap(),
+            b"perso"
+        );
+        // ...quelli fuori dalla finestra sono scaduti.
+        assert_eq!(
+            bob_session.decrypt(&lost[0], b"conversation"),
+            Err(RatchetError::OutOfOrder)
+        );
+        // E la sessione continua a funzionare.
+        let next = alice_session.encrypt(b"ancora", b"conversation").unwrap();
+        assert_eq!(bob_session.decrypt(&next, b"conversation").unwrap(), b"ancora");
+    }
+
+    #[test]
+    fn symmetric_ratchet_keeps_advancing_with_repeated_gaps() {
+        let (alice, bob) = peers();
+        let mut alice_session = RatchetSession::new(SessionKey([16; 32]), alice, bob);
+        let mut bob_session = RatchetSession::new(SessionKey([16; 32]), bob, alice);
         let messages = (0..130)
             .map(|_| alice_session.encrypt(b"x", b"conversation").unwrap())
             .collect::<Vec<_>>();
 
-        for index in (1..128).step_by(2) {
+        for index in (1..130).step_by(2) {
             assert!(bob_session
                 .decrypt(&messages[index], b"conversation")
                 .is_ok());
         }
+        assert!(bob_session.skipped_message_keys.len() as u64 <= MAX_SKIPPED_MESSAGE_KEYS);
+        assert!(bob_session.decrypt(&messages[128], b"conversation").is_ok());
         assert_eq!(
-            bob_session.decrypt(&messages[129], b"conversation"),
+            bob_session.decrypt(&messages[0], b"conversation"),
             Err(RatchetError::OutOfOrder)
         );
+    }
+
+    #[test]
+    fn symmetric_ratchet_rejects_huge_gap_without_advancing() {
+        let (alice, bob) = peers();
+        let mut alice_session = RatchetSession::new(SessionKey([17; 32]), alice, bob);
+        let mut bob_session = RatchetSession::new(SessionKey([17; 32]), bob, alice);
+        for _ in 0..MAX_MESSAGE_GAP {
+            alice_session.encrypt(b"x", b"conversation").unwrap();
+        }
+        let far = alice_session.encrypt(b"lontano", b"conversation").unwrap();
+        assert_eq!(
+            bob_session.decrypt(&far, b"conversation"),
+            Err(RatchetError::OutOfOrder)
+        );
+        assert_eq!(bob_session.receive_number, 0);
     }
 }
