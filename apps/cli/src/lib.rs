@@ -3649,93 +3649,100 @@ impl Node {
                     return Ok(LoopFlow::Continue);
                 }
                 match response {
-                    HybridResponse::Accepted(hello) => match initiator
-                        .finish(&hello)
-                        .map_err(|error| error.to_string())
-                        .and_then(|handshaked| {
-                            pin_pq_identity(history, peer, handshaked.peer_ml_dsa_key.as_deref())?;
-                            Ok(handshaked.key)
-                        }) {
-                        Ok(session_key) => {
-                            let rekey = sessions.contains_key(&peer);
-                            pending_handshakes.install(
-                                sessions,
-                                peer,
-                                RatchetSession::new(session_key, local_peer_id, peer),
-                                rekey,
-                            );
-                            handshake_retries.remove(&peer);
-                            log::info!("handshake ibrido completato: {peer}");
-                            if rekey {
-                                // Il primo messaggio con la sessione nuova
-                                // dice al responder di passare a quella.
-                                send_event(
-                                    swarm,
-                                    sessions,
-                                    contact_devices,
-                                    peer,
-                                    local_peer_id,
-                                    sent_numbers,
-                                    ChatEvent::Presence(presence_update(
-                                        display_name,
-                                        presence_status,
-                                        true,
-                                        account_proof,
-                                    )),
-                                );
-                                return Ok(LoopFlow::Continue);
-                            }
-                            let contact = contact_devices.canonical(peer);
-                            let _ = events.send(ClientEvent::ContactUpdated {
-                                contact: ClientContact {
-                                    peer_id: contact.to_string(),
-                                    name: peer_names
-                                        .get(&contact)
-                                        .cloned()
-                                        .unwrap_or_else(|| "Contatto".into()),
-                                    online: true,
-                                    secure: true,
-                                    fingerprint: peer_fingerprint(contact),
-                                },
-                            });
-                            send_group_definitions_for_peer(
-                                history,
-                                swarm,
-                                sessions,
-                                contact_devices,
-                                sent_numbers,
-                                local_peer_id,
-                                peer,
-                            );
-                            flush_outbox(
-                                swarm,
-                                sessions,
-                                contact_devices,
-                                sent_numbers,
-                                pending_messages,
-                                outbox,
-                                local_peer_id,
-                                peer,
-                            );
-                            for offer in take_waiting_offers(waiting_offers, contact_devices, peer)
-                            {
-                                offer_file(
-                                    swarm,
-                                    sessions,
-                                    contact_devices,
-                                    sent_numbers,
-                                    pending_offers,
+                    HybridResponse::Accepted(hello) => {
+                        // Il responder tiene la sessione nuova in attesa
+                        // finché non la vede usata: se l'hello era un
+                        // rinnovo, gli si manda subito un messaggio.
+                        let rekey = initiator.rekey();
+                        match initiator
+                            .finish(&hello)
+                            .map_err(|error| error.to_string())
+                            .and_then(|handshaked| {
+                                pin_pq_identity(
                                     history,
-                                    events,
-                                    local_peer_id,
-                                    offer,
+                                    peer,
+                                    handshaked.peer_ml_dsa_key.as_deref(),
+                                )?;
+                                Ok(handshaked.key)
+                            }) {
+                            Ok(session_key) => {
+                                pending_handshakes.install(
+                                    sessions,
+                                    peer,
+                                    RatchetSession::new(session_key, local_peer_id, peer),
+                                    rekey,
                                 );
+                                handshake_retries.remove(&peer);
+                                log::info!("handshake ibrido completato: {peer}");
+                                if rekey {
+                                    send_event(
+                                        swarm,
+                                        sessions,
+                                        contact_devices,
+                                        peer,
+                                        local_peer_id,
+                                        sent_numbers,
+                                        ChatEvent::Presence(presence_update(
+                                            display_name,
+                                            presence_status,
+                                            true,
+                                            account_proof,
+                                        )),
+                                    );
+                                }
+                                let contact = contact_devices.canonical(peer);
+                                let _ = events.send(ClientEvent::ContactUpdated {
+                                    contact: ClientContact {
+                                        peer_id: contact.to_string(),
+                                        name: peer_names
+                                            .get(&contact)
+                                            .cloned()
+                                            .unwrap_or_else(|| "Contatto".into()),
+                                        online: true,
+                                        secure: true,
+                                        fingerprint: peer_fingerprint(contact),
+                                    },
+                                });
+                                send_group_definitions_for_peer(
+                                    history,
+                                    swarm,
+                                    sessions,
+                                    contact_devices,
+                                    sent_numbers,
+                                    local_peer_id,
+                                    peer,
+                                );
+                                flush_outbox(
+                                    swarm,
+                                    sessions,
+                                    contact_devices,
+                                    sent_numbers,
+                                    pending_messages,
+                                    outbox,
+                                    local_peer_id,
+                                    peer,
+                                );
+                                for offer in
+                                    take_waiting_offers(waiting_offers, contact_devices, peer)
+                                {
+                                    offer_file(
+                                        swarm,
+                                        sessions,
+                                        contact_devices,
+                                        sent_numbers,
+                                        pending_offers,
+                                        history,
+                                        events,
+                                        local_peer_id,
+                                        offer,
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                log::warn!("handshake ibrido fallito con {peer}: {error}")
                             }
                         }
-                        Err(error) => {
-                            log::warn!("handshake ibrido fallito con {peer}: {error}")
-                        }
-                    },
+                    }
                     HybridResponse::Rejected(error) => {
                         log::warn!("handshake ibrido rifiutato da {peer}: {error:?}");
                     }
