@@ -34,7 +34,7 @@ pub fn export(
         fs::create_dir_all(parent)?;
     }
     fs::write(path, &encoded)?;
-    println!("{}", encoded_link(&encoded));
+    log::info!("{}", encoded_link(&encoded));
     Ok(())
 }
 

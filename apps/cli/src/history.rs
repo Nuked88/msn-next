@@ -80,6 +80,11 @@ pub enum SyncOperation {
     },
 }
 
+/// Byte di record per richiesta Pair/Sync. Il codec cbor di libp2p rifiuta
+/// richieste oltre 1 MiB, e il messaggio sigillato codifica il ciphertext
+/// come array (fino a 2 byte per byte): resta ampio margine.
+pub const MAX_SYNC_BATCH_BYTES: usize = 256 * 1024;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SyncRecord {
     pub seq: u64,
@@ -116,6 +121,8 @@ impl History {
             fs::create_dir_all(parent)?;
         }
         let connection = Connection::open(path)?;
+        // Le righe cancellate vengono azzerate su disco, non solo scollegate.
+        connection.pragma_update(None, "secure_delete", true)?;
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY,
@@ -148,7 +155,9 @@ impl History {
         CREATE TABLE IF NOT EXISTS sync_log (
             seq INTEGER PRIMARY KEY AUTOINCREMENT,
             op_id TEXT NOT NULL UNIQUE,
-            payload BLOB NOT NULL
+            payload BLOB NOT NULL,
+            event_id TEXT,
+            peer TEXT
         );
         CREATE TABLE IF NOT EXISTS sync_versions (
             entity TEXT PRIMARY KEY,
@@ -164,6 +173,19 @@ impl History {
             event_id TEXT PRIMARY KEY,
             tombstone INTEGER NOT NULL,
             changed_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS revoked_devices (
+            peer TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            revoked_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS retired_account_keys (
+            key_id BLOB PRIMARY KEY,
+            account_key BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS pq_identities (
+            peer TEXT PRIMARY KEY,
+            ml_dsa_public_key BLOB NOT NULL
         );",
         )?;
         if !column_exists(&connection, "contacts", "account_id")? {
@@ -183,10 +205,24 @@ impl History {
             "CREATE UNIQUE INDEX IF NOT EXISTS events_event_id ON events(event_id)",
             [],
         )?;
+        // Il sync_log ricorda a quale messaggio e conversazione si riferisce
+        // ogni RecordEvent, così una cancellazione può toglierne il contenuto.
+        let index_sync_log = !column_exists(&connection, "sync_log", "event_id")?;
+        if index_sync_log {
+            connection.execute("ALTER TABLE sync_log ADD COLUMN event_id TEXT", [])?;
+            connection.execute("ALTER TABLE sync_log ADD COLUMN peer TEXT", [])?;
+        }
+        connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS sync_log_event_id ON sync_log(event_id);
+             CREATE INDEX IF NOT EXISTS sync_log_peer ON sync_log(peer);",
+        )?;
         let history = Self {
             connection,
             cipher: XChaCha20Poly1305::new((&key).into()),
         };
+        if index_sync_log {
+            history.compact_sync_log()?;
+        }
         history.seed_sync_log()?;
         Ok(history)
     }
@@ -244,7 +280,11 @@ impl History {
     }
 
     /// Segna un messaggio come eliminato "per tutti" (segnaposto su entrambi).
-    pub fn tombstone_event(&self, event_id: &str, changed_at_ms: u64) -> Result<(), Box<dyn Error>> {
+    pub fn tombstone_event(
+        &self,
+        event_id: &str,
+        changed_at_ms: u64,
+    ) -> Result<(), Box<dyn Error>> {
         self.commit_local(SyncOperation::TombstoneEvent {
             event_id: event_id.to_owned(),
             changed_at_ms,
@@ -254,10 +294,7 @@ impl History {
 
     /// Metadati di un messaggio per validare una cancellazione in ingresso:
     /// `(peer, direction, timestamp_ms)`.
-    pub fn event_meta(
-        &self,
-        event_id: &str,
-    ) -> Result<Option<EventMeta>, Box<dyn Error>> {
+    pub fn event_meta(&self, event_id: &str) -> Result<Option<EventMeta>, Box<dyn Error>> {
         Ok(self
             .connection
             .query_row(
@@ -311,11 +348,26 @@ impl History {
     }
 
     pub fn conversation(&self, peer: &str, limit: usize) -> Result<Vec<Entry>, Box<dyn Error>> {
+        self.conversation_before(peer, None, limit)
+    }
+
+    /// I messaggi di una conversazione dal più recente, fino a `limit`. Con
+    /// `before` (id di un evento) solo quelli più vecchi di quell'evento: è il
+    /// cursore della paginazione.
+    pub fn conversation_before(
+        &self,
+        peer: &str,
+        before: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Entry>, Box<dyn Error>> {
         let mut statement = self.connection.prepare(
             "SELECT event_id, peer, direction, kind, body, timestamp_ms
-             FROM events WHERE peer = ?1 ORDER BY id DESC LIMIT ?2",
+             FROM events
+             WHERE peer = ?1
+               AND (?2 IS NULL OR id < (SELECT id FROM events WHERE event_id = ?2))
+             ORDER BY id DESC LIMIT ?3",
         )?;
-        let rows = statement.query_map(params![peer, limit as u64], |row| {
+        let rows = statement.query_map(params![peer, before, limit as u64], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -439,6 +491,10 @@ impl History {
             peer: peer.to_owned(),
             changed_at_ms: now_ms(),
         })?;
+        // Un contatto rimosso e riaggiunto riparte da zero: la sua chiave
+        // ML-DSA si fissa di nuovo al prossimo handshake.
+        self.connection
+            .execute("DELETE FROM pq_identities WHERE peer = ?1", [peer])?;
         Ok(())
     }
 
@@ -493,11 +549,9 @@ impl History {
     }
 
     pub fn contacts(&self) -> Result<Vec<ContactEntry>, Box<dyn Error>> {
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT peer, name, link, account_id FROM contacts ORDER BY name COLLATE NOCASE",
-            )?;
+        let mut statement = self.connection.prepare(
+            "SELECT peer, name, link, account_id FROM contacts ORDER BY name COLLATE NOCASE",
+        )?;
         let rows = statement.query_map([], |row| {
             Ok(ContactEntry {
                 peer: row.get(0)?,
@@ -574,6 +628,95 @@ impl History {
         Ok(())
     }
 
+    /// Esclude un dispositivo dall'account: niente più sync né relay con lui,
+    /// anche dopo un riavvio. Un nuovo pairing lo riammette.
+    pub fn revoke_device(&self, peer: &str, name: &str) -> Result<(), Box<dyn Error>> {
+        self.connection
+            .execute("DELETE FROM linked_devices WHERE peer = ?1", [peer])?;
+        self.connection
+            .execute("DELETE FROM sync_cursors WHERE peer = ?1", [peer])?;
+        self.connection.execute(
+            "INSERT OR REPLACE INTO revoked_devices (peer, name, revoked_at_ms) VALUES (?1, ?2, ?3)",
+            params![peer, name, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Chiave ML-DSA fissata per un peer al primo handshake firmato.
+    pub fn pq_identity(&self, peer: &str) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT ml_dsa_public_key FROM pq_identities WHERE peer = ?1",
+                [peer],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn pin_pq_identity(&self, peer: &str, key: &[u8]) -> Result<(), Box<dyn Error>> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO pq_identities (peer, ml_dsa_public_key) VALUES (?1, ?2)",
+            params![peer, key],
+        )?;
+        Ok(())
+    }
+
+    pub fn readmit_device(&self, peer: &str) -> Result<(), Box<dyn Error>> {
+        self.connection
+            .execute("DELETE FROM revoked_devices WHERE peer = ?1", [peer])?;
+        Ok(())
+    }
+
+    /// Dispositivi revocati: `(peer, nome)`.
+    pub fn revoked_devices(&self) -> Result<Vec<(String, String)>, Box<dyn Error>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT peer, name FROM revoked_devices ORDER BY peer")?;
+        let peers = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(peers)
+    }
+
+    /// Conserva una chiave di account sostituita: serve a riconoscere i
+    /// dispositivi rimasti offline durante la rotazione e passare loro la
+    /// chiave nuova.
+    pub fn retire_account_key(
+        &self,
+        key_id: &[u8; 16],
+        key: &[u8; 32],
+    ) -> Result<(), Box<dyn Error>> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO retired_account_keys (key_id, account_key) VALUES (?1, ?2)",
+            params![key_id.as_slice(), self.seal(key)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn retired_account_key(
+        &self,
+        key_id: &[u8; 16],
+    ) -> Result<Option<[u8; 32]>, Box<dyn Error>> {
+        let sealed: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT account_key FROM retired_account_keys WHERE key_id = ?1",
+                [key_id.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        sealed
+            .map(|sealed| {
+                let key: [u8; 32] = self
+                    .unseal(&sealed)?
+                    .try_into()
+                    .map_err(|_| "chiave di account ritirata non valida")?;
+                Ok(key)
+            })
+            .transpose()
+    }
+
     pub fn devices(&self) -> Result<Vec<DeviceEntry>, Box<dyn Error>> {
         let mut statement = self.connection.prepare(
             "SELECT peer, name, addresses, last_seen_ms FROM linked_devices ORDER BY name COLLATE NOCASE",
@@ -630,9 +773,16 @@ impl History {
     pub fn latest_sync_seq(&self) -> Result<u64, Box<dyn Error>> {
         Ok(self
             .connection
-            .query_row("SELECT coalesce(max(seq), 0) FROM sync_log", [], |row| {
-                row.get(0)
-            })?)
+            // Dal contatore e non da max(seq): le righe compattate lasciano
+            // buchi, anche in fondo al log.
+            .query_row(
+                "SELECT max(
+                    coalesce((SELECT max(seq) FROM sync_log), 0),
+                    coalesce((SELECT seq FROM sqlite_sequence WHERE name = 'sync_log'), 0)
+                 )",
+                [],
+                |row| row.get(0),
+            )?)
     }
 
     pub fn sync_records_since(
@@ -651,12 +801,20 @@ impl History {
             ))
         })?;
         let mut records = Vec::new();
+        let mut batch_bytes = 0;
         for row in rows {
             let (seq, op_id, payload) = row?;
+            let plain = self.unseal(&payload)?;
+            // Il resto arriva al giro successivo: chi riceve ripete il sync
+            // finché il cursore non raggiunge latest_seq.
+            batch_bytes += plain.len();
+            if !records.is_empty() && batch_bytes > MAX_SYNC_BATCH_BYTES {
+                break;
+            }
             records.push(SyncRecord {
                 seq,
                 op_id,
-                operation: cbor4ii::serde::from_slice(&self.unseal(&payload)?)?,
+                operation: cbor4ii::serde::from_slice(&plain)?,
             });
         }
         Ok(records)
@@ -704,8 +862,16 @@ impl History {
         Ok(result)
     }
 
-    fn commit_local(&self, operation: SyncOperation) -> Result<(), Box<dyn Error>> {
+    fn commit_local(&self, mut operation: SyncOperation) -> Result<(), Box<dyn Error>> {
         let op_id = random_id();
+        // Orologio ibrido: una modifica fatta qui viene dopo tutto ciò che
+        // questo dispositivo ha già visto per la stessa entità, anche se il
+        // suo orologio è indietro rispetto a quello di chi l'ha scritta.
+        if let Some((entity, changed_at_ms)) = versioned_entity(&mut operation) {
+            if let Some((seen, _)) = self.entity_version(&entity)? {
+                *changed_at_ms = (*changed_at_ms).max(seen.saturating_add(1));
+            }
+        }
         self.apply_operation(&op_id, &operation)?;
         self.append_sync_record(&op_id, &operation)?;
         Ok(())
@@ -716,11 +882,131 @@ impl History {
         op_id: &str,
         operation: &SyncOperation,
     ) -> Result<(), Box<dyn Error>> {
+        // Un messaggio già cancellato non entra nel log con il suo testo,
+        // nemmeno se arriva da un altro dispositivo dopo la cancellazione.
+        let redacted = self.redacted(operation)?;
+        let operation = redacted.as_ref().unwrap_or(operation);
+        let (event_id, peer) = sync_subject(operation);
         let payload = cbor4ii::serde::to_vec(Vec::new(), operation)?;
         self.connection.execute(
-            "INSERT OR IGNORE INTO sync_log (op_id, payload) VALUES (?1, ?2)",
-            params![op_id, self.seal(&payload)?],
+            "INSERT OR IGNORE INTO sync_log (op_id, payload, event_id, peer) VALUES (?1, ?2, ?3, ?4)",
+            params![op_id, self.seal(&payload)?, event_id, peer],
         )?;
+        Ok(())
+    }
+
+    /// La versione di un'operazione da conservare nel sync_log, se diversa:
+    /// un RecordEvent di un messaggio cancellato perde il contenuto. Il log
+    /// viene reinviato a ogni nuovo dispositivo collegato, quindi senza
+    /// questo i messaggi "cancellati" restavano su disco e si propagavano.
+    fn redacted(&self, operation: &SyncOperation) -> Result<Option<SyncOperation>, Box<dyn Error>> {
+        let SyncOperation::RecordEvent(event) = operation else {
+            return Ok(None);
+        };
+        let deleted: Option<(i64, u64)> = self
+            .connection
+            .query_row(
+                "SELECT tombstone, changed_at_ms FROM deleted_events WHERE event_id = ?1",
+                [&event.event_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let removed_at = match deleted {
+            Some((0, changed_at_ms)) => Some(changed_at_ms),
+            Some(_) if event.kind == "deleted" && event.body.is_empty() => return Ok(None),
+            Some(_) => {
+                return Ok(Some(SyncOperation::RecordEvent(Entry {
+                    kind: "deleted".into(),
+                    body: String::new(),
+                    ..event.clone()
+                })))
+            }
+            None => {
+                // Conversazione svuotata (o contatto/gruppo eliminato) dopo
+                // questo messaggio. Non un DeleteEvent: con una fusione di
+                // contatti lo stesso id vive ancora sotto il contatto superstite.
+                let cleared_at = self
+                    .entity_version(&format!("conversation:{}", event.peer))?
+                    .map(|(cleared_at, _)| cleared_at)
+                    .filter(|cleared_at| *cleared_at >= event.timestamp_ms);
+                return Ok(
+                    cleared_at.map(|changed_at_ms| SyncOperation::ClearConversation {
+                        peer: event.peer.clone(),
+                        changed_at_ms,
+                    }),
+                );
+            }
+        };
+        Ok(removed_at.map(|changed_at_ms| SyncOperation::DeleteEvent {
+            event_id: event.event_id.clone(),
+            changed_at_ms,
+        }))
+    }
+
+    /// Riscrive le righe del sync_log di un messaggio (`event_id`) o di una
+    /// conversazione (`peer`) dopo una cancellazione.
+    fn redact_sync_log(&self, column: &str, value: &str) -> Result<(), Box<dyn Error>> {
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT seq, payload FROM sync_log WHERE {column} = ?1"
+        ))?;
+        let rows = statement
+            .query_map([value], |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (seq, payload) in rows {
+            let operation: SyncOperation = cbor4ii::serde::from_slice(&self.unseal(&payload)?)?;
+            if let Some(redacted) = self.redacted(&operation)? {
+                self.replace_sync_row(seq, &redacted)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Un messaggio eliminato per tutti resta come segnaposto; per il resto la
+    /// riga sparisce: l'operazione di cancellazione è già nel log e basta ai
+    /// nuovi dispositivi.
+    fn replace_sync_row(&self, seq: u64, redacted: &SyncOperation) -> Result<(), Box<dyn Error>> {
+        if matches!(redacted, SyncOperation::RecordEvent(_)) {
+            self.rewrite_sync_row(seq, redacted)
+        } else {
+            self.connection
+                .execute("DELETE FROM sync_log WHERE seq = ?1", [seq])?;
+            Ok(())
+        }
+    }
+
+    fn rewrite_sync_row(&self, seq: u64, operation: &SyncOperation) -> Result<(), Box<dyn Error>> {
+        let (event_id, peer) = sync_subject(operation);
+        let payload = cbor4ii::serde::to_vec(Vec::new(), operation)?;
+        self.connection.execute(
+            "UPDATE sync_log SET payload = ?2, event_id = ?3, peer = ?4 WHERE seq = ?1",
+            params![seq, self.seal(&payload)?, event_id, peer],
+        )?;
+        Ok(())
+    }
+
+    /// Una tantum, sui database creati prima dell'indice: annota ogni riga e
+    /// toglie il contenuto dei messaggi già cancellati.
+    fn compact_sync_log(&self) -> Result<(), Box<dyn Error>> {
+        let rows = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT seq, payload FROM sync_log")?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        for (seq, payload) in rows {
+            let operation: SyncOperation = cbor4ii::serde::from_slice(&self.unseal(&payload)?)?;
+            match self.redacted(&operation)? {
+                Some(redacted) => self.replace_sync_row(seq, &redacted)?,
+                None => self.rewrite_sync_row(seq, &operation)?,
+            }
+        }
         Ok(())
     }
 
@@ -782,6 +1068,7 @@ impl History {
                      ON CONFLICT(event_id) DO UPDATE SET tombstone = 0, changed_at_ms = ?2",
                     params![event_id, changed_at_ms],
                 )?;
+                self.redact_sync_log("event_id", event_id)?;
                 true
             }
             SyncOperation::TombstoneEvent {
@@ -797,6 +1084,7 @@ impl History {
                      ON CONFLICT(event_id) DO UPDATE SET tombstone = 1, changed_at_ms = ?2",
                     params![event_id, changed_at_ms],
                 )?;
+                self.redact_sync_log("event_id", event_id)?;
                 true
             }
             SyncOperation::UpsertContact {
@@ -847,6 +1135,7 @@ impl History {
                     [peer],
                 )?;
                 self.set_version(&format!("conversation:{peer}"), *changed_at_ms, op_id)?;
+                self.redact_sync_log("peer", peer)?;
                 true
             }
             SyncOperation::ClearConversation {
@@ -861,6 +1150,7 @@ impl History {
                     "DELETE FROM events WHERE peer = ?1 AND timestamp_ms <= ?2",
                     params![peer, changed_at_ms],
                 )?;
+                self.redact_sync_log("peer", peer)?;
                 true
             }
             SyncOperation::UpsertGroup {
@@ -894,6 +1184,7 @@ impl History {
                     *changed_at_ms,
                     op_id,
                 )?;
+                self.redact_sync_log("peer", &conversation)?;
                 true
             }
         };
@@ -999,6 +1290,14 @@ impl History {
     }
 }
 
+/// Messaggio e conversazione a cui si riferisce una riga del sync_log.
+fn sync_subject(operation: &SyncOperation) -> (Option<&str>, Option<&str>) {
+    match operation {
+        SyncOperation::RecordEvent(event) => (Some(&event.event_id), Some(&event.peer)),
+        _ => (None, None),
+    }
+}
+
 fn column_exists(
     connection: &Connection,
     table: &str,
@@ -1016,6 +1315,34 @@ fn random_id() -> String {
     let mut bytes = [0u8; 16];
     OsRng.fill_bytes(&mut bytes);
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// L'entità di `sync_versions` toccata da un'operazione e il suo istante.
+fn versioned_entity(operation: &mut SyncOperation) -> Option<(String, &mut u64)> {
+    match operation {
+        SyncOperation::RecordEvent(_)
+        | SyncOperation::DeleteEvent { .. }
+        | SyncOperation::TombstoneEvent { .. } => None,
+        SyncOperation::UpsertContact {
+            contact,
+            changed_at_ms,
+        } => Some((format!("contact:{}", contact.peer), changed_at_ms)),
+        SyncOperation::DeleteContact {
+            peer,
+            changed_at_ms,
+        } => Some((format!("contact:{peer}"), changed_at_ms)),
+        SyncOperation::ClearConversation {
+            peer,
+            changed_at_ms,
+        } => Some((format!("conversation:{peer}"), changed_at_ms)),
+        SyncOperation::UpsertGroup {
+            group,
+            changed_at_ms,
+        } => Some((format!("group:{}", group.id), changed_at_ms)),
+        SyncOperation::DeleteGroup { id, changed_at_ms } => {
+            Some((format!("group:{id}"), changed_at_ms))
+        }
+    }
 }
 
 fn now_ms() -> u64 {
@@ -1125,6 +1452,182 @@ mod tests {
         fs::remove_file(path).ok();
     }
 
+    /// Audit #11: oltre gli ultimi 100 messaggi la cronologia non era
+    /// raggiungibile. Il cursore `before` scorre le pagine fino all'inizio.
+    #[test]
+    fn conversation_pages_reach_the_oldest_message() {
+        let path = std::env::temp_dir().join(format!("msnnext-pages-{}.db", std::process::id()));
+        fs::remove_file(&path).ok();
+        let history = History::open(&path, [5; 32]).unwrap();
+        for index in 0..250u64 {
+            history
+                .record_with_id(
+                    &format!("id-{index:03}"),
+                    "alice",
+                    "in",
+                    "text",
+                    &format!("m{index}"),
+                    index,
+                )
+                .unwrap();
+            history.record("bob", "in", "text", "altro", index).unwrap();
+        }
+        let mut before: Option<String> = None;
+        let mut seen = Vec::new();
+        loop {
+            let page = history
+                .conversation_before("alice", before.as_deref(), 100)
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            assert!(page.iter().all(|entry| entry.peer == "alice"));
+            before = Some(page.last().unwrap().event_id.clone());
+            seen.extend(page.into_iter().map(|entry| entry.body));
+        }
+        assert_eq!(seen.len(), 250);
+        assert_eq!(seen.first().map(String::as_str), Some("m249"));
+        assert_eq!(seen.last().map(String::as_str), Some("m0"));
+        fs::remove_file(path).ok();
+    }
+
+    fn logged_bodies(history: &History) -> Vec<String> {
+        history
+            .sync_records_since(0, usize::MAX >> 1)
+            .unwrap()
+            .into_iter()
+            .filter_map(|record| match record.operation {
+                SyncOperation::RecordEvent(event) => Some(event.body),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Audit #17: un messaggio cancellato spariva da `events` ma la copia
+    /// restava nel sync_log, reinviato a ogni nuovo dispositivo.
+    /// Audit #24: con l'orologio indietro una modifica locale fatta dopo
+    /// averne ricevuta una remota veniva scartata (last-write-wins).
+    #[test]
+    fn local_changes_win_over_seen_ones_despite_clock_skew() {
+        let path = std::env::temp_dir().join(format!("msnnext-hlc-{}.db", std::process::id()));
+        fs::remove_file(&path).ok();
+        let history = History::open(&path, [7; 32]).unwrap();
+        let ahead = now_ms() + 60 * 60 * 1000;
+        history
+            .apply_sync_records(&[SyncRecord {
+                seq: 1,
+                op_id: "remote".into(),
+                operation: SyncOperation::UpsertContact {
+                    contact: ContactEntry {
+                        peer: "alice".into(),
+                        name: "Alice (altro PC)".into(),
+                        link: String::new(),
+                        account_id: String::new(),
+                    },
+                    changed_at_ms: ahead,
+                },
+            }])
+            .unwrap();
+
+        history.rename_contact("alice", "Alice").unwrap();
+        assert_eq!(history.contacts().unwrap()[0].name, "Alice");
+
+        // L'altro dispositivo riceve la rinomina e la applica a sua volta.
+        let other_path =
+            std::env::temp_dir().join(format!("msnnext-hlc-other-{}.db", std::process::id()));
+        fs::remove_file(&other_path).ok();
+        let other = History::open(&other_path, [8; 32]).unwrap();
+        other
+            .apply_sync_records(&history.sync_records_since(0, 100).unwrap())
+            .unwrap();
+        assert_eq!(other.contacts().unwrap()[0].name, "Alice");
+        fs::remove_file(path).ok();
+        fs::remove_file(other_path).ok();
+    }
+
+    #[test]
+    fn deleted_messages_leave_the_sync_log() {
+        let path = std::env::temp_dir().join(format!("msnnext-redact-{}.db", std::process::id()));
+        fs::remove_file(&path).ok();
+        let history = History::open(&path, [6; 32]).unwrap();
+        history
+            .record_with_id("a1", "alice", "in", "text", "per me", 10)
+            .unwrap();
+        history
+            .record_with_id("a2", "alice", "out", "text", "per tutti", 11)
+            .unwrap();
+        history
+            .record_with_id("b1", "bob", "in", "text", "svuotato", 12)
+            .unwrap();
+        history
+            .record_with_id("c1", "carol", "in", "text", "contatto eliminato", 13)
+            .unwrap();
+        history
+            .record_with_id("a3", "alice", "in", "text", "resta", 14)
+            .unwrap();
+
+        history.delete_event("a1", 20).unwrap();
+        history.tombstone_event("a2", 21).unwrap();
+        history.clear_conversation("bob").unwrap();
+        history.delete_contact("carol").unwrap();
+        assert_eq!(
+            logged_bodies(&history),
+            vec!["".to_owned(), "resta".to_owned()]
+        );
+
+        // Lo stesso messaggio che arriva dopo da un altro dispositivo non
+        // rientra nel log con il testo.
+        let late = SyncRecord {
+            seq: 1,
+            op_id: "remoto".into(),
+            operation: SyncOperation::RecordEvent(Entry {
+                event_id: "a1".into(),
+                peer: "alice".into(),
+                direction: "in".into(),
+                kind: "text".into(),
+                body: "per me".into(),
+                timestamp_ms: 10,
+            }),
+        };
+        history.apply_sync_records(&[late]).unwrap();
+        assert!(!logged_bodies(&history).contains(&"per me".to_owned()));
+        assert!(history.latest_sync_seq().unwrap() >= 9);
+        fs::remove_file(path).ok();
+    }
+
+    /// I database precedenti all'indice vengono compattati una volta
+    /// all'apertura.
+    #[test]
+    fn old_sync_log_is_compacted_on_open() {
+        let path = std::env::temp_dir().join(format!("msnnext-compact-{}.db", std::process::id()));
+        fs::remove_file(&path).ok();
+        {
+            let history = History::open(&path, [4; 32]).unwrap();
+            history
+                .record_with_id("x1", "alice", "in", "text", "segreto", 10)
+                .unwrap();
+            history
+                .record_with_id("x2", "alice", "in", "text", "resta", 11)
+                .unwrap();
+            // Come una cancellazione fatta da una versione precedente: il
+            // testo resta nel log e il log non ha le colonne nuove.
+            history
+                .connection
+                .execute_batch(
+                    "DELETE FROM events WHERE event_id = 'x1';
+                     INSERT INTO deleted_events (event_id, tombstone, changed_at_ms) VALUES ('x1', 0, 20);
+                     DROP INDEX sync_log_event_id;
+                     DROP INDEX sync_log_peer;
+                     ALTER TABLE sync_log DROP COLUMN event_id;
+                     ALTER TABLE sync_log DROP COLUMN peer;",
+                )
+                .unwrap();
+        }
+        let history = History::open(&path, [4; 32]).unwrap();
+        assert_eq!(logged_bodies(&history), vec!["resta".to_owned()]);
+        fs::remove_file(path).ok();
+    }
+
     #[test]
     fn contacts_survive_reopening_the_store() {
         let path = std::env::temp_dir().join(format!("msnnext-contacts-{}.db", std::process::id()));
@@ -1173,12 +1676,18 @@ mod tests {
             std::env::temp_dir().join(format!("msnnext-contact-merge-{}.db", std::process::id()));
         fs::remove_file(&path).ok();
         let history = History::open(&path, [11; 32]).unwrap();
-        history.save_contact("peer-a", "Phillip", "link", 1).unwrap();
+        history
+            .save_contact("peer-a", "Phillip", "link", 1)
+            .unwrap();
         history.save_contact("peer-b", "Amico", "", 2).unwrap();
         history.record("peer-a", "in", "text", "sul pc", 3).unwrap();
-        history.record("peer-b", "in", "text", "dal telefono", 4).unwrap();
+        history
+            .record("peer-b", "in", "text", "dal telefono", 4)
+            .unwrap();
 
-        history.bind_contact_account("peer-a", "account-1", 5).unwrap();
+        history
+            .bind_contact_account("peer-a", "account-1", 5)
+            .unwrap();
         // Un rename successivo non deve perdere il legame con l'account.
         history.rename_contact("peer-a", "Phil").unwrap();
         let contact = history
@@ -1205,8 +1714,10 @@ mod tests {
         assert!(history.ignored_contacts().unwrap().is_empty());
 
         // La fusione viaggia nel log di sincronizzazione.
-        let twin_path = std::env::temp_dir()
-            .join(format!("msnnext-contact-merge-twin-{}.db", std::process::id()));
+        let twin_path = std::env::temp_dir().join(format!(
+            "msnnext-contact-merge-twin-{}.db",
+            std::process::id()
+        ));
         fs::remove_file(&twin_path).ok();
         let twin = History::open(&twin_path, [11; 32]).unwrap();
         twin.apply_sync_records(&history.sync_records_since(0, 500).unwrap())
