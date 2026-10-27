@@ -182,6 +182,10 @@ impl History {
         CREATE TABLE IF NOT EXISTS retired_account_keys (
             key_id BLOB PRIMARY KEY,
             account_key BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS pq_identities (
+            peer TEXT PRIMARY KEY,
+            ml_dsa_public_key BLOB NOT NULL
         );",
         )?;
         if !column_exists(&connection, "contacts", "account_id")? {
@@ -487,6 +491,10 @@ impl History {
             peer: peer.to_owned(),
             changed_at_ms: now_ms(),
         })?;
+        // Un contatto rimosso e riaggiunto riparte da zero: la sua chiave
+        // ML-DSA si fissa di nuovo al prossimo handshake.
+        self.connection
+            .execute("DELETE FROM pq_identities WHERE peer = ?1", [peer])?;
         Ok(())
     }
 
@@ -630,6 +638,26 @@ impl History {
         self.connection.execute(
             "INSERT OR REPLACE INTO revoked_devices (peer, name, revoked_at_ms) VALUES (?1, ?2, ?3)",
             params![peer, name, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Chiave ML-DSA fissata per un peer al primo handshake firmato.
+    pub fn pq_identity(&self, peer: &str) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT ml_dsa_public_key FROM pq_identities WHERE peer = ?1",
+                [peer],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn pin_pq_identity(&self, peer: &str, key: &[u8]) -> Result<(), Box<dyn Error>> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO pq_identities (peer, ml_dsa_public_key) VALUES (?1, ?2)",
+            params![peer, key],
         )?;
         Ok(())
     }
