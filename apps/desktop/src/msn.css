@@ -3958,3 +3958,15 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Conferma dentro l'app (sostituisce window.confirm). Sta sopra gli altri dialog. */
+.confirm-backdrop { z-index: 80; }
+.confirm-modal { width: min(420px, calc(100vw - 32px)); }
+.confirm-modal > p { color: var(--muted); font-size: 0.8rem; line-height: 1.5; white-space: pre-line; }
+.confirm-modal .modal-heading > span.danger {
+  border-color: color-mix(in srgb, #b42318 30%, var(--line));
+  color: #b42318;
+  background: color-mix(in srgb, #b42318 8%, var(--surface));
+}
+.confirm-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.confirm-actions > button { height: 34px; min-height: 0; margin: 0; padding: 0 16px; font-size: 0.75rem; }
