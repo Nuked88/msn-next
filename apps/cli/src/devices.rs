@@ -7,6 +7,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{error::Error, time::Duration};
 
 use crate::history::SyncRecord;
+use msnnext_protocol::{EmoticonOffer, EmoticonSpan};
 
 pub const PAIRING_VALIDITY: Duration = Duration::from_secs(10 * 60);
 pub const MAX_SYNC_RECORDS: usize = 500;
@@ -52,7 +53,32 @@ pub enum DeviceRequest {
         target: String,
         id: [u8; 16],
         text: String,
+        /// Assenti nelle richieste dei client precedenti: il dispositivo che
+        /// consegna usa allora i propri trigger.
+        #[serde(default)]
+        emoticons: Vec<EmoticonSpan>,
+        #[serde(default)]
+        offers: Vec<EmoticonOffer>,
     },
+    /// Un dispositivo dell'account ne ha revocati altri e ha cambiato la
+    /// chiave di account. Sigillato con la chiave precedente: chi lo riceve
+    /// lo applica solo dopo la conferma dell'utente.
+    RotateAccount { rotation: AccountRotation },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RevokedDevice {
+    pub peer_id: String,
+    pub name: String,
+}
+
+/// Nuova chiave di account e dispositivi esclusi.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AccountRotation {
+    pub account_key: [u8; 32],
+    pub revoked: Vec<RevokedDevice>,
+    /// Nome del dispositivo che ha fatto la revoca, da mostrare all'utente.
+    pub from_name: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -71,7 +97,17 @@ pub enum DeviceResponse {
     },
     Rejected(String),
     /// Esito di una richiesta RelayText: consegnato/accodato dal dispositivo.
-    RelayResult { id: [u8; 16], delivered: bool },
+    RelayResult {
+        id: [u8; 16],
+        delivered: bool,
+    },
+    /// La rotazione è arrivata e attende la conferma dell'utente.
+    RotationPending,
+    /// Risposta a un Sync sigillato con una chiave di account ritirata: il
+    /// dispositivo che lo manda deve prima adottare la chiave nuova.
+    RotationRequired {
+        rotation: AccountRotation,
+    },
 }
 
 pub fn create_pairing_link(
@@ -159,6 +195,52 @@ pub fn open<T: DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit #25: tanti messaggi lunghi superavano il limite di 1 MiB del
+    /// codec cbor e il sync si bloccava.
+    #[test]
+    fn sync_batches_fit_the_request_limit() {
+        let path =
+            std::env::temp_dir().join(format!("msnnext-sync-size-{}.db", std::process::id()));
+        std::fs::remove_file(&path).ok();
+        let history = crate::history::History::open(&path, [9; 32]).unwrap();
+        let long = "é".repeat(msnnext_protocol::MAX_TEXT_BYTES / 2);
+        // 150 messaggi da 16 KB bastano a superare 1 MiB di parecchio.
+        for index in 0..150 {
+            history
+                .record("alice", "in", "text", &long, index as u64)
+                .unwrap();
+        }
+        let mut cursor = 0;
+        let mut batches = 0;
+        loop {
+            let records = history
+                .sync_records_since(cursor, MAX_SYNC_RECORDS)
+                .unwrap();
+            let Some(last) = records.last() else { break };
+            cursor = last.seq;
+            batches += 1;
+            let request = DeviceRequest::Sync {
+                device: DeviceDescriptor {
+                    peer_id: "peer".into(),
+                    name: "PC".into(),
+                    addresses: Vec::new(),
+                },
+                after_seq: 0,
+                records,
+            };
+            let sealed = seal(&[1; 32], &request).unwrap();
+            let encoded = cbor4ii::serde::to_vec(Vec::new(), &sealed).unwrap();
+            assert!(
+                encoded.len() < 1024 * 1024,
+                "batch da {} byte",
+                encoded.len()
+            );
+        }
+        assert!(batches > 1);
+        assert_eq!(cursor, history.latest_sync_seq().unwrap());
+        std::fs::remove_file(path).ok();
+    }
 
     #[test]
     fn pairing_links_expire_and_round_trip() {

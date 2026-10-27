@@ -69,3 +69,7 @@ jobs:
       - name: Check
         working-directory: apps/desktop
         run: npm run check
+
+      - name: Test
+        working-directory: apps/desktop
+        run: npm test
