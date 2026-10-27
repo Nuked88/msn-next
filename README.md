@@ -31,8 +31,8 @@ A P2P desktop messenger inspired by MSN Messenger. Its goal is to keep text, nud
 - Identify, Kademlia DHT, AutoNAT, DCUtR, and Circuit Relay v2;
 - signed contact links and verification that the public key matches the Peer ID;
 - hybrid Ed25519 + ML-DSA-65 account proof carried in presence, binding each device to its account: a contact's newly linked devices are recognized without a second approval, and an unproven peer still requires explicit consent;
-- hybrid X25519 + ML-KEM-768 application handshake;
-- application messages encrypted with XChaCha20-Poly1305 and a symmetric ratchet;
+- hybrid X25519 + ML-KEM-768 application handshake, with the transcript signed by each device's ML-DSA-65 key; the key is pinned at the first signed handshake, and a changed key or a missing signature from a peer that used to sign is rejected (older clients that never signed keep classical authentication);
+- application messages encrypted with XChaCha20-Poly1305 and a symmetric ratchet; sessions are renewed with a fresh hybrid handshake every hour or 1,000 messages, so a stolen session state stops working at the next renewal (post-compromise security at renewal granularity, not per message);
 - replay protection and limited support for out-of-order messages;
 - backoff reconnection after a lost connection;
 - encrypted P2P device synchronization, attempting direct DCUtR with Circuit Relay fallback;
@@ -118,7 +118,8 @@ The original file sent is not copied into the msnnext archive: it is read in chu
 
 ### Security work remaining
 
-- ML-DSA signature of the application-handshake transcript, in addition to the hybrid-signed v2 contact cards already implemented;
+- pin the ML-DSA key from a v2 contact card at import time instead of trusting the first handshake;
+- a per-message asymmetric ratchet (Double Ratchet) for finer-grained post-compromise security;
 - explicit persistence of fingerprint/QR comparison results;
 - independent cryptographic and security audit;
 - migration/versioning protocol for cryptographic primitives.
@@ -130,8 +131,7 @@ The original file sent is not copied into the msnnext archive: it is read in chu
 3. Run extended connection, disconnection, and reconnection tests with two installed applications.
 4. Complete native nudge, sound, presence, avatar, and contact management.
 5. Test multi-device pairing, bootstrap, relay, and hole punching on real networks.
-6. Add device revocation with account-root rotation.
-7. Strengthen key storage, CSP, post-quantum signatures, and identity verification.
+6. Strengthen key storage on mobile and macOS, CSP, and identity verification.
 
 ## Structure
 
@@ -165,13 +165,13 @@ npm run build
 npx tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
 ```
 
-The current standard suite passes with 68 tests. A test using two real sockets is excluded from the automated suite because libp2p teardown can block the harness on Windows. Its scenario should be replaced with deterministic desktop end-to-end testing.
+CI runs `cargo test`, `cargo clippy -D warnings`, `npm run check` and `npm test` on every pull request. The core tests include two-node scenarios over loopback; the frontend tests (`apps/desktop/tests`) cover message parsing and translations.
 
 Installers are generated in:
 
 ```text
-target/release/bundle/msi/msnnext_0.2.0_x64_en-US.msi
-target/release/bundle/nsis/msnnext_0.2.0_x64-setup.exe
+target/release/bundle/msi/msnnext_<version>_x64_en-US.msi
+target/release/bundle/nsis/msnnext_<version>_x64-setup.exe
 ```
 
 ## Creating releases and installers

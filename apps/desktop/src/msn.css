@@ -1540,6 +1540,28 @@ button:disabled {
   background: var(--line-soft);
 }
 
+.load-older {
+  display: block;
+  margin: 0 auto 19px;
+  padding: 6px 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--faint);
+  font: inherit;
+  font-size: 0.72rem;
+  cursor: pointer;
+}
+
+.load-older:hover:not(:disabled) {
+  color: inherit;
+}
+
+.load-older:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
+
 .message-line {
   position: relative;
   max-width: 780px;
