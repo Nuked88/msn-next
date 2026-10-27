@@ -484,6 +484,11 @@ pub enum ClientEvent {
     ContactRequest {
         peer_id: String,
         name: String,
+        /// Impronta da confrontare con l'altra persona prima di accettare.
+        fingerprint: String,
+        /// Ha usato un nostro codice d'invito: la scheda è già verificata,
+        /// ma l'ultima parola resta all'utente (il codice può essere rubato).
+        via_invite: bool,
     },
     MessageDeleted {
         peer_id: String,
@@ -535,6 +540,9 @@ pub enum ClientEvent {
     InviteCompleted {
         peer_id: String,
         name: String,
+        /// `true` dal lato di chi ha creato il codice: ora deve accettare la
+        /// richiesta; `false` da chi l'ha inserito: attende quella conferma.
+        inviter: bool,
     },
     /// L'invito mostrato (`inviter`) o quello inserito è fallito.
     InviteFailed {
@@ -1078,6 +1086,7 @@ async fn run_node(
     let pending_pair_targets = HashMap::<PeerId, PairingLink>::new();
     let active_invite = None::<invite::ActiveInvite>;
     let invite_join = None::<InviteJoin>;
+    let pending_invite_cards = HashMap::<PeerId, contacts::InviteCard>::new();
     let pending_device_requests =
         HashMap::<request_response::OutboundRequestId, PendingDeviceRequest>::new();
     let online_devices = HashSet::<PeerId>::new();
@@ -1269,6 +1278,7 @@ async fn run_node(
         pending_pair_targets,
         active_invite,
         invite_join,
+        pending_invite_cards,
         pending_device_requests,
         online_devices,
         known_devices,
@@ -1385,6 +1395,9 @@ struct Node {
     active_invite: Option<invite::ActiveInvite>,
     /// Codice d'invito inserito qui e ancora in corso.
     invite_join: Option<InviteJoin>,
+    /// Schede verificate di chi ha usato un nostro codice, in attesa che
+    /// l'utente accetti la richiesta.
+    pending_invite_cards: HashMap<PeerId, contacts::InviteCard>,
     pending_device_requests: HashMap<request_response::OutboundRequestId, PendingDeviceRequest>,
     online_devices: HashSet<PeerId>,
     known_devices: HashMap<PeerId, DeviceEntry>,
@@ -3100,6 +3113,8 @@ impl Node {
                                 let _ = events.send(ClientEvent::ContactRequest {
                                     peer_id: peer.to_string(),
                                     name: presence.display_name.clone(),
+                                    fingerprint: peer_fingerprint(peer),
+                                    via_invite: false,
                                 });
                             }
                         }
@@ -4960,17 +4975,27 @@ impl Node {
                     .send_response(channel, response)
                     .ok();
                 if let (true, Some(card)) = (finished, card) {
+                    // Il codice è usato: nessun altro può più provarci. Chi
+                    // l'ha usato però non entra in rubrica da solo: il codice
+                    // potrebbe essere stato letto da qualcun altro, quindi
+                    // diventa una richiesta da accettare con nome e impronta.
                     self.stop_invite();
                     let name = card.name.clone();
-                    if let Err(error) = self.add_invited_contact(card) {
-                        self.invite_failed(true, error.to_string());
-                        return Ok(LoopFlow::Continue);
-                    }
+                    self.ignored_contacts.remove(&peer);
+                    self.peer_names.insert(peer, name.clone());
+                    self.pending_contact_requests.insert(peer, name.clone());
+                    self.pending_invite_cards.insert(peer, card);
                     let _ = self.events.send(ClientEvent::InviteCompleted {
                         peer_id: peer.to_string(),
-                        name,
+                        name: name.clone(),
+                        inviter: true,
                     });
-                    return self.on_connection_established(peer);
+                    let _ = self.events.send(ClientEvent::ContactRequest {
+                        peer_id: peer.to_string(),
+                        name,
+                        fingerprint: peer_fingerprint(peer),
+                        via_invite: true,
+                    });
                 }
             }
             request_response::Message::Response { response, .. } => {
@@ -5025,6 +5050,7 @@ impl Node {
                         let _ = self.events.send(ClientEvent::InviteCompleted {
                             peer_id: peer.to_string(),
                             name: card.name,
+                            inviter: false,
                         });
                         return self.on_connection_established(peer);
                     }
@@ -5109,25 +5135,12 @@ impl Node {
     fn add_invited_contact(&mut self, card: contacts::InviteCard) -> Result<(), Box<dyn Error>> {
         let peer = card.peer_id;
         let key = peer.to_string();
-        match self.history.pq_identity(&key)? {
-            Some(pinned) if pinned != card.ml_dsa_public_key => {
-                return Err("la chiave ML-DSA del contatto è cambiata".into())
-            }
-            Some(_) => {}
-            None => self
-                .history
-                .pin_pq_identity(&key, &card.ml_dsa_public_key)?,
-        }
+        store_invite_card(&self.history, &mut self.swarm, &card)?;
         self.history.allow_contact(&key)?;
         self.ignored_contacts.remove(&peer);
         self.pending_contact_requests.remove(&peer);
-        self.history
-            .save_contact(&key, &card.name, &card.link, now_ms())?;
         self.peer_names.insert(peer, card.name.clone());
         self.known_contacts.insert(peer);
-        for address in card.addresses {
-            self.swarm.add_peer_address(peer, address);
-        }
         let _ = self.events.send(ClientEvent::ContactUpdated {
             contact: ClientContact {
                 peer_id: key,
@@ -5525,6 +5538,7 @@ impl Node {
             display_name,
             peers,
             pending_contact_requests,
+            pending_invite_cards,
             pending_accounts,
             reconnect_at,
             reconnect_attempts,
@@ -5612,10 +5626,16 @@ impl Node {
                 }
             }
             ClientCommand::AcceptContactRequest { peer } => {
+                let invite_card = pending_invite_cards.remove(&peer);
                 if let Some(name) = pending_contact_requests.remove(&peer) {
                     ignored_contacts.remove(&peer);
                     history.allow_contact(&peer.to_string())?;
                     history.ensure_contact(&peer.to_string(), &name, now_ms())?;
+                    // Arrivato con il nostro codice: scheda già verificata,
+                    // si fissa subito la sua chiave ML-DSA.
+                    if let Some(card) = &invite_card {
+                        store_invite_card(history, swarm, card)?;
+                    }
                     // Approvata la persona, i suoi altri dispositivi non
                     // dovranno più chiedere.
                     if let Some(account) = pending_accounts.remove(&peer) {
@@ -5661,6 +5681,7 @@ impl Node {
             }
             ClientCommand::RejectContactRequest { peer } => {
                 pending_contact_requests.remove(&peer);
+                pending_invite_cards.remove(&peer);
                 pending_accounts.remove(&peer);
                 // Il rifiuto resta dopo un riavvio e arriva agli altri
                 // dispositivi: lo stesso sconosciuto non può richiedere di nuovo.
@@ -5683,6 +5704,8 @@ impl Node {
                     let _ = events.send(ClientEvent::ContactRequest {
                         peer_id: peer.to_string(),
                         name: name.clone(),
+                        fingerprint: peer_fingerprint(*peer),
+                        via_invite: pending_invite_cards.contains_key(peer),
                     });
                 }
             }
@@ -7435,6 +7458,28 @@ fn contact_addresses(
         .collect::<Vec<_>>();
     addresses.dedup();
     addresses
+}
+
+/// Fissa la chiave ML-DSA di una scheda d'invito verificata e salva il
+/// contatto con il suo link, così si ricollega anche dopo un riavvio.
+fn store_invite_card(
+    history: &History,
+    swarm: &mut Swarm<Behaviour>,
+    card: &contacts::InviteCard,
+) -> Result<(), Box<dyn Error>> {
+    let key = card.peer_id.to_string();
+    match history.pq_identity(&key)? {
+        Some(pinned) if pinned != card.ml_dsa_public_key => {
+            return Err("la chiave ML-DSA del contatto è cambiata".into())
+        }
+        Some(_) => {}
+        None => history.pin_pq_identity(&key, &card.ml_dsa_public_key)?,
+    }
+    history.save_contact(&key, &card.name, &card.link, now_ms())?;
+    for address in &card.addresses {
+        swarm.add_peer_address(card.peer_id, address.clone());
+    }
+    Ok(())
 }
 
 fn connect_contact(
@@ -10476,23 +10521,44 @@ mod tests {
                 assert!(!inviter);
                 assert_eq!(message, invite::INVITE_WRONG_CODE);
 
-                let ClientEvent::InviteCompleted { peer_id, name } =
-                    join_invite(&mut bob, &code).await
+                let ClientEvent::InviteCompleted {
+                    peer_id,
+                    name,
+                    inviter,
+                } = join_invite(&mut bob, &code).await
                 else {
                     panic!("il codice giusto deve funzionare");
                 };
                 assert_eq!(peer_id, alice.peer.to_string());
                 assert_eq!(name, "alice");
-                let ClientEvent::InviteCompleted { peer_id, .. } = alice
-                    .until(|event| matches!(event, ClientEvent::InviteCompleted { .. }))
+                assert!(!inviter);
+
+                // Chi ha creato il codice deve comunque approvare: il codice
+                // potrebbe essere stato rubato.
+                let ClientEvent::ContactRequest {
+                    peer_id,
+                    fingerprint,
+                    via_invite,
+                    ..
+                } = alice
+                    .until(|event| matches!(event, ClientEvent::ContactRequest { .. }))
                     .await
                 else {
                     unreachable!()
                 };
                 assert_eq!(peer_id, bob.peer.to_string());
+                assert_eq!(fingerprint, peer_fingerprint(bob.peer));
+                assert!(via_invite);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(1500), bob.until_secure())
+                        .await
+                        .is_err(),
+                    "nessun canale cifrato prima dell'approvazione"
+                );
+                alice.send(ClientCommand::AcceptContactRequest { peer: bob.peer });
 
-                // Canale cifrato senza accettare richieste: la chiave ML-DSA
-                // fissata dalla scheda coincide con quella dell'handshake.
+                // La chiave ML-DSA fissata dalla scheda coincide con quella
+                // dell'handshake.
                 alice.until_secure().await;
                 bob.until_secure().await;
                 bob.send(ClientCommand::SendText {

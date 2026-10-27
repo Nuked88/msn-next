@@ -3601,6 +3601,11 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
   font-size: 0.5rem;
 }
 
+.contact-request-fingerprint {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  opacity: 0.8;
+}
+
 .invite-code {
   display: block;
   margin: 12px 0 4px;

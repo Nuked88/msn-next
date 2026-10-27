@@ -171,7 +171,7 @@
   type ClientEvent =
     | { type: 'started'; peerId: string; displayName: string; fingerprint: string }
     | { type: 'contactUpdated'; contact: Omit<Contact, 'unread'> }
-    | { type: 'contactRequest'; peerId: string; name: string }
+    | { type: 'contactRequest'; peerId: string; name: string; fingerprint: string; viaInvite: boolean }
     | { type: 'messageDeleted'; peerId: string; eventId: string }
     | { type: 'contactStatus'; peerId: string; status: string }
     | { type: 'conversationLoaded'; peerId: string; messages: ClientMessage[] }
@@ -181,7 +181,7 @@
     | { type: 'emoticonRemoved'; assetId: string }
     | { type: 'contactLink'; link: string; qrLink: string }
     | { type: 'invite'; code: string; expiresAtMs: number }
-    | { type: 'inviteCompleted'; peerId: string; name: string }
+    | { type: 'inviteCompleted'; peerId: string; name: string; inviter: boolean }
     | { type: 'inviteFailed'; inviter: boolean; message: string }
     | { type: 'deviceLink'; link: string; qrLink: string; expiresAtMs: number }
     | { type: 'devicesUpdated'; devices: LinkedDevice[] }
@@ -462,7 +462,7 @@
   let rosterOpen = false
   let linkRequested = false
   let toastText = ''
-  let contactRequests: { peerId: string; name: string }[] = []
+  let contactRequests: { peerId: string; name: string; fingerprint: string; viaInvite: boolean }[] = []
   const deleteEveryoneWindowMs = 15 * 60 * 1000
   let messageMenu: { message: ChatMessage; x: number; y: number } | null = null
   let contactStatuses: Record<string, string> = {}
@@ -956,7 +956,7 @@
     }
     if (event.type === 'contactRequest') {
       if (!contactRequests.some((request) => request.peerId === event.peerId)) {
-        contactRequests = [...contactRequests, { peerId: event.peerId, name: event.name }]
+        contactRequests = [...contactRequests, { peerId: event.peerId, name: event.name, fingerprint: event.fingerprint, viaInvite: event.viaInvite }]
       }
       return
     }
@@ -1022,7 +1022,7 @@
     if (event.type === 'inviteCompleted') {
       resetInvite()
       connectOpen = false
-      showToast($t('toast.inviteCompleted', { name: event.name }))
+      showToast($t(event.inviter ? 'toast.inviteRedeemed' : 'toast.inviteCompleted', { name: event.name }))
       return
     }
     if (event.type === 'inviteFailed') {
@@ -3324,7 +3324,8 @@
         <span class="avatar-shell contact-request-avatar"><span>{request.name.slice(0, 1).toUpperCase()}</span></span>
         <div class="contact-request-copy">
           <strong id="contact-request-title">{$t('contactRequest.title')}</strong>
-          <small>{$t('contactRequest.wants', { name: request.name })}</small>
+          <small>{$t(request.viaInvite ? 'contactRequest.usedInvite' : 'contactRequest.wants', { name: request.name })}</small>
+          <small class="contact-request-fingerprint">{$t('contactRequest.fingerprint', { fingerprint: request.fingerprint })}</small>
         </div>
         <div class="contact-request-actions">
           <button class="secondary-button" onclick={() => rejectContactRequest(request.peerId)}>{$t('offer.decline')}</button>
@@ -3339,7 +3340,8 @@
           <span class="avatar-shell contact-avatar"><span>{request.name.slice(0, 1).toUpperCase()}</span></span>
           <div class="contact-request-copy">
             <strong>{$t('contactRequest.title')}</strong>
-            <small>{$t('contactRequest.wants', { name: request.name })}</small>
+            <small>{$t(request.viaInvite ? 'contactRequest.usedInvite' : 'contactRequest.wants', { name: request.name })}</small>
+            <small class="contact-request-fingerprint">{$t('contactRequest.fingerprint', { fingerprint: request.fingerprint })}</small>
           </div>
           <div class="contact-request-actions">
             <button class="secondary-button" onclick={() => rejectContactRequest(request.peerId)}>{$t('offer.decline')}</button>
