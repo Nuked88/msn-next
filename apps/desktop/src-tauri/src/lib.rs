@@ -1283,6 +1283,70 @@ fn node_answer_account_rotation(
 }
 
 #[tauri::command]
+fn device_link_preview(link: String) -> Result<msnnext_core::DeviceLinkPreview, String> {
+    msnnext_core::preview_device_link(&link)
+}
+
+/// Esce dall'account su questo dispositivo: ferma il nodo e cancella identità,
+/// chat, file ricevuti, emoticon e profilo. Al prossimo avvio si riparte dal
+/// setup. Quello che non è su un altro dispositivo collegato o in un backup va
+/// perso: l'interfaccia lo dice prima di chiamarlo.
+#[tauri::command]
+fn account_logout(app: AppHandle, state: State<'_, NodeState>) -> Result<(), String> {
+    node_stop(state)?;
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    erase_account_data(&data_dir)?;
+    delete_identity_secret(&data_dir)
+}
+
+/// File e cartelle dell'account dentro la cartella dati dell'app. Restano solo
+/// le preferenze del sistema (autostart).
+fn erase_account_data(data_dir: &Path) -> Result<(), String> {
+    let Ok(entries) = std::fs::read_dir(data_dir) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let account_file = name.starts_with("history.db")
+            || name.starts_with("identity.")
+            || name.starts_with("account-data-before-restore-")
+            || name.starts_with(".history-restore-")
+            || name == "profile-avatar.png"
+            || matches!(name.as_str(), "profile.json" | "downloads" | "emoticons");
+        if !account_file {
+            continue;
+        }
+        let path = entry.path();
+        let removed = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        removed.map_err(|error| format!("{name} could not be deleted: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(desktop)]
+fn delete_identity_secret(_data_dir: &Path) -> Result<(), String> {
+    // Su macOS l'identità è un file (già cancellato); il Keychain può avere
+    // ancora la copia precedente alla migrazione.
+    match identity_entry()?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!("failed to delete from keystore: {error}")),
+    }
+}
+
+#[cfg(not(desktop))]
+fn delete_identity_secret(_data_dir: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[tauri::command]
 fn node_import_device_link(state: State<'_, NodeState>, link: String) -> Result<(), String> {
     send_command(&state, ClientCommand::ImportDeviceLink { link })
 }
@@ -1803,6 +1867,8 @@ pub fn run() {
             node_request_contact_link,
             node_request_device_link,
             node_import_device_link,
+            device_link_preview,
+            account_logout,
             node_revoke_device,
             node_answer_account_rotation,
             scan_contact_qr,
@@ -1898,6 +1964,42 @@ mod tests {
 
         assert_eq!(std::fs::read(data_dir.join("history.db")).unwrap(), history);
         std::fs::remove_dir_all(archive).ok();
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn logout_erases_account_files_and_keeps_system_preferences() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "msnnext-logout-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for dir in ["downloads", "emoticons", "account-data-before-restore-1-2"] {
+            std::fs::create_dir_all(data_dir.join(dir)).unwrap();
+            std::fs::write(data_dir.join(dir).join("file"), b"x").unwrap();
+        }
+        for file in [
+            "history.db",
+            "history.db-wal",
+            "identity.v1.json",
+            "identity.v1.enc",
+            "profile.json",
+            "profile-avatar.png",
+            "autostart.init",
+        ] {
+            std::fs::write(data_dir.join(file), b"x").unwrap();
+        }
+
+        erase_account_data(&data_dir).unwrap();
+
+        let left: Vec<_> = std::fs::read_dir(&data_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec!["autostart.init".to_owned()]);
         std::fs::remove_dir_all(data_dir).ok();
     }
 

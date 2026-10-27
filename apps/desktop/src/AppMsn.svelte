@@ -35,6 +35,7 @@
     ExternalLink,
     Info,
     Link2,
+    LogOut,
     LockKeyhole,
     Menu,
     MessageCircleMore,
@@ -64,6 +65,7 @@
     UserRound,
     UserRoundPlus,
     UsersRound,
+    WifiOff,
     X,
     Zap,
   } from '@lucide/svelte'
@@ -77,6 +79,11 @@
     fingerprint: string
   }
 
+  type DeviceLinkPreview = {
+    name: string
+    peerId: string
+    expiresAtMs: number
+  }
   type LinkedDevice = {
     peerId: string
     name: string
@@ -352,6 +359,19 @@
   let devicePairingQr = ''
   let devicePairingExpiresAt = 0
   let devicePairingBusy = false
+  // Il pairing aperto dal setup usa un account appena creato e vuoto: se lo
+  // si chiude senza collegarsi, quell'account si scarta e si torna al setup.
+  let devicePairingFromSetup = false
+  type ConfirmRequest = {
+    title: string
+    body: string
+    warning?: string
+    confirmLabel: string
+    danger?: boolean
+    resolve: (accepted: boolean) => void
+  }
+  let confirmRequest: ConfirmRequest | null = null
+  let loggingOut = false
   let linkedDevices: LinkedDevice[] = []
   let securityIntroOpen = typeof localStorage !== 'undefined'
     && localStorage.getItem(securityIntroKey) !== 'seen'
@@ -776,6 +796,82 @@
     }
   }
 
+  // Conferma dentro l'app al posto di window.confirm: tradotta, nello stile
+  // dei dialog, e funziona anche dove la webview non mostra quella nativa.
+  function askConfirm(request: Omit<ConfirmRequest, 'resolve'>): Promise<boolean> {
+    confirmRequest?.resolve(false)
+    return new Promise((resolve) => {
+      confirmRequest = { ...request, resolve }
+    })
+  }
+
+  function answerConfirm(accepted: boolean) {
+    const request = confirmRequest
+    confirmRequest = null
+    request?.resolve(accepted)
+  }
+
+  function otherDevicesLine() {
+    return linkedDevices.length
+      ? $t('logout.otherDevices', { devices: linkedDevices.map((device) => device.name).join(', ') })
+      : undefined
+  }
+
+  // Cancella identità, chat e profilo da questo dispositivo e torna al setup.
+  async function eraseAccount(keepName: boolean) {
+    const name = displayName
+    await invoke('account_logout')
+    if (running && effectsSounds) sounds.signOut()
+    running = false
+    peerId = ''
+    ownFingerprint = ''
+    ownContactLink = ''
+    ownContactQr = ''
+    contacts = []
+    conversations = {}
+    chatGroups = []
+    linkedDevices = []
+    contactRequests = []
+    contactStatuses = {}
+    customEmoticons = []
+    offeredEmoticons = []
+    incomingAttachmentOffers = []
+    attachmentPreviews = {}
+    olderAvailable = {}
+    selectedPeerId = ''
+    selectedGroupId = ''
+    detailsOpen = false
+    profileOpen = false
+    statusMenuOpen = false
+    avatarDataUrl = ''
+    notificationMutes = {}
+    localStorage.removeItem(notificationMutesKey)
+    localStorage.removeItem('msnnext-name')
+    displayName = keepName ? name : ''
+  }
+
+  async function logout() {
+    statusMenuOpen = false
+    const accepted = await askConfirm({
+      title: $t('logout.title'),
+      body: $t('logout.body'),
+      warning: otherDevicesLine() ?? $t('logout.lastDevice'),
+      confirmLabel: $t('logout.confirm'),
+      danger: true,
+    })
+    if (!accepted) return
+    loggingOut = true
+    try {
+      await eraseAccount(false)
+      setupOpen = true
+      showToast($t('toast.loggedOut'))
+    } catch (error) {
+      showToast(String(error))
+    } finally {
+      loggingOut = false
+    }
+  }
+
   function closeSecurityIntro() {
     localStorage.setItem(securityIntroKey, 'seen')
     securityIntroOpen = false
@@ -884,11 +980,12 @@
     }
     if (event.type === 'accountRotationRequested') {
       // Chi rifiuta tratta come compromesso il dispositivo che ha chiesto la revoca.
-      const accept = confirm($t('devices.rotation.prompt', {
-        from: event.fromName,
-        revoked: event.revoked.join(', '),
-      }))
-      void invoke('node_answer_account_rotation', { requestId: event.requestId, accept })
+      const { requestId, fromName, revoked } = event
+      void askConfirm({
+        title: $t('devices.rotation.title'),
+        body: $t('devices.rotation.prompt', { from: fromName, revoked: revoked.join(', ') }),
+        confirmLabel: $t('devices.rotation.accept'),
+      }).then((accept) => invoke('node_answer_account_rotation', { requestId, accept }))
         .catch((error) => showToast(String(error)))
       return
     }
@@ -900,6 +997,7 @@
       devicePairingBusy = false
       if (event.paired) {
         devicePairingOpen = false
+        devicePairingFromSetup = false
         showToast($t('toast.deviceLinked'))
       } else if (event.applied) {
         showToast($t('toast.changesSynced', { count: event.applied }))
@@ -1260,7 +1358,12 @@
   }
 
   async function revokeDevice(device: LinkedDevice) {
-    if (!confirm($t('settings.devices.revokeConfirm', { name: device.name }))) return
+    if (!await askConfirm({
+      title: $t('settings.devices.revokeTitle'),
+      body: $t('settings.devices.revokeConfirm', { name: device.name }),
+      confirmLabel: $t('settings.devices.revoke'),
+      danger: true,
+    })) return
     await invoke('node_revoke_device', { peerId: device.peerId }).catch((error) => showToast(String(error)))
   }
 
@@ -1273,7 +1376,12 @@
   async function moderateGroup(memberId: string, value: string) {
     if (!selectedGroupId || !value) return
     const [action, duration] = value.split(':')
-    if (action === 'permaBan' && !confirm($t('confirm.permaBan', { name: memberName(memberId) }))) return
+    if (action === 'permaBan' && !await askConfirm({
+      title: $t('confirm.permaBan', { name: memberName(memberId) }),
+      body: $t('confirm.permaBanBody'),
+      confirmLabel: $t('confirm.ban'),
+      danger: true,
+    })) return
     await invoke('node_moderate_group', {
       groupId: selectedGroupId,
       peerId: memberId,
@@ -1616,13 +1724,23 @@
   }
 
   async function clearGroupConversation() {
-    if (!selectedGroupId || !confirm('Delete this group chat history?')) return
+    if (!selectedGroupId || !await askConfirm({
+      title: $t('confirm.clearGroupTitle'),
+      body: $t('confirm.clearBody'),
+      confirmLabel: $t('confirm.delete'),
+      danger: true,
+    })) return
     await invoke('node_clear_group_conversation', { groupId: selectedGroupId })
       .catch((error) => showToast(String(error)))
   }
 
   async function deleteChatGroup() {
-    if (!selectedGroupId || !confirm('Remove this group chat from this device?')) return
+    if (!selectedGroupId || !await askConfirm({
+      title: $t('confirm.deleteGroupTitle'),
+      body: $t('confirm.deleteGroupBody'),
+      confirmLabel: $t('confirm.remove'),
+      danger: true,
+    })) return
     const id = selectedGroupId
     selectedGroupId = ''
     await invoke('node_delete_chat_group', { groupId: id })
@@ -1689,7 +1807,12 @@
   }
 
   async function deleteEmoticon() {
-    if (!emoticonToSave?.saved || !confirm('Delete this emoticon?')) return
+    if (!emoticonToSave?.saved || !await askConfirm({
+      title: $t('confirm.deleteEmoticonTitle'),
+      body: $t('confirm.deleteEmoticonBody', { trigger: emoticonToSave.trigger }),
+      confirmLabel: $t('confirm.delete'),
+      danger: true,
+    })) return
     pendingEmoticonAction = $t('emo.deleting')
     try {
       await invoke('node_delete_emoticon', { assetId: emoticonToSave.assetId })
@@ -1744,13 +1867,23 @@
   }
 
   async function clearConversation() {
-    if (!selectedPeerId || !confirm('Delete this chat history?')) return
+    if (!selectedPeerId || !await askConfirm({
+      title: $t('confirm.clearChatTitle'),
+      body: $t('confirm.clearBody'),
+      confirmLabel: $t('confirm.delete'),
+      danger: true,
+    })) return
     try { await invoke('node_clear_conversation', { peerId: selectedPeerId }) }
     catch (error) { showToast(String(error)) }
   }
 
   async function deleteContact() {
-    if (!selectedPeerId || !confirm(`Delete ${activeContact?.name || 'this contact'} and their chat?`)) return
+    if (!selectedPeerId || !await askConfirm({
+      title: $t('confirm.deleteContactTitle', { name: activeContact?.name || '' }),
+      body: $t('confirm.deleteContactBody'),
+      confirmLabel: $t('confirm.delete'),
+      danger: true,
+    })) return
     try { await invoke('node_delete_contact', { peerId: selectedPeerId }) }
     catch (error) { showToast(String(error)) }
   }
@@ -1829,11 +1962,12 @@
     }
   }
 
-  function joinDevicePairing() {
+  function joinDevicePairing(fromSetup = false) {
     if (!running) {
       showToast($t('toast.goOnlineLinkThis'))
       return
     }
+    devicePairingFromSetup = fromSetup
     devicePairingMode = 'join'
     devicePairingLink = ''
     devicePairingQr = ''
@@ -1852,18 +1986,89 @@
     if (!running) await startNode()
     if (!running) return
     setupOpen = false
-    joinDevicePairing()
+    joinDevicePairing(true)
+  }
+
+  // Chiuso il pairing aperto dal setup senza collegarsi: l'account vuoto
+  // creato per l'occasione si scarta e si torna al setup.
+  async function closeDevicePairing() {
+    devicePairingOpen = false
+    if (!devicePairingFromSetup) return
+    devicePairingFromSetup = false
+    try {
+      await eraseAccount(true)
+    } catch (error) {
+      showToast(String(error))
+    }
+    setupOpen = true
+  }
+
+  // Questo dispositivo ha già un suo account in uso: chat, contatti o altri
+  // dispositivi. Collegarlo a un altro account li cancellerebbe da qui.
+  function accountInUse() {
+    return contacts.length > 0
+      || chatGroups.length > 0
+      || linkedDevices.length > 0
+      || Object.values(conversations).some((messages) => messages.length > 0)
   }
 
   async function importDevicePairing() {
-    if (!devicePairingLink.trim() || devicePairingBusy) return
+    const link = devicePairingLink.trim()
+    if (!link || devicePairingBusy) return
+    let target: DeviceLinkPreview
+    try {
+      target = await invoke<DeviceLinkPreview>('device_link_preview', { link })
+    } catch (error) {
+      showToast(String(error))
+      return
+    }
+    // Il codice di un contatto è di un'altra persona: mai unire gli account.
+    if (contacts.some((contact) => contact.peerId === target.peerId)) {
+      showToast($t('pairing.contactBlocked', { name: target.name }))
+      return
+    }
+    if (!devicePairingFromSetup && accountInUse()) {
+      const accepted = await askConfirm({
+        title: $t('pairing.switchTitle', { name: target.name }),
+        body: $t('pairing.switchBody', { me: displayName, name: target.name }),
+        warning: otherDevicesLine() ?? $t('logout.lastDevice'),
+        confirmLabel: $t('pairing.switchConfirm'),
+        danger: true,
+      })
+      if (!accepted) return
+      devicePairingBusy = true
+      try {
+        // Esce dall'account attuale e riparte vuoto, con lo stesso nome del
+        // dispositivo: riceverà solo i dati dell'account a cui si collega.
+        await eraseAccount(true)
+        await startNode()
+        if (!running) await waitForStart()
+      } catch (error) {
+        devicePairingBusy = false
+        showToast(String(error))
+        setupOpen = true
+        return
+      }
+    }
     devicePairingBusy = true
     try {
-      await invoke('node_import_device_link', { link: devicePairingLink.trim() })
+      await invoke('node_import_device_link', { link })
     } catch (error) {
       devicePairingBusy = false
       showToast(String(error))
     }
+  }
+
+  function waitForStart(timeoutMs = 15_000): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const started = Date.now()
+      const poll = () => {
+        if (running) resolve()
+        else if (Date.now() - started > timeoutMs) reject(new Error($t('pairing.startTimeout')))
+        else setTimeout(poll, 100)
+      }
+      poll()
+    })
   }
 
   async function scanDevicePairingCamera() {
@@ -2137,10 +2342,11 @@
               <button role="menuitem" onclick={() => setPresenceStatus('busy')}><i class="status-dot" data-status="busy"></i>{$t('status.busy')}</button>
               <button role="menuitem" onclick={() => setPresenceStatus('away')}><i class="status-dot" data-status="away"></i>{$t('status.away')}</button>
               <div class="menu-separator" role="separator"></div>
-              <button role="menuitem" class="danger-item" onclick={() => { statusMenuOpen = false; void stopNode() }}>{$t('action.disconnect')}</button>
+              <button role="menuitem" onclick={() => { statusMenuOpen = false; void stopNode() }}><WifiOff size={14} />{$t('action.goOffline')}</button>
             {:else}
               <button role="menuitem" onclick={() => { statusMenuOpen = false; void startNode(false) }}>{$t('action.connect')}</button>
             {/if}
+            <button role="menuitem" class="danger-item" disabled={loggingOut} onclick={() => void logout()}><LogOut size={14} />{$t('action.disconnect')}</button>
           </div>
         {/if}
       </header>
@@ -2754,7 +2960,7 @@
               {/if}
               <div class="settings-action-row">
                 <button class="secondary-button" disabled={!running} onclick={shareDevicePairing}><QrCode size={14} /> {$t('settings.devices.showCode')}</button>
-                <button class="secondary-button" disabled={!running} onclick={joinDevicePairing}><Link2 size={14} /> {$t('settings.devices.useCode')}</button>
+                <button class="secondary-button" disabled={!running} onclick={() => joinDevicePairing()}><Link2 size={14} /> {$t('settings.devices.useCode')}</button>
               </div>
             </section>
           {:else if settingsSection === 'data'}
@@ -2845,7 +3051,7 @@
 {#if devicePairingOpen}
   <div class="modal-backdrop">
     <div class="modal device-pairing-modal" role="dialog" aria-modal="true" aria-labelledby="device-pairing-title">
-      <button type="button" class="modal-close" aria-label={$t('window.close')} onclick={() => devicePairingOpen = false}><X size={18} /></button>
+      <button type="button" class="modal-close" aria-label={$t('window.close')} onclick={() => void closeDevicePairing()}><X size={18} /></button>
       <div class="modal-heading">
         <span>{#if devicePairingMode === 'share'}<QrCode size={22} />{:else}<Link2 size={22} />{/if}</span>
         <div><p class="step-label">{$t('pairing.step')}</p><h2 id="device-pairing-title">{devicePairingMode === 'share' ? $t('pairing.shareTitle') : $t('pairing.joinTitle')}</h2></div>
@@ -2895,7 +3101,7 @@
   </div>
 {/if}
 
-{#if securityIntroOpen}
+{#if securityIntroOpen && !setupOpen}
   <div class="modal-backdrop security-intro-backdrop">
     <div class="modal security-intro-modal" role="dialog" aria-modal="true" aria-labelledby="security-intro-title">
       <div class="modal-heading">
@@ -2958,6 +3164,24 @@
       {/each}
     </div>
   {/if}
+{/if}
+
+{#if confirmRequest}
+  {@const request = confirmRequest}
+  <div class="modal-backdrop confirm-backdrop">
+    <div class="modal confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-body">
+      <div class="modal-heading">
+        <span class:danger={request.danger}>{#if request.danger}<TriangleAlert size={22} />{:else}<Info size={22} />{/if}</span>
+        <div><h2 id="confirm-title">{request.title}</h2></div>
+      </div>
+      <p id="confirm-body">{request.body}</p>
+      {#if request.warning}<div class="security-caveat"><Info size={16} /><p>{request.warning}</p></div>{/if}
+      <div class="confirm-actions">
+        <button class="secondary-button" onclick={() => answerConfirm(false)}>{$t('confirm.cancel')}</button>
+        <button class={request.danger ? 'danger-button' : 'primary-button'} onclick={() => answerConfirm(true)}>{request.confirmLabel}</button>
+      </div>
+    </div>
+  </div>
 {/if}
 
 {#if toastText}

@@ -314,10 +314,34 @@ pub enum GroupModeration {
     Unban,
 }
 
+const PAIRING_WITH_CONTACT: &str =
+    "questo codice appartiene a un tuo contatto: è un altro account e non si può collegare";
+const PAIRING_WITH_LOCAL_DATA: &str =
+    "questo dispositivo ha già chat o contatti di un altro account: esci dall'account prima di collegarlo";
+
 pub fn parse_peer_id(value: &str) -> Result<PeerId, String> {
     value
         .parse()
         .map_err(|error| format!("peer id non valido: {error}"))
+}
+
+/// Cosa mostra un codice dispositivo prima di usarlo: l'interfaccia lo fa
+/// vedere all'utente per chiedere conferma.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceLinkPreview {
+    pub name: String,
+    pub peer_id: String,
+    pub expires_at_ms: u64,
+}
+
+pub fn preview_device_link(link: &str) -> Result<DeviceLinkPreview, String> {
+    let pairing = devices::parse_pairing_link(link, now_ms()).map_err(|error| error.to_string())?;
+    Ok(DeviceLinkPreview {
+        name: pairing.inviter.name,
+        peer_id: pairing.inviter.peer_id,
+        expires_at_ms: pairing.expires_at_ms,
+    })
 }
 
 pub fn generate_secret() -> [u8; 32] {
@@ -2752,10 +2776,10 @@ impl Node {
                 display_name,
                 contact_addresses(swarm, &args.relays, local_peer_id),
             );
-            let records = history.sync_records_since(0, devices::MAX_SYNC_RECORDS)?;
+            // Chi si collega non porta dati suoi: riceve quelli dell'account.
             let request = DeviceRequest::Pair {
                 device: descriptor,
-                records,
+                records: Vec::new(),
             };
             let sealed = devices::seal(&pairing.secret, &request)?;
             let request_id = swarm.behaviour_mut().devices.send_request(&peer_id, sealed);
@@ -3855,9 +3879,33 @@ impl Node {
                 let response = match selected_key {
                     Some(key) => match devices::open::<DeviceRequest>(&key, &request) {
                         Ok(DeviceRequest::Pair { device, records })
+                            if pairing_key.is_some()
+                                && device.peer_id == peer.to_string()
+                                && (!records.is_empty()
+                                    || history
+                                        .contacts()?
+                                        .iter()
+                                        .any(|contact| contact.peer == peer.to_string())) =>
+                        {
+                            // Un contatto, o un dispositivo che porta chat di
+                            // un altro account, non entra: i due account si
+                            // mescolerebbero. Il codice resta valido.
+                            let reason = if records.is_empty() {
+                                PAIRING_WITH_CONTACT
+                            } else {
+                                PAIRING_WITH_LOCAL_DATA
+                            };
+                            let _ = events.send(ClientEvent::Error {
+                                message: format!(
+                                    "collegamento di {} rifiutato: {reason}",
+                                    device.name
+                                ),
+                            });
+                            devices::seal(&key, &DeviceResponse::Rejected(reason.into()))?
+                        }
+                        Ok(DeviceRequest::Pair { device, .. })
                             if pairing_key.is_some() && device.peer_id == peer.to_string() =>
                         {
-                            let applied = history.apply_sync_records(&records)?;
                             let entry = device_entry(&device, now_ms());
                             history.readmit_device(&peer.to_string())?;
                             revoked_devices.remove(&peer);
@@ -3887,13 +3935,12 @@ impl Node {
                             ));
                             let outgoing =
                                 history.sync_records_since(0, devices::MAX_SYNC_RECORDS)?;
-                            let accepted_through = records.last().map_or(0, |record| record.seq);
                             let payload = DeviceResponse::Paired {
                                 account_key: *account_key,
                                 devices: linked,
                                 records: outgoing,
                                 latest_seq: history.latest_sync_seq()?,
-                                accepted_through,
+                                accepted_through: 0,
                             };
                             refresh_synced_state(
                                 history,
@@ -3923,7 +3970,7 @@ impl Node {
                             )?;
                             let _ = events.send(ClientEvent::DeviceSynchronized {
                                 peer_id: peer.to_string(),
-                                applied: applied.applied,
+                                applied: 0,
                                 paired: true,
                             });
                             // Ri-annuncia la presence firmata ai contatti
@@ -4518,6 +4565,27 @@ impl Node {
                             });
                             return Ok(LoopFlow::Continue);
                         }
+                        // Un codice mostrato da un contatto è di un'altra
+                        // persona: collegarsi unirebbe i due account.
+                        if history
+                            .contacts()?
+                            .iter()
+                            .any(|contact| contact.peer == peer.to_string())
+                        {
+                            let _ = events.send(ClientEvent::Error {
+                                message: PAIRING_WITH_CONTACT.into(),
+                            });
+                            return Ok(LoopFlow::Continue);
+                        }
+                        // Un dispositivo con chat o contatti propri appartiene
+                        // già a un account: va prima svuotato (l'app archivia i
+                        // dati), altrimenti i due account si mescolano.
+                        if history.latest_sync_seq()? > 0 {
+                            let _ = events.send(ClientEvent::Error {
+                                message: PAIRING_WITH_LOCAL_DATA.into(),
+                            });
+                            return Ok(LoopFlow::Continue);
+                        }
                         let addresses = pairing
                             .inviter
                             .addresses
@@ -4532,11 +4600,9 @@ impl Node {
                                 display_name,
                                 contact_addresses(swarm, &args.relays, local_peer_id),
                             );
-                            let records =
-                                history.sync_records_since(0, devices::MAX_SYNC_RECORDS)?;
                             let request = DeviceRequest::Pair {
                                 device: descriptor,
-                                records,
+                                records: Vec::new(),
                             };
                             let sealed = devices::seal(&secret, &request)?;
                             let request_id =
@@ -10056,8 +10122,97 @@ mod tests {
             .await;
     }
 
+    fn history_key_for(dir: &Path) -> [u8; 32] {
+        let bytes = fs::read(dir.join("identity.key")).unwrap();
+        blake3::derive_key("msnnext local history v1", &bytes)
+    }
+
     fn device_config(name: &str, dir: &Path) -> ClientConfig {
         loopback_config(name, dir, None).with_account_key(generate_secret(), |_| Ok(()))
+    }
+
+    /// "Usa codice" da un account già in uso univa le chat dei due account
+    /// e cambiava utente. Ora il codice di un contatto e un dispositivo con
+    /// dati propri vengono rifiutati, e l'account che invita resta intatto.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(windows, ignore = "il teardown libp2p può bloccare l'harness Windows")]
+    async fn pairing_never_mixes_two_accounts() {
+        let root = test_root("pair-isolation");
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut alice = TestNode::start(device_config("Alice", &root.join("alice"))).await;
+                let mut bob = TestNode::start(device_config("Bob", &root.join("bob"))).await;
+                let mut carol = TestNode::start(device_config("Carol", &root.join("carol"))).await;
+                let mut dave = TestNode::start(device_config("Dave", &root.join("dave"))).await;
+                connect_pair(&mut alice, &mut bob).await;
+                connect_pair(&mut carol, &mut dave).await;
+                dave.send(ClientCommand::SendText {
+                    peer: carol.peer,
+                    text: "solo per carol".into(),
+                });
+                carol.until_text("solo per carol").await;
+
+                alice.send(ClientCommand::RequestDeviceLink);
+                let ClientEvent::DeviceLink { link, .. } = alice
+                    .until(|event| matches!(event, ClientEvent::DeviceLink { .. }))
+                    .await
+                else {
+                    unreachable!()
+                };
+                assert_eq!(preview_device_link(&link).unwrap().name, "Alice");
+
+                // Bob è un contatto di Alice: è un'altra persona.
+                bob.send(ClientCommand::ImportDeviceLink { link: link.clone() });
+                let ClientEvent::Error { message } = bob
+                    .until(|event| matches!(event, ClientEvent::Error { .. }))
+                    .await
+                else {
+                    unreachable!()
+                };
+                assert_eq!(message, PAIRING_WITH_CONTACT);
+
+                // Carol ha già un suo account con chat: non le porta ad Alice.
+                carol.send(ClientCommand::ImportDeviceLink { link: link.clone() });
+                let ClientEvent::Error { message } = carol
+                    .until(|event| matches!(event, ClientEvent::Error { .. }))
+                    .await
+                else {
+                    unreachable!()
+                };
+                assert_eq!(message, PAIRING_WITH_LOCAL_DATA);
+
+                // Il codice resta valido per un dispositivo nuovo, che riceve
+                // le chat di Alice e nessuna di Carol.
+                let mut laptop =
+                    TestNode::start(device_config("Laptop", &root.join("laptop"))).await;
+                laptop.send(ClientCommand::ImportDeviceLink { link });
+                laptop
+                    .until(|event| {
+                        matches!(event, ClientEvent::DeviceSynchronized { paired: true, .. })
+                    })
+                    .await;
+
+                let (carol_peer, dave_peer) = (carol.peer, dave.peer);
+                for node in [alice, bob, carol, dave, laptop] {
+                    node.shutdown().await;
+                }
+                let alice_history = History::open(
+                    &root.join("alice").join("history.db"),
+                    history_key_for(&root.join("alice")),
+                )
+                .unwrap();
+                let foreign = [carol_peer.to_string(), dave_peer.to_string()];
+                let leaked = alice_history
+                    .contacts()
+                    .unwrap()
+                    .into_iter()
+                    .filter(|contact| foreign.contains(&contact.peer))
+                    .count();
+                assert_eq!(leaked, 0, "i contatti di Carol sono finiti da Alice");
+            })
+            .await;
+        fs::remove_dir_all(root).ok();
     }
 
     /// Audit #19: un dispositivo perso restava autorizzato per sempre. Ora si
