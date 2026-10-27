@@ -54,9 +54,8 @@ jobs:
     needs: create-release
     strategy:
       fail-fast: false
-      # Serializza: i job aggiornano lo stesso latest.json sulla release; in
-      # parallelo andrebbe in race sull'asset. Affidabile, ~3x più lento.
-      max-parallel: 1
+      # I tre job girano in parallelo: nessuno tocca latest.json, che viene
+      # scritto una volta sola dal job publish.
       matrix:
         include:
           - name: Windows x64
@@ -101,6 +100,9 @@ jobs:
 
       - name: Cache Rust dependencies and build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Come in ci.yml: salva solo da main, così la cache resta riusabile.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Linux dependencies
         if: runner.os == 'Linux'
@@ -129,7 +131,9 @@ jobs:
           args: ${{ matrix.bundles }} ${{ github.event_name == 'pull_request' && '--config {"bundle":{"createUpdaterArtifacts":false}}' || '' }}
           # Carica tutti sulla stessa release creata dal job precedente.
           releaseId: ${{ needs.create-release.outputs.release_id }}
-          updaterJsonPreferNsis: true
+          # latest.json lo genera il job publish: caricato da ogni job in
+          # parallelo andrebbe in race sullo stesso asset.
+          includeUpdaterJson: false
 
       - name: Upload bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -144,6 +148,53 @@ jobs:
     needs: [create-release, build]
     runs-on: ubuntu-latest
     steps:
+      - name: Upload updater latest.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+          VERSION: ${{ needs.create-release.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, datetime
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          release = os.environ["RELEASE_ID"]
+          version = os.environ["VERSION"]
+
+          def api(*args):
+              return subprocess.run(["gh", "api", *args], check=True, capture_output=True, text=True).stdout
+
+          assets = {a["name"]: a for a in json.loads(api(f"repos/{repo}/releases/{release}/assets", "--paginate"))}
+
+          def entry(name):
+              sig = api("-H", "Accept: application/octet-stream", assets[name + ".sig"]["url"]).strip()
+              url = f"https://github.com/{repo}/releases/download/v{version}/{name}"
+              return {"signature": sig, "url": url}
+
+          exe = entry(f"msnnext_{version}_x64-setup.exe")
+          appimage = entry(f"msnnext_{version}_amd64.AppImage")
+          deb = entry(f"msnnext_{version}_amd64.deb")
+          mac = entry("msnnext_universal.app.tar.gz")
+          platforms = {
+              "windows-x86_64": exe,
+              "windows-x86_64-nsis": exe,
+              "linux-x86_64": appimage,
+              "linux-x86_64-appimage": appimage,
+              "linux-x86_64-deb": deb,
+              "darwin-aarch64": mac,
+              "darwin-x86_64": mac,
+              "darwin-aarch64-app": mac,
+              "darwin-x86_64-app": mac,
+          }
+          pub_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+          with open("latest.json", "w") as f:
+              json.dump({"version": version, "notes": "", "pub_date": pub_date, "platforms": platforms}, f, indent=2)
+          PY
+          cat latest.json
+          # Upload per id: la release è ancora una bozza.
+          gh api --method POST -H "Content-Type: application/json" --input latest.json \
+            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=latest.json" > /dev/null
+
       - name: Publish complete release
         env:
           GH_TOKEN: ${{ github.token }}
