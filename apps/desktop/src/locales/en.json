@@ -427,5 +427,9 @@
   "subtitle.protected": "Protected conversation",
   "subtitle.connecting": "Connecting…",
   "subtitle.offline": "Offline",
-  "confirm.permaBan": "Permanently ban {name}?"
+  "confirm.permaBan": "Permanently ban {name}?",
+  "settings.devices.revoke": "Revoke",
+  "settings.devices.revokeConfirm": "Revoke {name}? It will no longer sync or present itself as you to your contacts. Your other devices will be asked to confirm.",
+  "devices.rotation.prompt": "{from} revoked: {revoked}.\n\nOK if it was you. Cancel if you don't recognise it: {from} will be revoked instead.",
+  "toast.deviceRevoked": "Device revoked"
 }

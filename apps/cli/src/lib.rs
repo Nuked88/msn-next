@@ -17,7 +17,10 @@ use crypto::{
     verify_account_proof, AccountIdentity, HybridInitiator, HybridResponse, RatchetMessage,
     RatchetSession, SessionKey,
 };
-use devices::{DeviceDescriptor, DeviceRequest, DeviceResponse, PairingLink, SealedDeviceMessage};
+use devices::{
+    AccountRotation, DeviceDescriptor, DeviceRequest, DeviceResponse, PairingLink, RevokedDevice,
+    SealedDeviceMessage,
+};
 use futures::StreamExt;
 use history::{ContactEntry, DeviceEntry, GroupChatEntry, History};
 use libp2p::{
@@ -220,6 +223,18 @@ pub enum ClientCommand {
     UpdateDisplayName {
         name: String,
     },
+    /// Esclude un dispositivo collegato (perso, venduto) e cambia la chiave di
+    /// account, così quel dispositivo non può più sincronizzarsi né firmare
+    /// a nome dell'account.
+    RevokeDevice {
+        peer: PeerId,
+    },
+    /// Risposta dell'utente a una rotazione arrivata da un altro dispositivo:
+    /// se rifiuta, il dispositivo che l'ha chiesta viene revocato.
+    AnswerAccountRotation {
+        request_id: u64,
+        accept: bool,
+    },
     /// Solo test: dimentica la sessione cifrata con un peer, come dopo un
     /// riavvio dell'altro lato o un handshake concorrente.
     #[cfg(test)]
@@ -284,6 +299,8 @@ impl ClientCommand {
             | Self::RequestDeviceLink
             | Self::ImportDeviceLink { .. }
             | Self::UpdateDisplayName { .. }
+            | Self::RevokeDevice { .. }
+            | Self::AnswerAccountRotation { .. }
             | Self::Shutdown => None,
         }
     }
@@ -482,6 +499,17 @@ pub enum ClientEvent {
         applied: usize,
         paired: bool,
     },
+    /// Un altro dispositivo dell'account chiede di revocarne alcuni e di
+    /// adottare una nuova chiave: serve la conferma dell'utente.
+    AccountRotationRequested {
+        request_id: u64,
+        from_peer_id: String,
+        from_name: String,
+        revoked: Vec<String>,
+    },
+    DeviceRevoked {
+        peer_id: String,
+    },
     AttachmentReceived {
         peer_id: String,
         id: String,
@@ -631,6 +659,9 @@ enum PendingDeviceRequest {
         target: PeerId,
         message: TextMessage,
     },
+    /// Avviso di rotazione a un altro dispositivo: sigillato con la chiave
+    /// ormai ritirata, la risposta non porta informazioni.
+    Rotate,
 }
 
 struct PendingPairing {
@@ -919,8 +950,10 @@ async fn run_node(
     let sent_numbers = HashMap::<PeerId, u64>::new();
     let pending_offers = HashMap::<request_response::OutboundRequestId, PendingOffer>::new();
     let pending_transfers = HashMap::<request_response::OutboundRequestId, PendingTransfer>::new();
-    let pending_handshakes =
-        HashMap::<request_response::OutboundRequestId, (PeerId, HybridInitiator)>::new();
+    let pending_handshakes = Handshakes::new(
+        crypto::MlDsaIdentity::from_seed(&ml_dsa_seed)?,
+        args.session_rekey_interval,
+    );
     // Tentativi di handshake per peer: consente il retry se il primo invio
     // fallisce (frequente su mobile finché la connessione non è stabile).
     let handshake_retries = HashMap::<PeerId, u8>::new();
@@ -937,8 +970,9 @@ async fn run_node(
     let auto_accept_extensions = HashSet::<String>::new();
     // Stato di presenza comunicato ai contatti: "online" | "busy" | "away".
     let presence_status = String::from("online");
+    // (peer, chiave, rinnovo di una sessione attiva)
     let pending_inbound_handshakes =
-        HashMap::<request_response::InboundRequestId, (PeerId, SessionKey)>::new();
+        HashMap::<request_response::InboundRequestId, (PeerId, SessionKey, bool)>::new();
     let sessions = HashMap::<PeerId, RatchetSession>::new();
     // Errori di decifratura consecutivi per peer: oltre una soglia la sessione
     // è considerata rotta e si rifà l'handshake invece di rifiutare per sempre.
@@ -1077,7 +1111,15 @@ async fn run_node(
     let _ = events.send(ClientEvent::EmoticonCatalog { emoticons });
     let _ = events.send(ClientEvent::Ready);
 
+    let revoked_devices = history
+        .revoked_devices()?
+        .into_iter()
+        .filter_map(|(peer, _)| peer.parse::<PeerId>().ok())
+        .collect::<HashSet<_>>();
     let mut node = Node {
+        revoked_devices,
+        pending_rotations: HashMap::new(),
+        rotation_counter: 0,
         ml_dsa_identity,
         contact_identity,
         account_key,
@@ -1223,7 +1265,7 @@ struct Node {
     sent_numbers: HashMap<PeerId, u64>,
     pending_offers: HashMap<request_response::OutboundRequestId, PendingOffer>,
     pending_transfers: HashMap<request_response::OutboundRequestId, PendingTransfer>,
-    pending_handshakes: HashMap<request_response::OutboundRequestId, (PeerId, HybridInitiator)>,
+    pending_handshakes: Handshakes,
     handshake_retries: HashMap<PeerId, u8>,
     outbox: HashMap<PeerId, VecDeque<(ChatEvent, u8)>>,
     pending_messages: HashMap<request_response::OutboundRequestId, PendingMessage>,
@@ -1234,7 +1276,8 @@ struct Node {
     held_responses: Vec<request_response::ResponseChannel<ProtocolResponse>>,
     auto_accept_extensions: HashSet<String>,
     presence_status: String,
-    pending_inbound_handshakes: HashMap<request_response::InboundRequestId, (PeerId, SessionKey)>,
+    pending_inbound_handshakes:
+        HashMap<request_response::InboundRequestId, (PeerId, SessionKey, bool)>,
     sessions: HashMap<PeerId, RatchetSession>,
     decrypt_failures: HashMap<PeerId, u8>,
     shared_emoticons: HashSet<(PeerId, [u8; 32])>,
@@ -1260,6 +1303,9 @@ struct Node {
     online_devices: HashSet<PeerId>,
     known_devices: HashMap<PeerId, DeviceEntry>,
     device_sync_tick: tokio::time::Interval,
+    revoked_devices: HashSet<PeerId>,
+    pending_rotations: HashMap<u64, (PeerId, AccountRotation)>,
+    rotation_counter: u64,
     handshake_tick: tokio::time::Interval,
     args: ClientConfig,
     commands: mpsc::UnboundedReceiver<ClientCommand>,
@@ -1516,6 +1562,7 @@ impl Node {
                         | PendingDeviceRequest::Relay {
                             peer: pending_peer, ..
                         } => pending_peer == peer,
+                        PendingDeviceRequest::Rotate => false,
                     })
             })
             .collect::<Vec<_>>();
@@ -1644,6 +1691,7 @@ impl Node {
                 );
             }
         }
+        pending_handshakes.rekey_due_sessions(swarm, sessions, local_peer_id);
         Ok(LoopFlow::Continue)
     }
 
@@ -1955,6 +2003,10 @@ impl Node {
                 | ClientCommand::RejectAttachment { .. }),
             ) => return self.on_attachment_command(command),
             Some(ClientCommand::Shutdown) => return Ok(LoopFlow::Stop),
+            Some(ClientCommand::RevokeDevice { peer }) => return self.revoke_device(peer),
+            Some(ClientCommand::AnswerAccountRotation { request_id, accept }) => {
+                return self.answer_account_rotation(request_id, accept);
+            }
             #[cfg(test)]
             Some(ClientCommand::ForgetSession { peer }) => {
                 sessions.remove(&peer);
@@ -2173,9 +2225,9 @@ impl Node {
                     let was_application_peer = peers.remove(&peer_id);
                     sessions.remove(&peer_id);
                     shared_emoticons.retain(|(peer, _)| *peer != peer_id);
-                    pending_handshakes.retain(|_, (pending_peer, _)| *pending_peer != peer_id);
+                    pending_handshakes.forget(peer_id);
                     pending_inbound_handshakes
-                        .retain(|_, (pending_peer, _)| *pending_peer != peer_id);
+                        .retain(|_, (pending_peer, _, _)| *pending_peer != peer_id);
                     handshake_retries.remove(&peer_id);
                     decrypt_failures.remove(&peer_id);
                     if !contact_devices.online(contact_devices.canonical(peer_id), peers) {
@@ -2340,8 +2392,7 @@ impl Node {
                     ..
                 },
             )) => {
-                pending_handshakes.remove(&request_id);
-                log::warn!("handshake ibrido fallito con {peer}: {error}");
+                pending_handshakes.pending.remove(&request_id);
                 log::warn!("handshake ibrido fallito con {peer}: {error}");
                 // Riprova finché il peer è connesso e non è già cifrato: evita
                 // di restare bloccati su "preparazione" per un invio transitorio.
@@ -2376,13 +2427,20 @@ impl Node {
                     peer, request_id, ..
                 },
             )) => {
-                if let Some((expected_peer, session_key)) =
+                if let Some((expected_peer, session_key, rekey)) =
                     pending_inbound_handshakes.remove(&request_id)
                 {
                     if expected_peer == peer {
-                        sessions
-                            .insert(peer, RatchetSession::new(session_key, local_peer_id, peer));
-                        log::info!("handshake ibrido completato: {peer}");
+                        let session = RatchetSession::new(session_key, local_peer_id, peer);
+                        if rekey && sessions.contains_key(&peer) {
+                            // Si continua a cifrare con la vecchia finché
+                            // l'iniziatore non usa la nuova: i messaggi già
+                            // in volo restano decifrabili da entrambi.
+                            pending_handshakes.stage(peer, session);
+                            log::info!("sessione rinnovata (responder): {peer}");
+                            return Ok(LoopFlow::Continue);
+                        }
+                        pending_handshakes.install(sessions, peer, session, false);
                         log::info!("handshake ibrido completato (responder): {peer}");
                         let contact = contact_devices.canonical(peer);
                         let _ = events.send(ClientEvent::ContactUpdated {
@@ -2683,6 +2741,7 @@ impl Node {
                     PendingDeviceRequest::Pair { peer, .. }
                     | PendingDeviceRequest::Sync { peer }
                     | PendingDeviceRequest::Relay { peer, .. } => *peer == peer_id,
+                    PendingDeviceRequest::Rotate => false,
                 });
         if let Some(pairing) = pending_pair_targets
             .get(&peer_id)
@@ -3052,13 +3111,7 @@ impl Node {
                     if ignored_contacts.contains(&peer) || ignored_contacts.contains(&contact) {
                         Err("contatto rimosso")
                     } else {
-                        sessions
-                            .get_mut(&peer)
-                            .ok_or(REJECT_NO_SESSION)
-                            .and_then(|session| {
-                                decrypt_envelope(session, peer, local_peer_id, &request)
-                                    .map_err(|_| REJECT_UNDECRYPTABLE)
-                            })
+                        pending_handshakes.decrypt(sessions, peer, local_peer_id, &request)
                     };
                 match &envelope {
                     Ok(_) => {
@@ -3504,6 +3557,9 @@ impl Node {
     ) -> Result<LoopFlow, Box<dyn Error>> {
         let Node {
             history,
+            display_name,
+            presence_status,
+            account_proof,
             ignored_contacts,
             local_peer_id,
             swarm,
@@ -3545,11 +3601,24 @@ impl Node {
                             None,
                         )
                     } else {
-                        match respond_hybrid(&request, peer, local_peer_id) {
+                        match respond_hybrid(
+                            &request,
+                            peer,
+                            local_peer_id,
+                            &pending_handshakes.identity,
+                        )
+                        .map_err(|error| error.to_string())
+                        .and_then(|(hello, handshaked)| {
+                            pin_pq_identity(history, peer, handshaked.peer_ml_dsa_key.as_deref())?;
+                            Ok((hello, handshaked.key))
+                        }) {
                             Ok((hello, session_key)) => {
                                 (HybridResponse::Accepted(hello), Some(session_key))
                             }
-                            Err(error) => (HybridResponse::Rejected(error.to_string()), None),
+                            Err(error) => {
+                                log::warn!("handshake da {peer} rifiutato: {error}");
+                                (HybridResponse::Rejected(error), None)
+                            }
                         }
                     };
                 if swarm
@@ -3559,7 +3628,8 @@ impl Node {
                     .is_ok()
                 {
                     if let Some(session_key) = pending_key {
-                        pending_inbound_handshakes.insert(request_id, (peer, session_key));
+                        pending_inbound_handshakes
+                            .insert(request_id, (peer, session_key, request.rekey));
                     }
                 } else {
                     log::warn!("risposta handshake non consegnata a {peer}");
@@ -3569,7 +3639,8 @@ impl Node {
                 request_id,
                 response,
             } => {
-                let Some((expected_peer, initiator)) = pending_handshakes.remove(&request_id)
+                let Some((expected_peer, initiator)) =
+                    pending_handshakes.pending.remove(&request_id)
                 else {
                     return Ok(LoopFlow::Continue);
                 };
@@ -3578,66 +3649,100 @@ impl Node {
                     return Ok(LoopFlow::Continue);
                 }
                 match response {
-                    HybridResponse::Accepted(hello) => match initiator.finish(&hello) {
-                        Ok(session_key) => {
-                            sessions.insert(
-                                peer,
-                                RatchetSession::new(session_key, local_peer_id, peer),
-                            );
-                            handshake_retries.remove(&peer);
-                            log::info!("handshake ibrido completato: {peer}");
-                            log::info!("handshake ibrido completato: {peer}");
-                            let contact = contact_devices.canonical(peer);
-                            let _ = events.send(ClientEvent::ContactUpdated {
-                                contact: ClientContact {
-                                    peer_id: contact.to_string(),
-                                    name: peer_names
-                                        .get(&contact)
-                                        .cloned()
-                                        .unwrap_or_else(|| "Contatto".into()),
-                                    online: true,
-                                    secure: true,
-                                    fingerprint: peer_fingerprint(contact),
-                                },
-                            });
-                            send_group_definitions_for_peer(
-                                history,
-                                swarm,
-                                sessions,
-                                contact_devices,
-                                sent_numbers,
-                                local_peer_id,
-                                peer,
-                            );
-                            flush_outbox(
-                                swarm,
-                                sessions,
-                                contact_devices,
-                                sent_numbers,
-                                pending_messages,
-                                outbox,
-                                local_peer_id,
-                                peer,
-                            );
-                            for offer in take_waiting_offers(waiting_offers, contact_devices, peer)
-                            {
-                                offer_file(
+                    HybridResponse::Accepted(hello) => {
+                        // Il responder tiene la sessione nuova in attesa
+                        // finché non la vede usata: se l'hello era un
+                        // rinnovo, gli si manda subito un messaggio.
+                        let rekey = initiator.rekey();
+                        match initiator
+                            .finish(&hello)
+                            .map_err(|error| error.to_string())
+                            .and_then(|handshaked| {
+                                pin_pq_identity(
+                                    history,
+                                    peer,
+                                    handshaked.peer_ml_dsa_key.as_deref(),
+                                )?;
+                                Ok(handshaked.key)
+                            }) {
+                            Ok(session_key) => {
+                                pending_handshakes.install(
+                                    sessions,
+                                    peer,
+                                    RatchetSession::new(session_key, local_peer_id, peer),
+                                    rekey,
+                                );
+                                handshake_retries.remove(&peer);
+                                log::info!("handshake ibrido completato: {peer}");
+                                if rekey {
+                                    send_event(
+                                        swarm,
+                                        sessions,
+                                        contact_devices,
+                                        peer,
+                                        local_peer_id,
+                                        sent_numbers,
+                                        ChatEvent::Presence(presence_update(
+                                            display_name,
+                                            presence_status,
+                                            true,
+                                            account_proof,
+                                        )),
+                                    );
+                                }
+                                let contact = contact_devices.canonical(peer);
+                                let _ = events.send(ClientEvent::ContactUpdated {
+                                    contact: ClientContact {
+                                        peer_id: contact.to_string(),
+                                        name: peer_names
+                                            .get(&contact)
+                                            .cloned()
+                                            .unwrap_or_else(|| "Contatto".into()),
+                                        online: true,
+                                        secure: true,
+                                        fingerprint: peer_fingerprint(contact),
+                                    },
+                                });
+                                send_group_definitions_for_peer(
+                                    history,
                                     swarm,
                                     sessions,
                                     contact_devices,
                                     sent_numbers,
-                                    pending_offers,
-                                    history,
-                                    events,
                                     local_peer_id,
-                                    offer,
+                                    peer,
                                 );
+                                flush_outbox(
+                                    swarm,
+                                    sessions,
+                                    contact_devices,
+                                    sent_numbers,
+                                    pending_messages,
+                                    outbox,
+                                    local_peer_id,
+                                    peer,
+                                );
+                                for offer in
+                                    take_waiting_offers(waiting_offers, contact_devices, peer)
+                                {
+                                    offer_file(
+                                        swarm,
+                                        sessions,
+                                        contact_devices,
+                                        sent_numbers,
+                                        pending_offers,
+                                        history,
+                                        events,
+                                        local_peer_id,
+                                        offer,
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                log::warn!("handshake ibrido fallito con {peer}: {error}")
                             }
                         }
-                        Err(error) => {
-                            log::warn!("handshake ibrido fallito con {peer}: {error}")
-                        }
-                    },
+                    }
                     HybridResponse::Rejected(error) => {
                         log::warn!("handshake ibrido rifiutato da {peer}: {error:?}");
                     }
@@ -3653,6 +3758,7 @@ impl Node {
         message: request_response::Message<SealedDeviceMessage, SealedDeviceMessage>,
     ) -> Result<LoopFlow, Box<dyn Error>> {
         let Node {
+            revoked_devices,
             account_key,
             history,
             ignored_contacts,
@@ -3691,7 +3797,53 @@ impl Node {
             request_response::Message::Request {
                 request, channel, ..
             } => {
+                if revoked_devices.contains(&peer)
+                    && !pending_pairings.contains_key(&request.key_id)
+                {
+                    let response = devices::seal(
+                        &[0u8; 32],
+                        &DeviceResponse::Rejected("dispositivo revocato".into()),
+                    )?;
+                    swarm
+                        .behaviour_mut()
+                        .devices
+                        .send_response(channel, response)
+                        .ok();
+                    return Ok(LoopFlow::Continue);
+                }
                 pending_pairings.retain(|_, pairing| pairing.expires_at_ms >= now_ms());
+                // Sigillata con una chiave di account ritirata: il mittente è
+                // un nostro dispositivo rimasto indietro e riceve la nuova.
+                if request.key_id != devices::key_id(account_key)
+                    && !pending_pairings.contains_key(&request.key_id)
+                {
+                    if let Some(retired) = history.retired_account_key(&request.key_id)? {
+                        let reply = match devices::open::<DeviceRequest>(&retired, &request) {
+                            Ok(DeviceRequest::Sync { device, .. })
+                                if device.peer_id == peer.to_string()
+                                    && known_devices.contains_key(&peer) =>
+                            {
+                                DeviceResponse::RotationRequired {
+                                    rotation: AccountRotation {
+                                        account_key: *account_key,
+                                        revoked: revoked_list(history)?,
+                                        from_name: display_name.clone(),
+                                    },
+                                }
+                            }
+                            _ => {
+                                DeviceResponse::Rejected("chiave di account non più valida".into())
+                            }
+                        };
+                        let response = devices::seal(&retired, &reply)?;
+                        swarm
+                            .behaviour_mut()
+                            .devices
+                            .send_response(channel, response)
+                            .ok();
+                        return Ok(LoopFlow::Continue);
+                    }
+                }
                 let pairing_key = pending_pairings
                     .get(&request.key_id)
                     .map(|pairing| pairing.secret);
@@ -3707,6 +3859,8 @@ impl Node {
                         {
                             let applied = history.apply_sync_records(&records)?;
                             let entry = device_entry(&device, now_ms());
+                            history.readmit_device(&peer.to_string())?;
+                            revoked_devices.remove(&peer);
                             history.save_device(&entry)?;
                             known_devices.insert(peer, entry);
                             peers.remove(&peer);
@@ -3955,6 +4109,18 @@ impl Node {
                             log::info!("relay: consegna a {target} delivered={delivered}");
                             devices::seal(&key, &DeviceResponse::RelayResult { id, delivered })?
                         }
+                        Ok(DeviceRequest::RotateAccount { rotation })
+                            if pairing_key.is_none() && known_devices.contains_key(&peer) =>
+                        {
+                            let response = devices::seal(&key, &DeviceResponse::RotationPending)?;
+                            swarm
+                                .behaviour_mut()
+                                .devices
+                                .send_response(channel, response)
+                                .ok();
+                            self.queue_account_rotation(peer, rotation);
+                            return Ok(LoopFlow::Continue);
+                        }
                         _ => devices::seal(
                             &key,
                             &DeviceResponse::Rejected("richiesta dispositivo non valida".into()),
@@ -4037,7 +4203,9 @@ impl Node {
                 let (expected_peer, key, pairing) = match pending {
                     PendingDeviceRequest::Pair { peer, key } => (peer, key, true),
                     PendingDeviceRequest::Sync { peer } => (peer, *account_key, false),
-                    PendingDeviceRequest::Relay { .. } => return Ok(LoopFlow::Continue),
+                    PendingDeviceRequest::Relay { .. } | PendingDeviceRequest::Rotate => {
+                        return Ok(LoopFlow::Continue)
+                    }
                 };
                 if expected_peer != peer {
                     return Ok(LoopFlow::Continue);
@@ -4056,6 +4224,8 @@ impl Node {
                             })?;
                         }
                         *account_key = linked_key;
+                        history.readmit_device(&peer.to_string())?;
+                        revoked_devices.remove(&peer);
                         // Adottato l'account del dispositivo che ci ha
                         // collegati: da ora firmiamo le presence con la
                         // sua identità, così i suoi contatti ci
@@ -4235,8 +4405,17 @@ impl Node {
                             )?;
                         }
                     }
+                    Ok(DeviceResponse::RotationRequired { rotation }) if !pairing => {
+                        self.queue_account_rotation(peer, rotation);
+                    }
                     Ok(DeviceResponse::Rejected(message)) => {
                         let _ = events.send(ClientEvent::Error { message });
+                    }
+                    // Un dispositivo che non ha ancora adottato la nostra
+                    // nuova chiave non sa rispondere al sync periodico: non è
+                    // un errore da mostrare ogni pochi secondi.
+                    Err(_) if !pairing => {
+                        log::warn!("risposta di sync da {peer} non leggibile");
                     }
                     _ => {
                         let _ = events.send(ClientEvent::Error {
@@ -5469,6 +5648,197 @@ impl Node {
         }
         Ok(LoopFlow::Continue)
     }
+
+    /// Revoca chiesta dall'utente su questo dispositivo.
+    fn revoke_device(&mut self, peer: PeerId) -> Result<LoopFlow, Box<dyn Error>> {
+        if !self.known_devices.contains_key(&peer) {
+            return Err("dispositivo non collegato".into());
+        }
+        self.rotate_account(&[peer])?;
+        Ok(LoopFlow::Continue)
+    }
+
+    /// Esclude `revoked`, adotta una chiave di account nuova e la passa agli
+    /// altri dispositivi collegati raggiungibili. Quelli offline la ricevono
+    /// al primo sync, che arriva sigillato con la chiave ritirata.
+    fn rotate_account(&mut self, revoked: &[PeerId]) -> Result<(), Box<dyn Error>> {
+        let previous = self.account_key;
+        let revoked = revoked
+            .iter()
+            .map(|peer| {
+                let name = self
+                    .known_devices
+                    .get(peer)
+                    .map_or_else(|| peer.to_string(), |device| device.name.clone());
+                (*peer, name)
+            })
+            .collect::<Vec<_>>();
+        self.exclude_devices(&revoked)?;
+        self.adopt_account_key(generate_secret())?;
+        let rotation = AccountRotation {
+            account_key: self.account_key,
+            revoked: revoked_list(&self.history)?,
+            from_name: self.display_name.clone(),
+        };
+        let online = self
+            .known_devices
+            .keys()
+            .filter(|device| self.online_devices.contains(device))
+            .copied()
+            .collect::<Vec<_>>();
+        for device in online {
+            let sealed = devices::seal(
+                &previous,
+                &DeviceRequest::RotateAccount {
+                    rotation: rotation.clone(),
+                },
+            )?;
+            let request_id = self
+                .swarm
+                .behaviour_mut()
+                .devices
+                .send_request(&device, sealed);
+            self.pending_device_requests
+                .insert(request_id, PendingDeviceRequest::Rotate);
+        }
+        Ok(())
+    }
+
+    fn answer_account_rotation(
+        &mut self,
+        request_id: u64,
+        accept: bool,
+    ) -> Result<LoopFlow, Box<dyn Error>> {
+        let Some((from, rotation)) = self.pending_rotations.remove(&request_id) else {
+            return Ok(LoopFlow::Continue);
+        };
+        if !accept {
+            // L'utente non riconosce la revoca: il dispositivo che l'ha chiesta
+            // va trattato come compromesso.
+            if self.known_devices.contains_key(&from) {
+                self.rotate_account(&[from])?;
+            }
+            return Ok(LoopFlow::Continue);
+        }
+        if !self.known_devices.contains_key(&from) || self.revoked_devices.contains(&from) {
+            return Err("il dispositivo che ha chiesto la rotazione non è più collegato".into());
+        }
+        let revoked = rotation
+            .revoked
+            .iter()
+            .filter_map(|device| {
+                Some((device.peer_id.parse::<PeerId>().ok()?, device.name.clone()))
+            })
+            .filter(|(peer, _)| *peer != self.local_peer_id)
+            .collect::<Vec<_>>();
+        self.exclude_devices(&revoked)?;
+        self.adopt_account_key(rotation.account_key)?;
+        // Altre richieste della stessa rotazione (arrivate a ogni sync) non
+        // servono più.
+        self.pending_rotations
+            .retain(|_, (_, pending)| pending.account_key != rotation.account_key);
+        let descriptor = local_device_descriptor(
+            self.local_peer_id,
+            &self.display_name,
+            contact_addresses(&self.swarm, &self.args.relays, self.local_peer_id),
+        );
+        if self.known_devices.contains_key(&from) {
+            send_device_sync(
+                &mut self.swarm,
+                &self.history,
+                &self.account_key,
+                &mut self.pending_device_requests,
+                from,
+                descriptor,
+            )?;
+        }
+        Ok(LoopFlow::Continue)
+    }
+
+    /// Mette in attesa una rotazione arrivata da `from` e chiede all'utente.
+    fn queue_account_rotation(&mut self, from: PeerId, rotation: AccountRotation) {
+        if rotation.account_key == self.account_key
+            || self
+                .pending_rotations
+                .values()
+                .any(|(_, pending)| pending.account_key == rotation.account_key)
+        {
+            return;
+        }
+        if rotation
+            .revoked
+            .iter()
+            .any(|device| device.peer_id == self.local_peer_id.to_string())
+        {
+            log::warn!("{from} ha revocato questo dispositivo");
+            return;
+        }
+        self.rotation_counter += 1;
+        let request_id = self.rotation_counter;
+        let revoked = rotation
+            .revoked
+            .iter()
+            .map(|device| device.name.clone())
+            .collect();
+        let _ = self.events.send(ClientEvent::AccountRotationRequested {
+            request_id,
+            from_peer_id: from.to_string(),
+            from_name: rotation.from_name.clone(),
+            revoked,
+        });
+        self.pending_rotations.insert(request_id, (from, rotation));
+    }
+
+    fn exclude_devices(&mut self, revoked: &[(PeerId, String)]) -> Result<(), Box<dyn Error>> {
+        for (peer, name) in revoked {
+            self.history.revoke_device(&peer.to_string(), name)?;
+            self.known_devices.remove(peer);
+            self.online_devices.remove(peer);
+            self.revoked_devices.insert(*peer);
+            let _ = self.swarm.disconnect_peer_id(*peer);
+            let _ = self.events.send(ClientEvent::DeviceRevoked {
+                peer_id: peer.to_string(),
+            });
+        }
+        send_devices(&self.known_devices, &self.online_devices, &self.events);
+        Ok(())
+    }
+
+    /// Passa a una nuova chiave di account: la vecchia resta solo per
+    /// riconoscere i dispositivi che non l'hanno ancora cambiata.
+    fn adopt_account_key(&mut self, account_key: [u8; 32]) -> Result<(), Box<dyn Error>> {
+        let store = self
+            .args
+            .account_key_store
+            .as_ref()
+            .ok_or("la chiave di account non si può salvare su questo client")?;
+        store(account_key)
+            .map_err(|error| format!("nuova chiave di account non salvata: {error}"))?;
+        self.history
+            .retire_account_key(&devices::key_id(&self.account_key), &self.account_key)?;
+        self.account_key = account_key;
+        self.account_identity = AccountIdentity::from_account_key(&self.account_key)?;
+        self.account_proof = self.account_identity.proof(self.local_peer_id).ok();
+        // I contatti legano i nostri dispositivi al nuovo account solo
+        // vedendo la nuova prova.
+        for contact in self.peers.iter().copied().collect::<Vec<_>>() {
+            send_event(
+                &mut self.swarm,
+                &mut self.sessions,
+                &self.contact_devices,
+                contact,
+                self.local_peer_id,
+                &mut self.sent_numbers,
+                ChatEvent::Presence(presence_update(
+                    &self.display_name,
+                    &self.presence_status,
+                    true,
+                    &self.account_proof,
+                )),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Un testo oltre il limite del protocollo verrebbe rifiutato dal destinatario
@@ -6052,11 +6422,19 @@ fn recognize_presence(
         };
     }
     if let Some(contact) = devices.alias.get(&peer).copied() {
-        return PresenceSource {
-            contact: Some(contact),
-            account,
-            ..PresenceSource::default()
-        };
+        // Un dispositivo che ora firma per un altro account (per esempio
+        // dopo che la persona lo ha revocato) non è più suo.
+        if account
+            .as_ref()
+            .is_none_or(|account| devices.accounts.get(&contact) == Some(account))
+        {
+            return PresenceSource {
+                contact: Some(contact),
+                account,
+                ..PresenceSource::default()
+            };
+        }
+        devices.alias.remove(&peer);
     }
     PresenceSource {
         contact: account
@@ -6319,32 +6697,184 @@ fn next_request_retry(attempts: u8) -> Option<u8> {
 
 fn maybe_start_hybrid_handshake(
     swarm: &mut Swarm<Behaviour>,
-    pending: &mut HashMap<request_response::OutboundRequestId, (PeerId, HybridInitiator)>,
+    handshakes: &mut Handshakes,
     established: &HashMap<PeerId, RatchetSession>,
     local_peer: PeerId,
     remote_peer: PeerId,
 ) {
-    let already_pending = pending
-        .values()
-        .any(|(pending_peer, _)| *pending_peer == remote_peer);
     if !needs_outbound_handshake(
         local_peer,
         remote_peer,
         established.contains_key(&remote_peer),
-        already_pending,
+        handshakes.pending_for(remote_peer),
     ) {
         return;
     }
+    handshakes.start(swarm, local_peer, remote_peer, false);
+}
 
-    match HybridInitiator::start(local_peer, remote_peer) {
-        Ok((initiator, hello)) => {
-            let request_id = swarm
-                .behaviour_mut()
-                .handshake
-                .send_request(&remote_peer, hello);
-            pending.insert(request_id, (remote_peer, initiator));
+/// Ogni quanto si rinnova una sessione cifrata con un nuovo handshake ibrido
+/// (ML-KEM + X25519, chiavi effimere fresche). Il ratchet è solo simmetrico:
+/// chi ruba lo stato di una sessione legge tutto ciò che segue, ma solo fino
+/// al rinnovo successivo (post-compromise security).
+const SESSION_REKEY_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Rinnovo anticipato dopo questo numero di messaggi nella stessa sessione.
+const SESSION_REKEY_MESSAGES: u64 = 1_000;
+/// Per quanto la sessione sostituita decifra ancora i messaggi in volo.
+const RETIRED_SESSION_GRACE: Duration = Duration::from_secs(120);
+
+#[cfg(test)]
+static SESSION_REKEYS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Handshake in corso e rinnovo periodico delle sessioni.
+struct Handshakes {
+    pending: HashMap<request_response::OutboundRequestId, (PeerId, HybridInitiator)>,
+    /// Chiave ML-DSA del dispositivo: firma ogni handshake.
+    identity: crypto::MlDsaIdentity,
+    rekey_interval: Duration,
+    /// Quando è nata ogni sessione attiva.
+    started: HashMap<PeerId, Instant>,
+    /// Sessione nuova del responder, in attesa del primo messaggio che la usa.
+    staged: HashMap<PeerId, RatchetSession>,
+    /// Sessione sostituita, ancora valida per i messaggi in volo.
+    retired: HashMap<PeerId, (RatchetSession, Instant)>,
+}
+
+impl Handshakes {
+    fn new(identity: crypto::MlDsaIdentity, rekey_interval: Duration) -> Self {
+        Self {
+            pending: HashMap::new(),
+            identity,
+            rekey_interval,
+            started: HashMap::new(),
+            staged: HashMap::new(),
+            retired: HashMap::new(),
         }
-        Err(error) => log::warn!("avvio handshake ibrido fallito: {error}"),
+    }
+
+    fn pending_for(&self, peer: PeerId) -> bool {
+        self.pending.values().any(|(pending, _)| *pending == peer)
+    }
+
+    fn start(&mut self, swarm: &mut Swarm<Behaviour>, local: PeerId, remote: PeerId, rekey: bool) {
+        match HybridInitiator::start(local, remote, &self.identity, rekey) {
+            Ok((initiator, hello)) => {
+                let request_id = swarm.behaviour_mut().handshake.send_request(&remote, hello);
+                self.pending.insert(request_id, (remote, initiator));
+            }
+            Err(error) => log::warn!("avvio handshake ibrido fallito: {error}"),
+        }
+    }
+
+    /// Installa la sessione nata da un handshake. Se è un rinnovo, la vecchia
+    /// resta per poco a decifrare i messaggi partiti prima.
+    fn install(
+        &mut self,
+        sessions: &mut HashMap<PeerId, RatchetSession>,
+        peer: PeerId,
+        session: RatchetSession,
+        rekey: bool,
+    ) {
+        self.staged.remove(&peer);
+        match sessions.insert(peer, session) {
+            Some(old) if rekey => {
+                #[cfg(test)]
+                SESSION_REKEYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.retired.insert(peer, (old, Instant::now()));
+            }
+            _ => {
+                self.retired.remove(&peer);
+            }
+        }
+        self.started.insert(peer, Instant::now());
+    }
+
+    fn stage(&mut self, peer: PeerId, session: RatchetSession) {
+        self.staged.insert(peer, session);
+    }
+
+    fn forget(&mut self, peer: PeerId) {
+        self.pending.retain(|_, (pending, _)| *pending != peer);
+        self.started.remove(&peer);
+        self.staged.remove(&peer);
+        self.retired.remove(&peer);
+    }
+
+    /// L'iniziatore rinnova le sessioni troppo vecchie o troppo usate.
+    fn rekey_due_sessions(
+        &mut self,
+        swarm: &mut Swarm<Behaviour>,
+        sessions: &HashMap<PeerId, RatchetSession>,
+        local: PeerId,
+    ) {
+        self.retired
+            .retain(|_, (_, retired_at)| retired_at.elapsed() < RETIRED_SESSION_GRACE);
+        self.started.retain(|peer, _| sessions.contains_key(peer));
+        self.staged.retain(|peer, _| sessions.contains_key(peer));
+        for (peer, session) in sessions {
+            let started = *self.started.entry(*peer).or_insert_with(Instant::now);
+            let due = started.elapsed() >= self.rekey_interval
+                || session.messages() >= SESSION_REKEY_MESSAGES;
+            if due && should_initiate(local, *peer) && !self.pending_for(*peer) {
+                log::info!("rinnovo della sessione con {peer}");
+                self.start(swarm, local, *peer, true);
+            }
+        }
+    }
+
+    /// Decifra con la sessione attiva; durante un rinnovo prova anche quella
+    /// nuova (che diventa attiva al primo messaggio) e quella appena ritirata.
+    fn decrypt(
+        &mut self,
+        sessions: &mut HashMap<PeerId, RatchetSession>,
+        peer: PeerId,
+        local: PeerId,
+        message: &RatchetMessage,
+    ) -> Result<Envelope, &'static str> {
+        let Some(current) = sessions.get_mut(&peer) else {
+            return Err(REJECT_NO_SESSION);
+        };
+        if let Ok(envelope) = decrypt_envelope(current, peer, local, message) {
+            return Ok(envelope);
+        }
+        if let Some(mut staged) = self.staged.remove(&peer) {
+            if let Ok(envelope) = decrypt_envelope(&mut staged, peer, local, message) {
+                self.install(sessions, peer, staged, true);
+                return Ok(envelope);
+            }
+            self.staged.insert(peer, staged);
+        }
+        if let Some((retired, _)) = self.retired.get_mut(&peer) {
+            if let Ok(envelope) = decrypt_envelope(retired, peer, local, message) {
+                return Ok(envelope);
+            }
+        }
+        Err(REJECT_UNDECRYPTABLE)
+    }
+}
+
+/// Fissa la chiave ML-DSA di un peer al primo handshake firmato e poi la
+/// esige: un peer che cambia chiave, o che smette di firmare dopo averlo
+/// fatto (downgrade), viene rifiutato. I peer che non hanno mai firmato
+/// (client vecchi) restano accettati con la sola autenticazione classica.
+fn pin_pq_identity(history: &History, peer: PeerId, key: Option<&[u8]>) -> Result<(), String> {
+    let peer = peer.to_string();
+    let pinned = history
+        .pq_identity(&peer)
+        .map_err(|error| error.to_string())?;
+    match (pinned, key) {
+        (Some(pinned), Some(key)) if pinned == key => Ok(()),
+        (Some(_), Some(_)) => Err("la chiave ML-DSA del contatto è cambiata".into()),
+        (Some(_), None) => Err("handshake senza firma ML-DSA da un contatto che la usava".into()),
+        (None, Some(key)) => history
+            .pin_pq_identity(&peer, key)
+            .map_err(|error| error.to_string()),
+        (None, None) => {
+            log::warn!(
+                "{peer} non firma l'handshake: client vecchio, solo autenticazione classica"
+            );
+            Ok(())
+        }
     }
 }
 
@@ -6378,7 +6908,13 @@ fn connect_contact(
     pending_dht: &mut HashMap<kad::QueryId, PeerId>,
 ) {
     let mut valid = VecDeque::new();
-    for address in addresses {
+    for mut address in addresses {
+        // I descrittori dei dispositivi portano gli indirizzi senza il Peer
+        // ID finale: senza aggiungerlo venivano scartati tutti e il pairing
+        // dipendeva da DHT e mDNS.
+        if !matches!(address.iter().last(), Some(Protocol::P2p(_))) {
+            address.push(Protocol::P2p(peer));
+        }
         // Il loopback di un peer remoto non è mai raggiungibile: scartarlo evita
         // di sprecare lo slot di dial (cicli "Rifiuto persistente" su 127.0.0.1).
         // Nei test end-to-end i due nodi girano davvero sullo stesso host.
@@ -6608,10 +7144,7 @@ fn deliver_event(
     sent_numbers: &mut HashMap<PeerId, u64>,
     pending_messages: &mut HashMap<request_response::OutboundRequestId, PendingMessage>,
     outbox: &mut HashMap<PeerId, VecDeque<(ChatEvent, u8)>>,
-    pending_handshakes: &mut HashMap<
-        request_response::OutboundRequestId,
-        (PeerId, HybridInitiator),
-    >,
+    pending_handshakes: &mut Handshakes,
     local_peer_id: PeerId,
     peer: PeerId,
     event: ChatEvent,
@@ -7712,6 +8245,14 @@ fn device_descriptor(device: &DeviceEntry) -> DeviceDescriptor {
     }
 }
 
+fn revoked_list(history: &History) -> Result<Vec<RevokedDevice>, Box<dyn Error>> {
+    Ok(history
+        .revoked_devices()?
+        .into_iter()
+        .map(|(peer_id, name)| RevokedDevice { peer_id, name })
+        .collect())
+}
+
 fn send_devices(
     devices: &HashMap<PeerId, DeviceEntry>,
     online: &HashSet<PeerId>,
@@ -8336,6 +8877,8 @@ pub struct ClientConfig {
     /// Legge comandi da stdin (solo CLI). L'app desktop e i test non lo usano:
     /// una lettura bloccata su stdin impedisce lo spegnimento del runtime.
     read_stdin: bool,
+    /// Ogni quanto si rinnovano le sessioni cifrate (configurabile nei test).
+    session_rekey_interval: Duration,
     name: String,
 }
 
@@ -8349,6 +8892,12 @@ impl ClientConfig {
         self.identity_bytes = Some(bytes);
         self.ml_dsa_seed = Some(ml_dsa_seed);
         Ok(self)
+    }
+
+    #[cfg(test)]
+    fn with_session_rekey_interval(mut self, interval: Duration) -> Self {
+        self.session_rekey_interval = interval;
+        self
     }
 
     pub fn with_account_key<F>(mut self, account_key: [u8; 32], store: F) -> Self
@@ -8404,6 +8953,7 @@ impl ClientConfig {
             history: data_dir.join("history.db"),
             notifications: true,
             read_stdin: false,
+            session_rekey_interval: SESSION_REKEY_INTERVAL,
             name,
         })
     }
@@ -8473,6 +9023,7 @@ impl ClientConfig {
             history,
             notifications,
             read_stdin: true,
+            session_rekey_interval: SESSION_REKEY_INTERVAL,
             name,
         })
     }
@@ -9003,9 +9554,21 @@ mod tests {
         assert!(!devices.secure(contact, &sessions));
 
         // Solo il telefono è raggiungibile: il messaggio va lì.
-        let (initiator, hello) = HybridInitiator::start(local, phone).unwrap();
-        let (response, phone_key) = respond_hybrid(&hello, local, phone).unwrap();
-        let local_key = initiator.finish(&response).unwrap();
+        let (initiator, hello) = HybridInitiator::start(
+            local,
+            phone,
+            &crypto::MlDsaIdentity::from_seed(&[1; 32]).unwrap(),
+            false,
+        )
+        .unwrap();
+        let (response, phone_key) = respond_hybrid(
+            &hello,
+            local,
+            phone,
+            &crypto::MlDsaIdentity::from_seed(&[2; 32]).unwrap(),
+        )
+        .unwrap();
+        let local_key = initiator.finish(&response).unwrap().key;
         drop(phone_key);
         sessions.insert(phone, RatchetSession::new(local_key, local, phone));
         assert_eq!(devices.route(contact, &sessions), phone);
@@ -9021,11 +9584,23 @@ mod tests {
     fn envelope_round_trips_through_the_session_ratchet() {
         let alice = PeerId::from(Keypair::generate_ed25519().public());
         let bob = PeerId::from(Keypair::generate_ed25519().public());
-        let (initiator, hello) = HybridInitiator::start(alice, bob).unwrap();
-        let (response, bob_key) = respond_hybrid(&hello, alice, bob).unwrap();
-        let alice_key = initiator.finish(&response).unwrap();
+        let (initiator, hello) = HybridInitiator::start(
+            alice,
+            bob,
+            &crypto::MlDsaIdentity::from_seed(&[1; 32]).unwrap(),
+            false,
+        )
+        .unwrap();
+        let (response, bob_key) = respond_hybrid(
+            &hello,
+            alice,
+            bob,
+            &crypto::MlDsaIdentity::from_seed(&[2; 32]).unwrap(),
+        )
+        .unwrap();
+        let alice_key = initiator.finish(&response).unwrap().key;
         let mut alice_session = RatchetSession::new(alice_key, alice, bob);
-        let mut bob_session = RatchetSession::new(bob_key, bob, alice);
+        let mut bob_session = RatchetSession::new(bob_key.key, bob, alice);
         let envelope = Envelope {
             protocol_version: PROTOCOL_VERSION,
             conversation_id: conversation_id(alice, bob),
@@ -9353,6 +9928,77 @@ mod tests {
         fs::remove_dir_all(root).ok();
     }
 
+    /// Audit #18: le sessioni si rinnovano con un handshake nuovo mentre la
+    /// conversazione continua, senza perdere messaggi in nessuna direzione.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(windows, ignore = "il teardown libp2p può bloccare l'harness Windows")]
+    async fn sessions_rekey_periodically_without_losing_messages() {
+        let root = test_root("rekey");
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let fast = Duration::from_millis(500);
+                let mut alice = TestNode::start(
+                    loopback_config("Alice", &root.join("alice"), None)
+                        .with_session_rekey_interval(fast),
+                )
+                .await;
+                let mut bob = TestNode::start(
+                    loopback_config("Bob", &root.join("bob"), None)
+                        .with_session_rekey_interval(fast),
+                )
+                .await;
+                connect_pair(&mut alice, &mut bob).await;
+                let before = SESSION_REKEYS.load(std::sync::atomic::Ordering::Relaxed);
+
+                for round in 0..8 {
+                    alice.send(ClientCommand::SendText {
+                        peer: bob.peer,
+                        text: format!("da Alice {round}"),
+                    });
+                    bob.until_text(&format!("da Alice {round}")).await;
+                    bob.send(ClientCommand::SendText {
+                        peer: alice.peer,
+                        text: format!("da Bob {round}"),
+                    });
+                    alice.until_text(&format!("da Bob {round}")).await;
+                    tokio::time::sleep(Duration::from_millis(900)).await;
+                }
+
+                // Ogni rinnovo conta due volte: iniziatore e responder.
+                let rekeys = SESSION_REKEYS.load(std::sync::atomic::Ordering::Relaxed) - before;
+                assert!(rekeys >= 4, "sessione rinnovata solo {rekeys} volte");
+                alice.shutdown().await;
+                bob.shutdown().await;
+            })
+            .await;
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn pq_identity_is_pinned_and_enforced() {
+        let root = test_root("pq-pin");
+        fs::create_dir_all(&root).unwrap();
+        let history = History::open(&root.join("history.db"), [4; 32]).unwrap();
+        let peer = test_peer();
+        let first = crypto::MlDsaIdentity::from_seed(&[1; 32]).unwrap();
+        let other = crypto::MlDsaIdentity::from_seed(&[2; 32]).unwrap();
+
+        // Client vecchio mai visto firmare: accettato.
+        assert!(pin_pq_identity(&history, peer, None).is_ok());
+        // Primo handshake firmato: la chiave si fissa.
+        assert!(pin_pq_identity(&history, peer, Some(first.public_key())).is_ok());
+        assert!(pin_pq_identity(&history, peer, Some(first.public_key())).is_ok());
+        // Chiave diversa o firma sparita (downgrade): rifiutati.
+        assert!(pin_pq_identity(&history, peer, Some(other.public_key())).is_err());
+        assert!(pin_pq_identity(&history, peer, None).is_err());
+        // Rimuovere il contatto azzera la chiave fissata.
+        history.delete_contact(&peer.to_string()).unwrap();
+        assert!(pin_pq_identity(&history, peer, Some(other.public_key())).is_ok());
+        drop(history);
+        fs::remove_dir_all(root).ok();
+    }
+
     /// Audit #1: un testo oltre 16 KB spegneva il nodo. Ora il mittente
     /// riceve un errore e la conversazione continua.
     #[tokio::test(flavor = "current_thread")]
@@ -9387,6 +10033,182 @@ mod tests {
                 alice.until_text("ancora vivo").await;
                 alice.shutdown().await;
                 bob.shutdown().await;
+            })
+            .await;
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Collega `joining` all'account di `inviter` e aspetta il primo sync.
+    async fn link_devices(inviter: &mut TestNode, joining: &mut TestNode) {
+        inviter.send(ClientCommand::RequestDeviceLink);
+        let ClientEvent::DeviceLink { link, .. } = inviter
+            .until(|event| matches!(event, ClientEvent::DeviceLink { .. }))
+            .await
+        else {
+            unreachable!()
+        };
+        joining.send(ClientCommand::ImportDeviceLink { link });
+        joining
+            .until(|event| {
+                eprintln!("DBG {event:?}");
+                matches!(event, ClientEvent::DeviceSynchronized { paired: true, .. })
+            })
+            .await;
+    }
+
+    fn device_config(name: &str, dir: &Path) -> ClientConfig {
+        loopback_config(name, dir, None).with_account_key(generate_secret(), |_| Ok(()))
+    }
+
+    /// Audit #19: un dispositivo perso restava autorizzato per sempre. Ora si
+    /// revoca: la chiave di account cambia e gli altri dispositivi la
+    /// adottano dopo la conferma dell'utente.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(windows, ignore = "il teardown libp2p può bloccare l'harness Windows")]
+    async fn revoked_device_is_excluded_and_the_account_key_rotates() {
+        let root = test_root("revoke");
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut pc = TestNode::start(device_config("PC", &root.join("pc"))).await;
+                let mut laptop = TestNode::start(device_config("Laptop", &root.join("laptop"))).await;
+                let mut phone = TestNode::start(device_config("Telefono", &root.join("phone"))).await;
+                link_devices(&mut pc, &mut laptop).await;
+                link_devices(&mut pc, &mut phone).await;
+
+                pc.send(ClientCommand::RevokeDevice { peer: phone.peer });
+                let phone_id = phone.peer.to_string();
+                pc.until(|event| matches!(event, ClientEvent::DeviceRevoked { peer_id } if *peer_id == phone_id))
+                    .await;
+
+                // Il laptop chiede conferma prima di adottare la nuova chiave.
+                let ClientEvent::AccountRotationRequested {
+                    request_id,
+                    from_name,
+                    revoked,
+                    ..
+                } = laptop
+                    .until(|event| matches!(event, ClientEvent::AccountRotationRequested { .. }))
+                    .await
+                else {
+                    unreachable!()
+                };
+                assert_eq!(from_name, "PC");
+                assert_eq!(revoked, vec!["Telefono".to_owned()]);
+                laptop.send(ClientCommand::AnswerAccountRotation {
+                    request_id,
+                    accept: true,
+                });
+                laptop
+                    .until(|event| matches!(event, ClientEvent::DeviceRevoked { peer_id } if *peer_id == phone_id))
+                    .await;
+                // Il sync con il PC riesce: hanno di nuovo la stessa chiave.
+                let pc_id = pc.peer.to_string();
+                laptop
+                    .until(|event| matches!(event, ClientEvent::DeviceSynchronized { peer_id, paired: false, .. } if *peer_id == pc_id))
+                    .await;
+
+                pc.shutdown().await;
+                laptop.shutdown().await;
+                phone.shutdown().await;
+            })
+            .await;
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Un dispositivo spento durante la revoca riceve la nuova chiave al
+    /// primo sync, che arriva sigillato con la chiave ritirata.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(windows, ignore = "il teardown libp2p può bloccare l'harness Windows")]
+    async fn offline_device_learns_the_rotation_at_its_next_sync() {
+        let root = test_root("rotate-offline");
+        let laptop_dir = root.join("laptop");
+        let laptop_key = Arc::new(std::sync::Mutex::new(generate_secret()));
+        let laptop_config = || {
+            let store = laptop_key.clone();
+            let key = *laptop_key.lock().unwrap();
+            loopback_config("Laptop", &laptop_dir, None).with_account_key(key, move |key| {
+                *store.lock().unwrap() = key;
+                Ok(())
+            })
+        };
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut pc = TestNode::start(device_config("PC", &root.join("pc"))).await;
+                let mut laptop = TestNode::start(laptop_config()).await;
+                let mut phone = TestNode::start(device_config("Telefono", &root.join("phone"))).await;
+                link_devices(&mut pc, &mut laptop).await;
+                link_devices(&mut pc, &mut phone).await;
+                laptop.shutdown().await;
+
+                pc.send(ClientCommand::RevokeDevice { peer: phone.peer });
+                let phone_id = phone.peer.to_string();
+                pc.until(|event| matches!(event, ClientEvent::DeviceRevoked { peer_id } if *peer_id == phone_id))
+                    .await;
+
+                let mut laptop = TestNode::restart(laptop_config).await;
+                let ClientEvent::AccountRotationRequested { request_id, .. } = laptop
+                    .until(|event| matches!(event, ClientEvent::AccountRotationRequested { .. }))
+                    .await
+                else {
+                    unreachable!()
+                };
+                laptop.send(ClientCommand::AnswerAccountRotation {
+                    request_id,
+                    accept: true,
+                });
+                let pc_id = pc.peer.to_string();
+                laptop
+                    .until(|event| matches!(event, ClientEvent::DeviceSynchronized { peer_id, paired: false, .. } if *peer_id == pc_id))
+                    .await;
+
+                pc.shutdown().await;
+                laptop.shutdown().await;
+                phone.shutdown().await;
+            })
+            .await;
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Una rotazione che l'utente non riconosce revoca chi l'ha chiesta.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(windows, ignore = "il teardown libp2p può bloccare l'harness Windows")]
+    async fn refused_rotation_revokes_the_requesting_device() {
+        let root = test_root("refuse-rotation");
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut pc = TestNode::start(device_config("PC", &root.join("pc"))).await;
+                let mut laptop = TestNode::start(device_config("Laptop", &root.join("laptop"))).await;
+                let mut phone = TestNode::start(device_config("Telefono", &root.join("phone"))).await;
+                link_devices(&mut pc, &mut laptop).await;
+                link_devices(&mut pc, &mut phone).await;
+
+                // Il telefono raggiunge da solo anche il laptop.
+                let phone_id = phone.peer.to_string();
+                laptop
+                    .until(|event| matches!(event, ClientEvent::DeviceSynchronized { peer_id, .. } if *peer_id == phone_id))
+                    .await;
+                // Chi ha rubato il telefono prova a revocare il PC.
+                phone.send(ClientCommand::RevokeDevice { peer: pc.peer });
+                let ClientEvent::AccountRotationRequested { request_id, .. } = laptop
+                    .until(|event| matches!(event, ClientEvent::AccountRotationRequested { .. }))
+                    .await
+                else {
+                    unreachable!()
+                };
+                laptop.send(ClientCommand::AnswerAccountRotation {
+                    request_id,
+                    accept: false,
+                });
+                laptop
+                    .until(|event| matches!(event, ClientEvent::DeviceRevoked { peer_id } if *peer_id == phone_id))
+                    .await;
+
+                pc.shutdown().await;
+                laptop.shutdown().await;
+                phone.shutdown().await;
             })
             .await;
         fs::remove_dir_all(root).ok();
@@ -9499,9 +10321,12 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let source = root.join("grande.bin");
         // File sparso: non occupa disco ma va letto e hashato per intero.
+        // 2 GB: con 1 GB, su una CI veloce e con
+        // gli altri test in parallelo, l'hash poteva finire prima che il
+        // testo facesse il giro della rete.
         fs::File::create(&source)
             .unwrap()
-            .set_len(1024 * 1024 * 1024)
+            .set_len(2 * 1024 * 1024 * 1024)
             .unwrap();
         let local = tokio::task::LocalSet::new();
         local

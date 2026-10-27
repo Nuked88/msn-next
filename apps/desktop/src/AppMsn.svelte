@@ -175,6 +175,8 @@
     | { type: 'deviceLink'; link: string; qrLink: string; expiresAtMs: number }
     | { type: 'devicesUpdated'; devices: LinkedDevice[] }
     | { type: 'deviceSynchronized'; peerId: string; applied: number; paired: boolean }
+    | { type: 'accountRotationRequested'; requestId: number; fromPeerId: string; fromName: string; revoked: string[] }
+    | { type: 'deviceRevoked'; peerId: string }
     | { type: 'attachmentReceived'; peerId: string; id: string; filename: string; mime: string }
     | { type: 'groupAttachmentReceived'; groupId: string; id: string; filename: string; mime: string }
     | { type: 'attachmentSent'; peerId: string; filename: string }
@@ -880,6 +882,20 @@
       linkedDevices = event.devices
       return
     }
+    if (event.type === 'accountRotationRequested') {
+      // Chi rifiuta tratta come compromesso il dispositivo che ha chiesto la revoca.
+      const accept = confirm($t('devices.rotation.prompt', {
+        from: event.fromName,
+        revoked: event.revoked.join(', '),
+      }))
+      void invoke('node_answer_account_rotation', { requestId: event.requestId, accept })
+        .catch((error) => showToast(String(error)))
+      return
+    }
+    if (event.type === 'deviceRevoked') {
+      showToast($t('toast.deviceRevoked'))
+      return
+    }
     if (event.type === 'deviceSynchronized') {
       devicePairingBusy = false
       if (event.paired) {
@@ -1241,6 +1257,11 @@
   function banLabel(ban: GroupBan) {
     if (ban.expiresAtMs === null) return $t('ban.permanent')
     return $t('ban.until', { date: new Date(ban.expiresAtMs).toLocaleString() })
+  }
+
+  async function revokeDevice(device: LinkedDevice) {
+    if (!confirm($t('settings.devices.revokeConfirm', { name: device.name }))) return
+    await invoke('node_revoke_device', { peerId: device.peerId }).catch((error) => showToast(String(error)))
   }
 
   function deviceStatus(device: LinkedDevice) {
@@ -2720,6 +2741,7 @@
                     <div class="linked-device-row settings-row">
                       <span class:online={device.online} class="device-status-dot"></span>
                       <span><strong>{device.name}</strong><small>{deviceStatus(device)}</small></span>
+                      <button class="danger-button" disabled={!running} onclick={() => revokeDevice(device)}>{$t('settings.devices.revoke')}</button>
                     </div>
                   {/each}
                 </div>

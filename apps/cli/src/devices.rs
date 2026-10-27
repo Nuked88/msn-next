@@ -60,6 +60,25 @@ pub enum DeviceRequest {
         #[serde(default)]
         offers: Vec<EmoticonOffer>,
     },
+    /// Un dispositivo dell'account ne ha revocati altri e ha cambiato la
+    /// chiave di account. Sigillato con la chiave precedente: chi lo riceve
+    /// lo applica solo dopo la conferma dell'utente.
+    RotateAccount { rotation: AccountRotation },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RevokedDevice {
+    pub peer_id: String,
+    pub name: String,
+}
+
+/// Nuova chiave di account e dispositivi esclusi.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AccountRotation {
+    pub account_key: [u8; 32],
+    pub revoked: Vec<RevokedDevice>,
+    /// Nome del dispositivo che ha fatto la revoca, da mostrare all'utente.
+    pub from_name: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -81,6 +100,13 @@ pub enum DeviceResponse {
     RelayResult {
         id: [u8; 16],
         delivered: bool,
+    },
+    /// La rotazione è arrivata e attende la conferma dell'utente.
+    RotationPending,
+    /// Risposta a un Sync sigillato con una chiave di account ritirata: il
+    /// dispositivo che lo manda deve prima adottare la chiave nuova.
+    RotationRequired {
+        rotation: AccountRotation,
     },
 }
 
