@@ -161,6 +161,8 @@ pub enum ClientCommand {
     ReadAttachment {
         id: String,
         mime: String,
+        /// Solo anteprima ridotta (immagini), per il messaggio in chat.
+        thumbnail: bool,
     },
     ExportAttachment {
         id: String,
@@ -538,6 +540,7 @@ pub enum ClientEvent {
     AttachmentOpened {
         id: String,
         data_url: String,
+        thumbnail: bool,
     },
     AttachmentExported {
         path: String,
@@ -2076,13 +2079,9 @@ async fn run_node(
                         Err(message) => { let _ = events.send(ClientEvent::Error { message }); }
                     }
                 }
-                Some(ClientCommand::ReadAttachment { id, mime }) => {
-                    match parse_asset_id(&id).and_then(|id_bytes| {
-                        attachment_receiver.read(&id_bytes)
-                            .map(|bytes| format!("data:{mime};base64,{}", BASE64.encode(bytes)))
-                            .map_err(|error| error.to_string())
-                    }) {
-                        Ok(data_url) => { let _ = events.send(ClientEvent::AttachmentOpened { id, data_url }); }
+                Some(ClientCommand::ReadAttachment { id, mime, thumbnail }) => {
+                    match parse_asset_id(&id) {
+                        Ok(id_bytes) => open_attachment(attachment_receiver.vault(), &events, id, id_bytes, mime, thumbnail),
                         Err(message) => { let _ = events.send(ClientEvent::Error { message }); }
                     }
                 }
@@ -3586,6 +3585,51 @@ struct VaultJobDone {
 }
 
 /// Calcola il manifest (hash BLAKE3 dell'intero file) in un thread bloccante.
+/// Lato massimo delle anteprime in chat: bastano poche decine di KB invece
+/// di copiare l'intero file (fino a 50 MB in base64) nella UI.
+const THUMBNAIL_SIDE: u32 = 640;
+
+/// Apre un allegato del vault in un thread a parte: decifrare e codificare
+/// decine di MB non deve fermare il loop. Con `thumbnail` le immagini
+/// arrivano ridotte, per l'anteprima nel messaggio.
+fn open_attachment(
+    vault: attachments::Vault,
+    events: &mpsc::UnboundedSender<ClientEvent>,
+    id: String,
+    id_bytes: [u8; 32],
+    mime: String,
+    thumbnail: bool,
+) {
+    let events = events.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = vault.read(&id_bytes).map_err(|error| error.to_string()).and_then(|bytes| {
+            if thumbnail && mime.starts_with("image/") {
+                thumbnail_data_url(&bytes).map_err(|error| format!("anteprima non disponibile: {error}"))
+            } else {
+                Ok(format!("data:{mime};base64,{}", BASE64.encode(bytes)))
+            }
+        });
+        let _ = events.send(match result {
+            Ok(data_url) => ClientEvent::AttachmentOpened { id, data_url, thumbnail },
+            Err(message) => ClientEvent::Error { message },
+        });
+    });
+}
+
+fn thumbnail_data_url(bytes: &[u8]) -> Result<String, Box<dyn Error>> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
+    // Niente "bombe" di decompressione: dimensioni e memoria limitate.
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader.decode()?.thumbnail(THUMBNAIL_SIDE, THUMBNAIL_SIDE);
+    let mut png = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut png, image::ImageFormat::Png)?;
+    Ok(format!("data:image/png;base64,{}", BASE64.encode(png.into_inner())))
+}
+
 fn prepare_file(tx: &mpsc::UnboundedSender<PreparedFile>, target: FileTarget, path: PathBuf) {
     let tx = tx.clone();
     tokio::task::spawn_blocking(move || {
@@ -7367,6 +7411,23 @@ mod tests {
             })
             .await;
         fs::remove_dir_all(root).ok();
+    }
+
+    /// Audit #12: l'anteprima in chat era il file intero in base64 (fino a
+    /// 50 MB). Ora è una miniatura di pochi KB.
+    #[test]
+    fn inline_preview_is_a_small_thumbnail() {
+        let photo = image::RgbImage::from_fn(3000, 2000, |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, 90]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(photo).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let original = png.into_inner();
+
+        let data_url = thumbnail_data_url(&original).unwrap();
+        let encoded = data_url.strip_prefix("data:image/png;base64,").unwrap();
+        let thumbnail = image::load_from_memory(&BASE64.decode(encoded).unwrap()).unwrap();
+        assert_eq!((thumbnail.width(), thumbnail.height()), (640, 427));
+        assert!(data_url.len() < original.len() / 4, "{} vs {}", data_url.len(), original.len());
+        assert!(thumbnail_data_url(b"non un'immagine").is_err());
     }
 
     /// Audit #8: le emoticon viaggiano col relay, ma una richiesta resta

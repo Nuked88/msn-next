@@ -1,6 +1,5 @@
 use std::{
     collections::HashSet,
-    io::Cursor,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -1111,8 +1110,16 @@ fn node_read_attachment(
     state: State<'_, NodeState>,
     id: String,
     mime: String,
+    thumbnail: Option<bool>,
 ) -> Result<(), String> {
-    send_command(&state, ClientCommand::ReadAttachment { id, mime })
+    send_command(
+        &state,
+        ClientCommand::ReadAttachment {
+            id,
+            mime,
+            thumbnail: thumbnail.unwrap_or(false),
+        },
+    )
 }
 
 #[tauri::command]
@@ -1164,30 +1171,6 @@ fn save_contact_qr(path: PathBuf, data_url: String) -> Result<(), String> {
         return Err("invalid QR code".into());
     }
     std::fs::write(path, bytes).map_err(|error| format!("QR code could not be saved: {error}"))
-}
-
-#[tauri::command]
-fn image_preview(path: String) -> Result<String, String> {
-    const MAX_PREVIEW_SOURCE_BYTES: u64 = 100 * 1024 * 1024;
-    let path = Path::new(&path);
-    if std::fs::metadata(path)
-        .map_err(|error| format!("image could not be read: {error}"))?
-        .len()
-        > MAX_PREVIEW_SOURCE_BYTES
-    {
-        return Err("image is too large for preview".into());
-    }
-    let image = image::open(path)
-        .map_err(|error| format!("image could not be read: {error}"))?
-        .thumbnail(1280, 1280);
-    let mut bytes = Cursor::new(Vec::new());
-    image
-        .write_to(&mut bytes, image::ImageFormat::Png)
-        .map_err(|error| format!("preview could not be created: {error}"))?;
-    Ok(format!(
-        "data:image/png;base64,{}",
-        BASE64.encode(bytes.into_inner())
-    ))
 }
 
 #[tauri::command]
@@ -1652,7 +1635,6 @@ pub fn run() {
             node_import_device_link,
             scan_contact_qr,
             save_contact_qr,
-            image_preview,
             profile_load,
             profile_save,
             account_backup_export,
@@ -1776,7 +1758,7 @@ mod tests {
             .render::<image::Luma<u8>>()
             .min_dimensions(1024, 1024)
             .build();
-        let mut png = Cursor::new(Vec::new());
+        let mut png = std::io::Cursor::new(Vec::new());
         image::DynamicImage::ImageLuma8(image)
             .write_to(&mut png, image::ImageFormat::Png)
             .unwrap();

@@ -276,8 +276,14 @@ impl Receiver {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn read(&self, id: &[u8; 32]) -> Result<Vec<u8>, Box<dyn Error>> {
         self.vault.read(id)
+    }
+
+    /// Il vault da usare fuori dal loop (thread bloccanti).
+    pub fn vault(&self) -> Vault {
+        self.vault.clone()
     }
 
     pub fn export(&self, id: &[u8; 32], path: &Path) -> Result<(), Box<dyn Error>> {
@@ -367,7 +373,7 @@ impl Vault {
         Ok((file, reference.manifest))
     }
 
-    fn read(&self, id: &[u8; 32]) -> Result<Vec<u8>, Box<dyn Error>> {
+    pub fn read(&self, id: &[u8; 32]) -> Result<Vec<u8>, Box<dyn Error>> {
         if let Ok(bytes) = self.read_legacy(id) {
             return Ok(bytes);
         }

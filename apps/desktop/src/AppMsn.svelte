@@ -108,7 +108,6 @@
     emoticons: ClientEmoticonSpan[]
     attachmentId?: string
     attachmentMime?: string
-    attachmentDataUrl?: string
     senderPeerId?: string
     eventId?: string
     deleted?: boolean
@@ -182,7 +181,7 @@
     | { type: 'olderGroupMessagesLoaded'; groupId: string; messages: ClientGroupMessage[]; hasMore: boolean }
     | { type: 'groupMessage'; message: ClientGroupMessage }
     | { type: 'groupConversationCleared'; groupId: string }
-    | { type: 'attachmentOpened'; id: string; dataUrl: string }
+    | { type: 'attachmentOpened'; id: string; dataUrl: string; thumbnail: boolean }
     | { type: 'attachmentExported'; path: string }
     | { type: 'error'; message: string }
     | { type: 'messageFailed'; peerId: string; eventId: string; reason: string }
@@ -402,8 +401,10 @@
   let contextY = 0
   let fileDropActive = false
   let mediaPreview = ''
-  let pendingSentPreviews: Record<string, string[]> = {}
-  const automaticPreviewIds = new Set<string>()
+  // Anteprime ridotte per id allegato: una sola copia anche se lo stesso file
+  // compare in più messaggi, e solo le più recenti restano in memoria.
+  const MAX_INLINE_PREVIEWS = 60
+  let attachmentPreviews: Record<string, string> = {}
   let rosterOpen = false
   let linkRequested = false
   let toastText = ''
@@ -905,19 +906,13 @@
     }
     if (event.type === 'attachmentReceived') {
       const conversation = [...(conversations[event.peerId] || [])]
-      const index = conversation.findLastIndex((message) => !message.mine && message.kind === 'file' && message.body === event.filename)
+      const index = receivedFileIndex(conversation, event.id, event.filename)
       if (index >= 0) conversation[index] = {
         ...conversation[index], attachmentId: event.id, attachmentMime: event.mime,
       }
       conversations = { ...conversations, [event.peerId]: conversation }
       showToast($t('toast.fileReceived', { filename: event.filename }))
-      if (previewReceivedImages && event.mime.startsWith('image/')) {
-        automaticPreviewIds.add(event.id)
-        void invoke('node_read_attachment', { id: event.id, mime: event.mime }).catch((error) => {
-          automaticPreviewIds.delete(event.id)
-          showToast(String(error))
-        })
-      }
+      if (previewReceivedImages) requestInlinePreview(event.id, event.mime)
       return
     }
     if (event.type === 'attachmentSent') {
@@ -1006,8 +1001,8 @@
     if (event.type === 'groupMessage') {
       const key = `group:${event.message.groupId}`
       const next = toGroupChatMessage(event.message)
-      if (event.message.direction === 'out' && event.message.kind === 'file') {
-        consumeSentPreview(next, key, event.message.body)
+      if (event.message.direction === 'out' && event.message.kind === 'file' && previewSentImages && event.message.attachmentId) {
+        requestInlinePreview(event.message.attachmentId, event.message.attachmentMime)
       }
       conversations = {
         ...conversations,
@@ -1028,19 +1023,13 @@
     if (event.type === 'groupAttachmentReceived') {
       const key = `group:${event.groupId}`
       const conversation = [...(conversations[key] || [])]
-      const index = conversation.findLastIndex((message) => !message.mine && message.kind === 'file' && message.body === event.filename)
+      const index = receivedFileIndex(conversation, event.id, event.filename)
       if (index >= 0) conversation[index] = {
         ...conversation[index], attachmentId: event.id, attachmentMime: event.mime,
       }
       conversations = { ...conversations, [key]: conversation }
       showToast($t('toast.fileReceivedGroup', { filename: event.filename }))
-      if (previewReceivedImages && event.mime.startsWith('image/')) {
-        automaticPreviewIds.add(event.id)
-        void invoke('node_read_attachment', { id: event.id, mime: event.mime }).catch((error) => {
-          automaticPreviewIds.delete(event.id)
-          showToast(String(error))
-        })
-      }
+      if (previewReceivedImages) requestInlinePreview(event.id, event.mime)
       return
     }
     if (event.type === 'groupConversationCleared') {
@@ -1049,15 +1038,7 @@
       return
     }
     if (event.type === 'attachmentOpened') {
-      for (const [id, conversation] of Object.entries(conversations)) {
-        conversations = {
-          ...conversations,
-          [id]: conversation.map((message) => message.attachmentId === event.id
-            ? { ...message, attachmentDataUrl: event.dataUrl }
-            : message),
-        }
-      }
-      if (automaticPreviewIds.has(event.id)) automaticPreviewIds.delete(event.id)
+      if (event.thumbnail) storeInlinePreview(event.id, event.dataUrl)
       else mediaPreview = event.dataUrl
       return
     }
@@ -1152,8 +1133,8 @@
   function addMessage(message: ClientMessage) {
     const conversation = conversations[message.peerId] || []
     const next = toChatMessage(message)
-    if (message.direction === 'out' && message.kind === 'file') {
-      consumeSentPreview(next, message.peerId, message.body)
+    if (message.direction === 'out' && message.kind === 'file' && previewSentImages && message.attachmentId) {
+      requestInlinePreview(message.attachmentId, message.attachmentMime)
     }
     conversations = {
       ...conversations,
@@ -1179,12 +1160,26 @@
     scrollMessages()
   }
 
-  function consumeSentPreview(message: ChatMessage, conversation: string, filename: string) {
-    const key = `${conversation}\u0000${filename}`
-    const previews = pendingSentPreviews[key]
-    if (!previews?.length) return
-    message.attachmentDataUrl = previews.shift()
-    if (!previews.length) delete pendingSentPreviews[key]
+  // Il messaggio di un file ricevuto: per id allegato, così due file con lo
+  // stesso nome non si scambiano. Per nome solo con la cronologia vecchia,
+  // che non ha l'id.
+  function receivedFileIndex(conversation: ChatMessage[], id: string, filename: string) {
+    const byId = conversation.findLastIndex((message) => message.kind === 'file' && message.attachmentId === id)
+    if (byId >= 0) return byId
+    return conversation.findLastIndex((message) => !message.mine && message.kind === 'file' && !message.attachmentId && message.body === filename)
+  }
+
+  function requestInlinePreview(id: string, mime?: string) {
+    if (!mime?.startsWith('image/') || attachmentPreviews[id]) return
+    void invoke('node_read_attachment', { id, mime, thumbnail: true }).catch((error) => showToast(String(error)))
+  }
+
+  function storeInlinePreview(id: string, dataUrl: string) {
+    const { [id]: _previous, ...rest } = attachmentPreviews
+    const entries = Object.entries(rest)
+    // Le chiavi restano in ordine di inserimento: la più vecchia esce per prima.
+    const kept = entries.slice(Math.max(0, entries.length - MAX_INLINE_PREVIEWS + 1))
+    attachmentPreviews = { ...Object.fromEntries(kept), [id]: dataUrl }
   }
 
   async function focusComposer() {
@@ -1568,22 +1563,11 @@
     if (!canSend || (!selectedPeerId && !selectedGroupId) || !paths.length) return
     const targetPeer = selectedPeerId
     const targetGroup = selectedGroupId
-    const targetConversation = targetGroup ? `group:${targetGroup}` : targetPeer
     const targetCount = targetGroup ? Math.max(1, groupOnline) : 1
     pendingFileCount += paths.length * targetCount
     fileSending = true
     for (const path of paths) {
       try {
-        const filename = path.split(/[\\/]/).at(-1) || path
-        if (previewSentImages && isImagePath(path)) {
-          try {
-            const preview = await invoke<string>('image_preview', { path })
-            const key = `${targetConversation}\u0000${filename}`
-            pendingSentPreviews[key] = [...(pendingSentPreviews[key] || []), preview]
-          } catch {
-            // L'anteprima è facoltativa: il file può comunque essere inviato.
-          }
-        }
         if (targetGroup) await invoke('node_send_group_file', { groupId: targetGroup, path })
         else await invoke('node_send_file', { peerId: targetPeer, path })
       } catch (error) {
@@ -1594,9 +1578,6 @@
     }
   }
 
-  function isImagePath(path: string) {
-    return /\.(avif|bmp|gif|jpe?g|png|webp)$/i.test(path)
-  }
 
   function showContactMenu(event: MouseEvent, contact: Contact) {
     event.preventDefault()
@@ -1671,7 +1652,7 @@
     }
     if (message.attachmentMime.startsWith('image/') || message.attachmentMime.startsWith('video/')) {
       await invoke('node_read_attachment', {
-        id: message.attachmentId, mime: message.attachmentMime,
+        id: message.attachmentId, mime: message.attachmentMime, thumbnail: false,
       }).catch((error) => showToast(String(error)))
       return
     }
@@ -2084,7 +2065,7 @@
     const next: Record<string, ChatMessage[]> = {}
     for (const [key, list] of Object.entries(conversations)) {
       next[key] = list.map((message) => message.eventId === eventId
-        ? { ...message, deleted: true, body: '', emoticons: [], attachmentId: undefined, attachmentDataUrl: undefined }
+        ? { ...message, deleted: true, body: '', emoticons: [], attachmentId: undefined }
         : message)
     }
     conversations = next
@@ -2352,8 +2333,8 @@
                     <p class="deleted-message"><Trash2 size={13} /> {message.mine ? $t('msg.deletedByYou') : $t('msg.deletedMessage')}</p>
                   {:else if message.kind === 'file'}
                     <button class="file-line" disabled={!message.attachmentId} onclick={() => openAttachment(message)}>
-                      {#if message.attachmentDataUrl}
-                        <img src={message.attachmentDataUrl} alt={message.body} />
+                      {#if message.attachmentId && attachmentPreviews[message.attachmentId]}
+                        <img src={attachmentPreviews[message.attachmentId]} alt={message.body} />
                       {:else}<Paperclip size={17} />{/if}
                       <span><b>{message.attachmentMime?.startsWith('image/') ? (message.mine ? $t('msg.imageSent') : $t('msg.imageReceived')) : (message.mine ? $t('msg.fileSent') : $t('msg.fileReceived'))}</b><small>{message.body}</small></span>
                       {#if message.attachmentId}<ExternalLink size={14} />{/if}
