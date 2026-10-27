@@ -5149,12 +5149,13 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                 Ok(encoded) => encoded,
                 Err(error) => return ProtocolResponse::Rejected(error.to_string()),
             };
+            let timestamp_ms = remote_timestamp(group_message.timestamp_ms, received_at);
             if let Err(error) = context.history.record(
                 &group_history_key(&id),
                 "in",
                 &format!("group-text:{peer}"),
                 &encoded,
-                group_message.timestamp_ms,
+                timestamp_ms,
             ) {
                 return ProtocolResponse::Rejected(error.to_string());
             }
@@ -5165,7 +5166,7 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                     direction: "in".into(),
                     kind: "text".into(),
                     body: group_message.message.text.clone(),
-                    timestamp_ms: group_message.timestamp_ms,
+                    timestamp_ms,
                     emoticons: group_message
                         .message
                         .emoticons
@@ -5403,6 +5404,25 @@ fn emit_attachment_received(
 fn record(history: &History, peer: &PeerId, direction: &str, kind: &str, body: &str) {
     if let Err(error) = history.record(&peer.to_string(), direction, kind, body, now_ms()) {
         eprintln!("cronologia non aggiornata: {error}");
+    }
+}
+
+/// Margine concesso all'orologio di chi scrive rispetto al nostro.
+const MAX_CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
+/// Un messaggio può arrivare in ritardo (coda, dispositivo offline), ma non
+/// più di così.
+const MAX_REMOTE_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// L'istante dichiarato dal mittente, ricondotto a una finestra plausibile
+/// attorno alla ricezione: non può spostare un messaggio nel futuro né in
+/// fondo alla cronologia.
+fn remote_timestamp(claimed_ms: u64, received_at_ms: u64) -> u64 {
+    if claimed_ms > received_at_ms.saturating_add(MAX_CLOCK_SKEW_MS)
+        || claimed_ms < received_at_ms.saturating_sub(MAX_REMOTE_AGE_MS)
+    {
+        received_at_ms
+    } else {
+        claimed_ms
     }
 }
 
@@ -6517,6 +6537,15 @@ impl ClientConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_timestamps_stay_near_reception() {
+        let now = 1_000_000_000_000;
+        assert_eq!(remote_timestamp(now - 60_000, now), now - 60_000);
+        assert_eq!(remote_timestamp(now + 60_000, now), now + 60_000);
+        assert_eq!(remote_timestamp(now + 365 * 86_400_000, now), now);
+        assert_eq!(remote_timestamp(0, now), now);
+    }
 
     #[test]
     fn auto_accept_never_covers_large_files() {

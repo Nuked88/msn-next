@@ -743,8 +743,16 @@ impl History {
         Ok(result)
     }
 
-    fn commit_local(&self, operation: SyncOperation) -> Result<(), Box<dyn Error>> {
+    fn commit_local(&self, mut operation: SyncOperation) -> Result<(), Box<dyn Error>> {
         let op_id = random_id();
+        // Orologio ibrido: una modifica fatta qui viene dopo tutto ciò che
+        // questo dispositivo ha già visto per la stessa entità, anche se il
+        // suo orologio è indietro rispetto a quello di chi l'ha scritta.
+        if let Some((entity, changed_at_ms)) = versioned_entity(&mut operation) {
+            if let Some((seen, _)) = self.entity_version(&entity)? {
+                *changed_at_ms = (*changed_at_ms).max(seen.saturating_add(1));
+            }
+        }
         self.apply_operation(&op_id, &operation)?;
         self.append_sync_record(&op_id, &operation)?;
         Ok(())
@@ -1190,6 +1198,34 @@ fn random_id() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// L'entità di `sync_versions` toccata da un'operazione e il suo istante.
+fn versioned_entity(operation: &mut SyncOperation) -> Option<(String, &mut u64)> {
+    match operation {
+        SyncOperation::RecordEvent(_)
+        | SyncOperation::DeleteEvent { .. }
+        | SyncOperation::TombstoneEvent { .. } => None,
+        SyncOperation::UpsertContact {
+            contact,
+            changed_at_ms,
+        } => Some((format!("contact:{}", contact.peer), changed_at_ms)),
+        SyncOperation::DeleteContact {
+            peer,
+            changed_at_ms,
+        } => Some((format!("contact:{peer}"), changed_at_ms)),
+        SyncOperation::ClearConversation {
+            peer,
+            changed_at_ms,
+        } => Some((format!("conversation:{peer}"), changed_at_ms)),
+        SyncOperation::UpsertGroup {
+            group,
+            changed_at_ms,
+        } => Some((format!("group:{}", group.id), changed_at_ms)),
+        SyncOperation::DeleteGroup { id, changed_at_ms } => {
+            Some((format!("group:{id}"), changed_at_ms))
+        }
+    }
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1350,6 +1386,46 @@ mod tests {
 
     /// Audit #17: un messaggio cancellato spariva da `events` ma la copia
     /// restava nel sync_log, reinviato a ogni nuovo dispositivo.
+    /// Audit #24: con l'orologio indietro una modifica locale fatta dopo
+    /// averne ricevuta una remota veniva scartata (last-write-wins).
+    #[test]
+    fn local_changes_win_over_seen_ones_despite_clock_skew() {
+        let path = std::env::temp_dir().join(format!("msnnext-hlc-{}.db", std::process::id()));
+        fs::remove_file(&path).ok();
+        let history = History::open(&path, [7; 32]).unwrap();
+        let ahead = now_ms() + 60 * 60 * 1000;
+        history
+            .apply_sync_records(&[SyncRecord {
+                seq: 1,
+                op_id: "remote".into(),
+                operation: SyncOperation::UpsertContact {
+                    contact: ContactEntry {
+                        peer: "alice".into(),
+                        name: "Alice (altro PC)".into(),
+                        link: String::new(),
+                        account_id: String::new(),
+                    },
+                    changed_at_ms: ahead,
+                },
+            }])
+            .unwrap();
+
+        history.rename_contact("alice", "Alice").unwrap();
+        assert_eq!(history.contacts().unwrap()[0].name, "Alice");
+
+        // L'altro dispositivo riceve la rinomina e la applica a sua volta.
+        let other_path =
+            std::env::temp_dir().join(format!("msnnext-hlc-other-{}.db", std::process::id()));
+        fs::remove_file(&other_path).ok();
+        let other = History::open(&other_path, [8; 32]).unwrap();
+        other
+            .apply_sync_records(&history.sync_records_since(0, 100).unwrap())
+            .unwrap();
+        assert_eq!(other.contacts().unwrap()[0].name, "Alice");
+        fs::remove_file(path).ok();
+        fs::remove_file(other_path).ok();
+    }
+
     #[test]
     fn deleted_messages_leave_the_sync_log() {
         let path = std::env::temp_dir().join(format!("msnnext-redact-{}.db", std::process::id()));
