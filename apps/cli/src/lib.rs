@@ -182,6 +182,12 @@ pub enum ClientCommand {
     UpdateDisplayName {
         name: String,
     },
+    /// Solo test: dimentica la sessione cifrata con un peer, come dopo un
+    /// riavvio dell'altro lato o un handshake concorrente.
+    #[cfg(test)]
+    ForgetSession {
+        peer: PeerId,
+    },
     Shutdown,
 }
 
@@ -197,6 +203,8 @@ impl ClientCommand {
             | Self::RejectContactRequest { peer }
             | Self::DeleteMessageForEveryone { peer, .. }
             | Self::ClearConversation { peer } => Some(*peer),
+            #[cfg(test)]
+            Self::ForgetSession { peer } => Some(*peer),
             Self::CreateEmoticon { .. }
             | Self::DeleteMessageForMe { .. }
             | Self::SetAutoAcceptExtensions { .. }
@@ -372,6 +380,13 @@ pub enum ClientEvent {
     MessageDeleted {
         peer_id: String,
         event_id: String,
+    },
+    /// Un messaggio inviato non è stato consegnato (rifiutato o tentativi
+    /// esauriti).
+    MessageFailed {
+        peer_id: String,
+        event_id: String,
+        reason: String,
     },
     ContactStatus {
         peer_id: String,
@@ -787,7 +802,7 @@ async fn run_node(
     let mut handshake_retries = HashMap::<PeerId, u8>::new();
     // Affidabilità messaggi: coda per-peer quando la sessione non è pronta, e
     // tracciamento (peer, evento, tentativi) per il retry sui fallimenti.
-    let mut outbox = HashMap::<PeerId, VecDeque<ChatEvent>>::new();
+    let mut outbox = HashMap::<PeerId, VecDeque<(ChatEvent, u8)>>::new();
     let mut pending_messages =
         HashMap::<request_response::OutboundRequestId, (PeerId, ChatEvent, u8)>::new();
     // Estensioni (minuscole, senza punto) accettate automaticamente. Vuoto = off.
@@ -1171,6 +1186,14 @@ async fn run_node(
             },
             command = commands.recv(), if commands_open => match command {
                 Some(ClientCommand::Shutdown) => return Ok(LoopFlow::Stop),
+                #[cfg(test)]
+                Some(ClientCommand::ForgetSession { peer }) => {
+                    sessions.remove(&peer);
+                    let _ = events.send(ClientEvent::ContactStatus {
+                        peer_id: peer.to_string(),
+                        status: "session-forgotten".into(),
+                    });
+                }
                 Some(ClientCommand::RequestContactLink) => {
                     contact_link_requested = true;
                     let addresses = contact_addresses(&swarm, &args.relays, local_peer_id);
@@ -1435,11 +1458,11 @@ async fn run_node(
                                 pending_messages.insert(request_id, (peer, event, 0));
                             }
                             None => {
-                                outbox.entry(peer).or_default().push_back(event);
+                                outbox.entry(peer).or_default().push_back((event, 0));
                             }
                         }
                     } else {
-                        outbox.entry(peer).or_default().push_back(event);
+                        outbox.entry(peer).or_default().push_back((event, 0));
                         maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
                     }
                     let timestamp_ms = now_ms();
@@ -2443,10 +2466,10 @@ async fn run_node(
                         } else {
                             sessions
                                 .get_mut(&peer)
-                                .ok_or("sessione sicura non disponibile")
+                                .ok_or(REJECT_NO_SESSION)
                                 .and_then(|session| {
                                     decrypt_envelope(session, peer, local_peer_id, &request)
-                                        .map_err(|_| "messaggio cifrato non valido")
+                                        .map_err(|_| REJECT_UNDECRYPTABLE)
                                 })
                         };
                         let response = match envelope {
@@ -2659,9 +2682,31 @@ async fn run_node(
                                     let _ = events.send(ClientEvent::Error { message: "risposta non valida durante il trasferimento".into() });
                                 }
                             }
-                        } else {
-                            // Messaggio di testo consegnato (Ack): smetti di tracciarlo.
-                            pending_messages.remove(&request_id);
+                        } else if let Some((msg_peer, event, attempts)) = pending_messages.remove(&request_id) {
+                            match response {
+                                // Consegnato: smetti di tracciarlo.
+                                ProtocolResponse::Ack => {}
+                                // Il destinatario non riesce a decifrare (sessione
+                                // persa o sostituita da un nuovo handshake): la
+                                // nostra è stale. La scartiamo, rimettiamo il
+                                // messaggio in testa alla coda e rifacciamo
+                                // l'handshake; parte appena il canale è pronto.
+                                ProtocolResponse::Rejected(reason)
+                                    if is_session_rejection(&reason)
+                                        && attempts < MAX_DELIVERY_ATTEMPTS =>
+                                {
+                                    log::info!("messaggio rifiutato da {peer} ({reason}): nuova sessione e reinvio");
+                                    sessions.remove(&peer);
+                                    outbox.entry(msg_peer).or_default().push_front((event, attempts + 1));
+                                    maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
+                                }
+                                ProtocolResponse::Rejected(reason) => {
+                                    report_undelivered(&events, msg_peer, &event, &reason);
+                                }
+                                ProtocolResponse::MissingChunks(_) => {
+                                    report_undelivered(&events, msg_peer, &event, "risposta non valida");
+                                }
+                            }
                         }
                     }
                 },
@@ -2716,12 +2761,12 @@ async fn run_node(
                                     pending_messages.insert(new_id, (msg_peer, event, next));
                                 }
                                 None => {
-                                    outbox.entry(msg_peer).or_default().push_back(event);
+                                    outbox.entry(msg_peer).or_default().push_back((event, next));
                                 }
                             }
                         } else {
                             eprintln!("messaggio non consegnato definitivamente a {peer}: {error}");
-                            let _ = events.send(ClientEvent::Error { message: "un messaggio non è stato consegnato".into() });
+                            report_undelivered(&events, msg_peer, &event, &error.to_string());
                         }
                     } else {
                         eprintln!("invio cifrato fallito per {peer}: {error}");
@@ -2996,10 +3041,10 @@ async fn run_node(
                                             if sessions.contains_key(&target_peer) {
                                                 match send_event(&mut swarm, &mut sessions, &contact_devices, target_peer, local_peer_id, &mut sent_numbers, event.clone()) {
                                                     Some(request_id) => { pending_messages.insert(request_id, (target_peer, event, 0)); }
-                                                    None => { outbox.entry(target_peer).or_default().push_back(event); }
+                                                    None => { outbox.entry(target_peer).or_default().push_back((event, 0)); }
                                                 }
                                             } else {
-                                                outbox.entry(target_peer).or_default().push_back(event);
+                                                outbox.entry(target_peer).or_default().push_back((event, 0));
                                                 maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, target_peer);
                                             }
                                             record_text(&history, &target_peer, "out", &message);
@@ -3274,6 +3319,43 @@ fn check_outgoing_text(text: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Motivi di rifiuto con cui il destinatario segnala che la sessione cifrata
+/// del mittente non è più valida. Fanno parte del protocollo: un mittente li
+/// riconosce per rifare l'handshake e reinviare invece di perdere il messaggio.
+const REJECT_NO_SESSION: &str = "sessione sicura non disponibile";
+const REJECT_UNDECRYPTABLE: &str = "messaggio cifrato non valido";
+/// Tentativi di consegna di un messaggio di testo, handshake compresi.
+const MAX_DELIVERY_ATTEMPTS: u8 = 4;
+
+fn is_session_rejection(reason: &str) -> bool {
+    reason == REJECT_NO_SESSION || reason == REJECT_UNDECRYPTABLE
+}
+
+/// Un messaggio non è arrivato: l'utente deve saperlo, e per i testi la UI
+/// segna proprio quel messaggio come non consegnato.
+fn report_undelivered(
+    events: &mpsc::UnboundedSender<ClientEvent>,
+    peer: PeerId,
+    event: &ChatEvent,
+    reason: &str,
+) {
+    log::warn!("messaggio non consegnato a {peer}: {reason}");
+    match event {
+        ChatEvent::Text(message) => {
+            let _ = events.send(ClientEvent::MessageFailed {
+                peer_id: peer.to_string(),
+                event_id: hex_group_id(&message.id),
+                reason: reason.to_owned(),
+            });
+        }
+        _ => {
+            let _ = events.send(ClientEvent::Error {
+                message: format!("un messaggio non è stato consegnato: {reason}"),
+            });
+        }
+    }
 }
 
 /// Esito della gestione di un singolo evento del loop principale.
@@ -3943,7 +4025,7 @@ fn flush_outbox(
     devices: &ContactDevices,
     sent_numbers: &mut HashMap<PeerId, u64>,
     pending_messages: &mut HashMap<request_response::OutboundRequestId, (PeerId, ChatEvent, u8)>,
-    outbox: &mut HashMap<PeerId, VecDeque<ChatEvent>>,
+    outbox: &mut HashMap<PeerId, VecDeque<(ChatEvent, u8)>>,
     local_peer_id: PeerId,
     peer: PeerId,
 ) {
@@ -3958,13 +4040,13 @@ fn flush_outbox(
         let Some(queue) = outbox.remove(&target) else {
             continue;
         };
-        for event in queue {
+        for (event, attempts) in queue {
             match send_event(swarm, sessions, devices, target, local_peer_id, sent_numbers, event.clone()) {
                 Some(request_id) => {
-                    pending_messages.insert(request_id, (target, event, 0));
+                    pending_messages.insert(request_id, (target, event, attempts));
                 }
                 None => {
-                    outbox.entry(target).or_default().push_back(event);
+                    outbox.entry(target).or_default().push_back((event, attempts));
                 }
             }
         }
@@ -6555,6 +6637,44 @@ mod tests {
             })
             .await;
         fs::remove_dir_all(root).ok();
+    }
+
+    /// Audit #3: un messaggio rifiutato perché il destinatario non ha più la
+    /// sessione veniva trattato come consegnato e spariva. Ora il mittente
+    /// rifà l'handshake e lo reinvia.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(windows, ignore = "il teardown libp2p può bloccare l'harness Windows")]
+    async fn message_rejected_for_stale_session_is_redelivered() {
+        let root = test_root("rejected");
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut alice = TestNode::start(loopback_config("Alice", &root.join("alice"), None)).await;
+                let mut bob = TestNode::start(loopback_config("Bob", &root.join("bob"), None)).await;
+                connect_pair(&mut alice, &mut bob).await;
+
+                alice.send(ClientCommand::ForgetSession { peer: bob.peer });
+                alice
+                    .until(|event| matches!(event, ClientEvent::ContactStatus { status, .. } if status == "session-forgotten"))
+                    .await;
+                bob.send(ClientCommand::SendText {
+                    peer: alice.peer,
+                    text: "dopo la sessione persa".into(),
+                });
+                alice.until_text("dopo la sessione persa").await;
+                alice.shutdown().await;
+                bob.shutdown().await;
+            })
+            .await;
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn only_session_rejections_trigger_redelivery() {
+        assert!(is_session_rejection(REJECT_NO_SESSION));
+        assert!(is_session_rejection(REJECT_UNDECRYPTABLE));
+        assert!(!is_session_rejection("contatto rimosso"));
+        assert!(!is_session_rejection("testo non valido"));
     }
 
     /// Audit #2: se il nodo termina con un errore la UI deve ricevere
