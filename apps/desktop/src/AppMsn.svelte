@@ -16,7 +16,7 @@
   import { getCurrentWindow, UserAttentionType } from '@tauri-apps/api/window'
   import { Image } from '@tauri-apps/api/image'
   import { PhysicalPosition } from '@tauri-apps/api/dpi'
-  import { scan, Format } from '@tauri-apps/plugin-barcode-scanner'
+  import { scan, Format, checkPermissions as checkCameraPermission, requestPermissions as requestCameraPermission } from '@tauri-apps/plugin-barcode-scanner'
   import { getCurrent as getDeepLinks, onOpenUrl } from '@tauri-apps/plugin-deep-link'
   import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
   import { relaunch } from '@tauri-apps/plugin-process'
@@ -272,10 +272,46 @@
     return notifPermissionGranted
   }
 
+  // Privacy di default: la notifica dice solo "N nuovi messaggi", senza
+  // mittente né testo (visibili sulla schermata di blocco). Opt-in nei settings.
+  const notificationContentKey = 'msnnext-notification-content-v1'
+  const privateNotificationId = 1
+  let notificationShowContent = typeof localStorage !== 'undefined'
+    && localStorage.getItem(notificationContentKey) === '1'
+  $: if (typeof localStorage !== 'undefined') localStorage.setItem(notificationContentKey, notificationShowContent ? '1' : '0')
+  let privateNotificationCount = 0
+
   async function osNotify(title: string, body: string) {
     if (!notificationsEnabled) return
     if (!(await ensureNotifPermission())) return
-    try { sendNotification({ title, body }) } catch (error) { console.warn('notifica non inviata', error) }
+    try {
+      if (notificationShowContent) {
+        sendNotification({ title, body })
+      } else {
+        // Stesso id: su Android la notifica precedente viene sostituita.
+        privateNotificationCount += 1
+        sendNotification({
+          id: privateNotificationId,
+          title: 'msnnext',
+          body: privateNotificationCount === 1
+            ? $t('notif.privateOne')
+            : $t('notif.privateMany', { count: privateNotificationCount }),
+        })
+      }
+    } catch (error) { console.warn('notifica non inviata', error) }
+  }
+
+  // Android: chiede i permessi runtime (notifiche, fotocamera per i QR) una
+  // sola volta al primo avvio, invece che al primo uso.
+  const mobilePermissionsAskedKey = 'msnnext-mobile-permissions-v1'
+  async function requestMobilePermissionsOnce() {
+    if (!isMobile || !isTauri()) return
+    if (localStorage.getItem(mobilePermissionsAskedKey) === '1') return
+    localStorage.setItem(mobilePermissionsAskedKey, '1')
+    if (notificationsEnabled) await ensureNotifPermission()
+    try {
+      if ((await checkCameraPermission()) !== 'granted') await requestCameraPermission()
+    } catch (error) { console.warn('permesso fotocamera non richiesto', error) }
   }
 
   // Auto-accept media: estensioni consentite (stringa comma/spazio separata).
@@ -509,13 +545,17 @@
     window.addEventListener('contextmenu', blockNativeMenu)
     window.addEventListener('keydown', openPreferences)
     const refreshPendingContactRequests = () => {
-      if (document.visibilityState === 'visible') void requestPendingContactRequests()
+      if (document.visibilityState === 'visible') {
+        privateNotificationCount = 0
+        void requestPendingContactRequests()
+      }
     }
     document.addEventListener('visibilitychange', refreshPendingContactRequests)
     if (isTauri()) {
       void getVersion().then((version) => appVersion = version)
       // Android: il QR letto dalla fotocamera di sistema apre msnnext://add/…
       if (isMobile) {
+        void requestMobilePermissionsOnce()
         void getDeepLinks().then((urls) => urls && handleOpenUrls(urls)).catch(() => {})
         void onOpenUrl(handleOpenUrls).then((stop) => unlistenDeepLink = stop).catch(() => {})
       }
@@ -542,6 +582,7 @@
       void appWindow.onFocusChanged(({ payload: focused }) => {
         windowFocused = focused
         if (focused) {
+          privateNotificationCount = 0
           void requestPendingContactRequests()
           markActiveConversationRead()
           void appWindow.requestUserAttention(null)
@@ -3073,6 +3114,7 @@
                 <label class="settings-row"><span><strong>{$t('settings.nudgeSound.title')}</strong><small>{$t('settings.nudgeSound.desc')}</small></span><input type="checkbox" bind:checked={nudgeSound} /></label>
                 <label class="settings-row"><span><strong>{$t('settings.effectsSounds.title')}</strong><small>{$t('settings.effectsSounds.desc')}</small></span><input type="checkbox" bind:checked={effectsSounds} /></label>
                 <label class="settings-row"><span><strong>{$t('settings.notifications.title')}</strong><small>{$t('settings.notifications.desc')}</small></span><input type="checkbox" bind:checked={notificationsEnabled} onchange={() => { if (notificationsEnabled) void ensureNotifPermission() }} /></label>
+                {#if notificationsEnabled}<label class="settings-row"><span><strong>{$t('settings.notificationContent.title')}</strong><small>{$t('settings.notificationContent.desc')}</small></span><input type="checkbox" bind:checked={notificationShowContent} /></label>{/if}
                 <label class="settings-row"><span><strong>{$t('settings.autostart.title')}</strong><small>{$t('settings.autostart.desc')}</small></span><input type="checkbox" checked={autostartEnabled} onchange={(e) => void setAutostart(e.currentTarget.checked)} /></label>
                 <label class="settings-row"><span><strong>{$t('settings.startMinimized.title')}</strong><small>{$t('settings.startMinimized.desc')}</small></span><input type="checkbox" bind:checked={startMinimized} /></label>
                 <label class="settings-row"><span><strong>{$t('settings.language.title')}</strong><small>{$t('settings.language.desc')}</small></span>
