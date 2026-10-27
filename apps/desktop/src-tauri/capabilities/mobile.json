@@ -1,10 +1,11 @@
 {
   "$schema": "../gen/schemas/mobile-schema.json",
   "identifier": "mobile",
-  "description": "Permessi solo mobile (scanner QR con fotocamera).",
+  "description": "Permessi solo mobile (scanner QR con fotocamera, link msnnext://).",
   "platforms": ["android", "iOS"],
   "windows": ["main"],
   "permissions": [
-    "barcode-scanner:default"
+    "barcode-scanner:default",
+    "deep-link:default"
   ]
 }
