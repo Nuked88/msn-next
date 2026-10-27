@@ -1,6 +1,6 @@
 [package]
 name = "msnnext-desktop"
-version = "0.8.8"
+version = "0.8.9"
 description = "Desktop client for msnnext"
 authors = ["msnnext contributors"]
 license = "AGPL-3.0-or-later"
@@ -26,7 +26,7 @@ tauri-plugin-log = "2"
 tauri-plugin-process = "2.3.1"
 tauri-plugin-updater = "2.10.1"
 tokio = { version = "1.52.3", features = ["rt", "sync"], default-features = false }
-msnnext = { version = "0.8.8", path = "../../cli" }
+msnnext = { version = "0.8.9", path = "../../cli" }
 tauri-plugin-dialog = "2.7.1"
 tauri-plugin-notification = "2"
 libp2p-identity = { version = "0.2.14", features = ["peerid", "ed25519"] }
