@@ -67,6 +67,8 @@ const TEXT_HISTORY_PREFIX: &str = "msnnext-text-v1:";
 /// Richieste di contatto mostrate e in attesa di risposta.
 const MAX_PENDING_CONTACT_REQUESTS: usize = 20;
 const MAX_PENDING_INBOUND_OFFERS: usize = 8;
+/// Emoticon ricevute in attesa di salvataggio (fino a ~350 KB l'una).
+const MAX_PENDING_EMOTICONS: usize = 64;
 const ATTACHMENT_DECISION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Entro quanto un messaggio deve essere confermato prima del reinvio. Il
 /// timeout di libp2p è unico per il protocollo cifrato e vale 5 minuti per
@@ -5259,6 +5261,14 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                 ProtocolResponse::Ack
             }
         },
+        ChatEvent::EmoticonOffer(offer)
+            if !context
+                .pending_emoticons
+                .contains_key(&offer.metadata.asset_id)
+                && context.pending_emoticons.len() >= MAX_PENDING_EMOTICONS =>
+        {
+            ProtocolResponse::Rejected("troppe emoticon in attesa".into())
+        }
         ChatEvent::EmoticonOffer(offer) => match validate_offer(offer) {
             Ok(()) => {
                 let trigger = offer

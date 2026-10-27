@@ -14,6 +14,9 @@ use std::{
 pub const CHUNK_SIZE: usize = 256 * 1024;
 pub const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MAX_PREVIEW_BYTES: u64 = 50 * 1024 * 1024;
+/// Trasferimenti in arrivo tenuti in memoria allo stesso tempo: oltre questo
+/// numero le nuove offerte vengono rifiutate finché uno non finisce.
+pub const MAX_ACTIVE_INCOMING: usize = 32;
 
 pub fn build_manifest(path: &Path) -> Result<AttachmentManifest, Box<dyn Error>> {
     let size = fs::metadata(path)?.len();
@@ -184,6 +187,11 @@ impl Receiver {
             {
                 return Ok((vec![], Some(Completion::Ready(completed(&manifest)))));
             }
+        }
+        if !self.active.contains_key(&manifest.attachment_id)
+            && self.active.len() >= MAX_ACTIVE_INCOMING
+        {
+            return Err("troppi trasferimenti in arrivo".into());
         }
         fs::create_dir_all(self.vault.parts_dir(&manifest.attachment_id))?;
         // Per il resume basta guardare la dimensione delle parti già scritte:
@@ -612,6 +620,30 @@ mod tests {
         let mut duplicate = Receiver::new(root.join("received"), [11; 32]);
         let (missing, completed) = duplicate.accept_offer(manifest).unwrap();
         assert!(missing.is_empty() && matches!(completed, Some(Completion::Ready(_))));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn active_incoming_transfers_are_capped() {
+        let root = std::env::temp_dir().join(format!("msnnext-cap-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        let mut receiver = Receiver::new(root.join("received"), [12; 32]);
+        let manifests: Vec<_> = (0..=MAX_ACTIVE_INCOMING)
+            .map(|index| {
+                let source = root.join(format!("{index}.bin"));
+                fs::write(&source, vec![index as u8; CHUNK_SIZE + 1]).unwrap();
+                build_manifest(&source).unwrap()
+            })
+            .collect();
+        for manifest in &manifests[..MAX_ACTIVE_INCOMING] {
+            receiver.accept_offer(manifest.clone()).unwrap();
+        }
+        assert!(receiver
+            .accept_offer(manifests[MAX_ACTIVE_INCOMING].clone())
+            .is_err());
+        // Riproporre un trasferimento già attivo (resume) resta possibile.
+        assert!(receiver.accept_offer(manifests[0].clone()).is_ok());
         fs::remove_dir_all(root).ok();
     }
 
