@@ -488,6 +488,11 @@ impl HybridInitiator {
         ))
     }
 
+    /// Se l'handshake rinnova una sessione già attiva.
+    pub(crate) fn rekey(&self) -> bool {
+        self.client_hello.rekey
+    }
+
     pub(crate) fn finish(
         self,
         server_hello: &HybridServerHello,
