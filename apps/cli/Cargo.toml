@@ -21,6 +21,7 @@ msnnext-protocol = { path = "../../crates/protocol" }
 notify-rust = "4"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
+spake2 = "0.4"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread"] }
 qrcode = { version = "0.14.1", default-features = false }
 aws-lc-rs = { version = "=1.17.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm", "unstable"] }

@@ -4,6 +4,7 @@ mod contacts;
 mod crypto;
 mod devices;
 mod history;
+mod invite;
 
 use attachments::{
     build_manifest, read_chunk, validate_manifest, CompletedAttachment, Completion, FinalizeJob,
@@ -216,6 +217,13 @@ pub enum ClientCommand {
         until_ms: Option<u64>,
     },
     RequestContactLink,
+    /// Crea un codice d'invito corto (sostituisce quello precedente).
+    CreateInvite,
+    CancelInvite,
+    /// Usa il codice d'invito mostrato da un'altra persona.
+    JoinInvite {
+        code: String,
+    },
     RequestDeviceLink,
     ImportDeviceLink {
         link: String,
@@ -296,6 +304,9 @@ impl ClientCommand {
             | Self::SetNotificationMute { .. }
             | Self::ImportContactLink { .. }
             | Self::RequestContactLink
+            | Self::CreateInvite
+            | Self::CancelInvite
+            | Self::JoinInvite { .. }
             | Self::RequestDeviceLink
             | Self::ImportDeviceLink { .. }
             | Self::UpdateDisplayName { .. }
@@ -515,6 +526,21 @@ pub enum ClientEvent {
         qr_link: String,
         expires_at_ms: u64,
     },
+    /// Codice d'invito da mostrare o dettare all'altra persona.
+    Invite {
+        code: String,
+        expires_at_ms: u64,
+    },
+    /// Invito concluso: il contatto è in rubrica da entrambe le parti.
+    InviteCompleted {
+        peer_id: String,
+        name: String,
+    },
+    /// L'invito mostrato (`inviter`) o quello inserito è fallito.
+    InviteFailed {
+        inviter: bool,
+        message: String,
+    },
     DevicesUpdated {
         devices: Vec<ClientDevice>,
     },
@@ -633,6 +659,7 @@ struct Behaviour {
     secure_chat: request_response::cbor::Behaviour<RatchetMessage, ProtocolResponse>,
     handshake: request_response::cbor::Behaviour<crypto::HybridClientHello, HybridResponse>,
     devices: request_response::cbor::Behaviour<SealedDeviceMessage, SealedDeviceMessage>,
+    invite: request_response::cbor::Behaviour<invite::InviteRequest, invite::InviteResponse>,
     mdns: mdns::tokio::Behaviour,
     identify: identify::Behaviour,
     kad: kad::Behaviour<kad::store::MemoryStore>,
@@ -641,6 +668,21 @@ struct Behaviour {
     relay_server: Toggle<relay::Behaviour>,
     dcutr: dcutr::Behaviour,
     ping: ping::Behaviour,
+}
+
+/// Ricerca e scambio per un codice d'invito inserito dall'utente.
+struct InviteJoin {
+    code: invite::InviteCode,
+    query: Option<kad::QueryId>,
+    /// Provider trovati nella DHT e non ancora provati.
+    candidates: VecDeque<PeerId>,
+    tried: HashSet<PeerId>,
+    current: Option<PeerId>,
+    session: Option<invite::JoinSession>,
+    /// Scheda di chi invita già verificata, in attesa del suo `Finished`.
+    card: Option<contacts::InviteCard>,
+    /// Ultimo errore di un candidato, mostrato se non ne restano altri.
+    last_error: Option<String>,
 }
 
 struct PendingOffer {
@@ -769,6 +811,18 @@ fn build_swarm(
                     [(
                         StreamProtocol::new("/msnnext/devices/1"),
                         ProtocolSupport::Full,
+                    )],
+                    request_response::Config::default(),
+                ),
+                // Il mininodo trova gli inviti nella DHT ma non ne accetta.
+                invite: request_response::cbor::Behaviour::new(
+                    [(
+                        StreamProtocol::new("/msnnext/invite/1"),
+                        if relay_server_enabled {
+                            ProtocolSupport::Outbound
+                        } else {
+                            ProtocolSupport::Full
+                        },
                     )],
                     request_response::Config::default(),
                 ),
@@ -1022,6 +1076,8 @@ async fn run_node(
     let device_link_requested = false;
     let pending_pairings = HashMap::<[u8; 16], PendingPairing>::new();
     let pending_pair_targets = HashMap::<PeerId, PairingLink>::new();
+    let active_invite = None::<invite::ActiveInvite>;
+    let invite_join = None::<InviteJoin>;
     let pending_device_requests =
         HashMap::<request_response::OutboundRequestId, PendingDeviceRequest>::new();
     let online_devices = HashSet::<PeerId>::new();
@@ -1211,6 +1267,8 @@ async fn run_node(
         device_link_requested,
         pending_pairings,
         pending_pair_targets,
+        active_invite,
+        invite_join,
         pending_device_requests,
         online_devices,
         known_devices,
@@ -1323,6 +1381,10 @@ struct Node {
     device_link_requested: bool,
     pending_pairings: HashMap<[u8; 16], PendingPairing>,
     pending_pair_targets: HashMap<PeerId, PairingLink>,
+    /// Invito a codice mostrato da questo dispositivo.
+    active_invite: Option<invite::ActiveInvite>,
+    /// Codice d'invito inserito qui e ancora in corso.
+    invite_join: Option<InviteJoin>,
     pending_device_requests: HashMap<request_response::OutboundRequestId, PendingDeviceRequest>,
     online_devices: HashSet<PeerId>,
     known_devices: HashMap<PeerId, DeviceEntry>,
@@ -1983,6 +2045,11 @@ impl Node {
         let local_peer_id = *local_peer_id;
         match command {
             Some(
+                command @ (ClientCommand::CreateInvite
+                | ClientCommand::CancelInvite
+                | ClientCommand::JoinInvite { .. }),
+            ) => return self.on_invite_command(command),
+            Some(
                 command @ (ClientCommand::RequestContactLink
                 | ClientCommand::RequestDeviceLink
                 | ClientCommand::ImportDeviceLink { .. }
@@ -2514,6 +2581,30 @@ impl Node {
                     }
                 }
             }
+            SwarmEvent::Behaviour(BehaviourEvent::Invite(request_response::Event::Message {
+                peer,
+                message,
+                ..
+            })) => return self.on_invite_message(peer, message),
+            SwarmEvent::Behaviour(BehaviourEvent::Invite(
+                request_response::Event::OutboundFailure { peer, error, .. },
+            )) => {
+                log::warn!("invito verso {peer} fallito: {error}");
+                return self
+                    .invite_candidate_failed(peer, "chi ha creato il codice non è raggiungibile");
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
+                id,
+                result: kad::QueryResult::GetProviders(result),
+                step,
+                ..
+            })) if self
+                .invite_join
+                .as_ref()
+                .is_some_and(|join| join.query == Some(id)) =>
+            {
+                return self.on_invite_providers(result, step.last)
+            }
             SwarmEvent::Behaviour(BehaviourEvent::Devices(request_response::Event::Message {
                 peer,
                 message,
@@ -2738,6 +2829,7 @@ impl Node {
             pending_device_requests,
             online_devices,
             known_devices,
+            active_invite,
             args,
             events,
             ..
@@ -2750,6 +2842,16 @@ impl Node {
         reconnect_at.remove(&peer_id);
         reconnect_attempts.remove(&peer_id);
         fallback_planner.connected(peer_id);
+        // Un invito creato prima di raggiungere il mininodo non era arrivato
+        // nella DHT: lo ripubblichiamo appena c'è.
+        if infrastructure_peers.contains(&peer_id) {
+            if let Some(invite) = active_invite.as_ref() {
+                let key = kad::RecordKey::new(&invite.code.rendezvous_key());
+                if let Err(error) = swarm.behaviour_mut().kad.start_providing(key) {
+                    log::warn!("invito non pubblicato: {error}");
+                }
+            }
+        }
         if let Some(address) = relay_addresses.get(&peer_id) {
             if requested_relay_reservations.insert(peer_id) {
                 if let Err(error) = swarm.listen_on(address.clone().with(Protocol::P2pCircuit)) {
@@ -4665,6 +4767,377 @@ impl Node {
             _ => {}
         }
         Ok(LoopFlow::Continue)
+    }
+
+    fn on_invite_command(&mut self, command: ClientCommand) -> Result<LoopFlow, Box<dyn Error>> {
+        match command {
+            ClientCommand::CreateInvite => {
+                self.stop_invite();
+                let invite = invite::ActiveInvite::new(now_ms());
+                let key = kad::RecordKey::new(&invite.code.rendezvous_key());
+                if let Err(error) = self.swarm.behaviour_mut().kad.start_providing(key) {
+                    self.invite_failed(true, error.to_string());
+                    return Ok(LoopFlow::Continue);
+                }
+                let _ = self.events.send(ClientEvent::Invite {
+                    code: invite.code.to_string(),
+                    expires_at_ms: invite.expires_at_ms,
+                });
+                self.active_invite = Some(invite);
+            }
+            ClientCommand::CancelInvite => self.stop_invite(),
+            ClientCommand::JoinInvite { code } => {
+                let code = match invite::InviteCode::parse(&code) {
+                    Ok(code) => code,
+                    Err(message) => {
+                        self.invite_failed(false, message.into());
+                        return Ok(LoopFlow::Continue);
+                    }
+                };
+                if self
+                    .active_invite
+                    .as_ref()
+                    .is_some_and(|active| active.code == code)
+                {
+                    self.invite_failed(
+                        false,
+                        "questo è il tuo codice: va inserito dall'altra persona".into(),
+                    );
+                    return Ok(LoopFlow::Continue);
+                }
+                let key = kad::RecordKey::new(&code.rendezvous_key());
+                let query = self.swarm.behaviour_mut().kad.get_providers(key);
+                self.invite_join = Some(InviteJoin {
+                    code,
+                    query: Some(query),
+                    candidates: VecDeque::new(),
+                    tried: HashSet::new(),
+                    current: None,
+                    session: None,
+                    card: None,
+                    last_error: None,
+                });
+            }
+            _ => {}
+        }
+        Ok(LoopFlow::Continue)
+    }
+
+    fn invite_failed(&mut self, inviter: bool, message: String) {
+        let _ = self
+            .events
+            .send(ClientEvent::InviteFailed { inviter, message });
+    }
+
+    /// Ritira l'invito mostrato: la DHT smette di indicare questo peer e i
+    /// tentativi successivi vengono rifiutati.
+    fn stop_invite(&mut self) {
+        if let Some(invite) = self.active_invite.take() {
+            self.swarm
+                .behaviour_mut()
+                .kad
+                .stop_providing(&kad::RecordKey::new(&invite.code.rendezvous_key()));
+        }
+    }
+
+    fn own_invite_card(&self) -> Result<Vec<u8>, Box<dyn Error>> {
+        contacts::invite_card(
+            &self.display_name,
+            self.local_peer_id,
+            &self.contact_identity,
+            &self.ml_dsa_identity,
+            contact_addresses(&self.swarm, &self.args.relays, self.local_peer_id).into_iter(),
+        )
+    }
+
+    fn on_invite_providers(
+        &mut self,
+        result: kad::GetProvidersResult,
+        last: bool,
+    ) -> Result<LoopFlow, Box<dyn Error>> {
+        let local_peer_id = self.local_peer_id;
+        let Some(join) = self.invite_join.as_mut() else {
+            return Ok(LoopFlow::Continue);
+        };
+        if let Ok(kad::GetProvidersOk::FoundProviders { providers, .. }) = result {
+            for provider in providers {
+                if provider != local_peer_id
+                    && !join.tried.contains(&provider)
+                    && !join.candidates.contains(&provider)
+                    && join.tried.len() + join.candidates.len() < invite::MAX_INVITE_CANDIDATES
+                {
+                    join.candidates.push_back(provider);
+                }
+            }
+        }
+        // Ogni server DHT restituisce tutti i provider che conosce: appena
+        // ne arriva uno non serve interrogare anche i peer più lontani, che
+        // in modalità client non rispondono e farebbero solo attendere.
+        if !join.candidates.is_empty() {
+            if let Some(mut query) = join
+                .query
+                .take()
+                .and_then(|id| self.swarm.behaviour_mut().kad.query_mut(&id))
+            {
+                query.finish();
+            }
+        } else if last {
+            join.query = None;
+        }
+        self.invite_next_candidate();
+        Ok(LoopFlow::Continue)
+    }
+
+    /// Prova il prossimo provider del nameplate, oppure chiude la ricerca.
+    fn invite_next_candidate(&mut self) {
+        let Some(join) = self.invite_join.as_mut() else {
+            return;
+        };
+        if join.current.is_some() {
+            return;
+        }
+        let Some(peer) = join.candidates.pop_front() else {
+            if join.query.is_none() {
+                let message = join.last_error.take().unwrap_or_else(|| {
+                    "codice non trovato: controlla che sia giusto e che chi l'ha creato sia online"
+                        .into()
+                });
+                self.invite_join = None;
+                self.invite_failed(false, message);
+            }
+            return;
+        };
+        join.tried.insert(peer);
+        join.current = Some(peer);
+        let (session, request) = invite::JoinSession::start(join.code, peer, self.local_peer_id);
+        join.session = Some(session);
+        // La richiesta compone da sola il numero: indirizzi dalla ricerca DHT
+        // in corso, più i circuiti sui relay configurati.
+        for relay in &self.args.relays {
+            if let Ok(route) = relay_route(relay, peer) {
+                self.swarm.add_peer_address(peer, route);
+            }
+        }
+        self.swarm
+            .behaviour_mut()
+            .invite
+            .send_request(&peer, request);
+    }
+
+    fn invite_candidate_failed(
+        &mut self,
+        peer: PeerId,
+        reason: &str,
+    ) -> Result<LoopFlow, Box<dyn Error>> {
+        if let Some(join) = self
+            .invite_join
+            .as_mut()
+            .filter(|join| join.current == Some(peer))
+        {
+            join.current = None;
+            join.session = None;
+            join.card = None;
+            join.last_error = Some(reason.to_owned());
+            self.invite_next_candidate();
+        }
+        Ok(LoopFlow::Continue)
+    }
+
+    fn on_invite_message(
+        &mut self,
+        peer: PeerId,
+        message: request_response::Message<invite::InviteRequest, invite::InviteResponse>,
+    ) -> Result<LoopFlow, Box<dyn Error>> {
+        match message {
+            request_response::Message::Request {
+                request, channel, ..
+            } => {
+                let (response, card) = self.answer_invite(peer, request);
+                let finished = matches!(response, invite::InviteResponse::Finished);
+                self.swarm
+                    .behaviour_mut()
+                    .invite
+                    .send_response(channel, response)
+                    .ok();
+                if let (true, Some(card)) = (finished, card) {
+                    self.stop_invite();
+                    let name = card.name.clone();
+                    if let Err(error) = self.add_invited_contact(card) {
+                        self.invite_failed(true, error.to_string());
+                        return Ok(LoopFlow::Continue);
+                    }
+                    let _ = self.events.send(ClientEvent::InviteCompleted {
+                        peer_id: peer.to_string(),
+                        name,
+                    });
+                    return self.on_connection_established(peer);
+                }
+            }
+            request_response::Message::Response { response, .. } => {
+                if !self
+                    .invite_join
+                    .as_ref()
+                    .is_some_and(|join| join.current == Some(peer))
+                {
+                    return Ok(LoopFlow::Continue);
+                }
+                match response {
+                    invite::InviteResponse::Started { message, card } => {
+                        let Some(session) =
+                            self.invite_join.as_mut().and_then(|j| j.session.take())
+                        else {
+                            return Ok(LoopFlow::Continue);
+                        };
+                        let own_card = self.own_invite_card()?;
+                        let verified = session
+                            .complete(&message, &card, &own_card)
+                            .map_err(|error| error.to_string())
+                            .and_then(|(bytes, finish)| {
+                                let card = contacts::decode_invite_card(&bytes)
+                                    .map_err(|error| error.to_string())?;
+                                if card.peer_id != peer {
+                                    return Err("la scheda non è di chi ha risposto".into());
+                                }
+                                Ok((card, finish))
+                            });
+                        match verified {
+                            Ok((card, finish)) => {
+                                // Chi invita è verificato: lo aggiungiamo subito,
+                                // così la sua presence non diventa una richiesta.
+                                if let Err(error) = self.add_invited_contact(card.clone()) {
+                                    return self.invite_candidate_failed(peer, &error.to_string());
+                                }
+                                if let Some(join) = self.invite_join.as_mut() {
+                                    join.card = Some(card);
+                                }
+                                self.swarm
+                                    .behaviour_mut()
+                                    .invite
+                                    .send_request(&peer, finish);
+                            }
+                            Err(error) => return self.invite_candidate_failed(peer, &error),
+                        }
+                    }
+                    invite::InviteResponse::Finished => {
+                        let Some(card) = self.invite_join.take().and_then(|join| join.card) else {
+                            return Ok(LoopFlow::Continue);
+                        };
+                        let _ = self.events.send(ClientEvent::InviteCompleted {
+                            peer_id: peer.to_string(),
+                            name: card.name,
+                        });
+                        return self.on_connection_established(peer);
+                    }
+                    invite::InviteResponse::Rejected(reason) => {
+                        return self.invite_candidate_failed(peer, &reason)
+                    }
+                }
+            }
+        }
+        Ok(LoopFlow::Continue)
+    }
+
+    /// Lato di chi invita: risponde a `Start` e `Finish`. Con `Finished`
+    /// restituisce anche la scheda verificata di chi ha usato il codice.
+    fn answer_invite(
+        &mut self,
+        peer: PeerId,
+        request: invite::InviteRequest,
+    ) -> (invite::InviteResponse, Option<contacts::InviteCard>) {
+        let now = now_ms();
+        let rejected = |reason: &str| (invite::InviteResponse::Rejected(reason.into()), None);
+        if self.known_devices.contains_key(&peer) {
+            return rejected("un tuo dispositivo non può essere un contatto");
+        }
+        if self
+            .active_invite
+            .as_ref()
+            .is_none_or(|invite| invite.expired(now))
+        {
+            self.stop_invite();
+            return rejected(invite::INVITE_EXPIRED);
+        }
+        match request {
+            invite::InviteRequest::Start { nameplate, message } => {
+                if self
+                    .active_invite
+                    .as_ref()
+                    .is_some_and(|invite| invite.exhausted(now))
+                {
+                    self.stop_invite();
+                    self.invite_failed(true, invite::INVITE_BURNED.into());
+                    return rejected(invite::INVITE_EXPIRED);
+                }
+                let card = match self.own_invite_card() {
+                    Ok(card) => card,
+                    Err(error) => return rejected(&error.to_string()),
+                };
+                let local_peer_id = self.local_peer_id;
+                let Some(active) = self.active_invite.as_mut() else {
+                    return rejected(invite::INVITE_EXPIRED);
+                };
+                match active.start(local_peer_id, peer, nameplate, &message, &card, now) {
+                    Ok((message, card)) => {
+                        (invite::InviteResponse::Started { message, card }, None)
+                    }
+                    Err(error) => rejected(error),
+                }
+            }
+            invite::InviteRequest::Finish { nameplate, card } => {
+                let Some(active) = self.active_invite.as_mut() else {
+                    return rejected(invite::INVITE_EXPIRED);
+                };
+                let card = active
+                    .finish(peer, nameplate, &card, now)
+                    .map_err(|error| error.to_string())
+                    .and_then(|bytes| {
+                        contacts::decode_invite_card(&bytes).map_err(|error| error.to_string())
+                    });
+                match card {
+                    Ok(card) if card.peer_id == peer => {
+                        (invite::InviteResponse::Finished, Some(card))
+                    }
+                    Ok(_) => rejected("la scheda non è di chi ha usato il codice"),
+                    Err(error) => rejected(&error),
+                }
+            }
+        }
+    }
+
+    /// Mette in rubrica un contatto arrivato con un invito e fissa subito la
+    /// sua chiave ML-DSA, già verificata dalla firma della scheda.
+    fn add_invited_contact(&mut self, card: contacts::InviteCard) -> Result<(), Box<dyn Error>> {
+        let peer = card.peer_id;
+        let key = peer.to_string();
+        match self.history.pq_identity(&key)? {
+            Some(pinned) if pinned != card.ml_dsa_public_key => {
+                return Err("la chiave ML-DSA del contatto è cambiata".into())
+            }
+            Some(_) => {}
+            None => self
+                .history
+                .pin_pq_identity(&key, &card.ml_dsa_public_key)?,
+        }
+        self.history.allow_contact(&key)?;
+        self.ignored_contacts.remove(&peer);
+        self.pending_contact_requests.remove(&peer);
+        self.history
+            .save_contact(&key, &card.name, &card.link, now_ms())?;
+        self.peer_names.insert(peer, card.name.clone());
+        self.known_contacts.insert(peer);
+        for address in card.addresses {
+            self.swarm.add_peer_address(peer, address);
+        }
+        let _ = self.events.send(ClientEvent::ContactUpdated {
+            contact: ClientContact {
+                peer_id: key,
+                name: card.name,
+                online: false,
+                secure: false,
+                fingerprint: peer_fingerprint(peer),
+            },
+        });
+        Ok(())
     }
 
     fn on_message_command(&mut self, command: ClientCommand) -> Result<LoopFlow, Box<dyn Error>> {
@@ -9926,6 +10399,119 @@ mod tests {
         ));
         fs::remove_dir_all(&root).ok();
         root
+    }
+
+    /// Bob inserisce il codice di Alice: la DHT del mininodo li fa
+    /// incontrare e SPAKE2 li aggiunge a vicenda, senza richiesta da accettare.
+    async fn join_invite(bob: &mut TestNode, code: &str) -> ClientEvent {
+        // L'invito arriva nella DHT poco dopo la creazione: finché non c'è
+        // il codice risulta "non trovato".
+        for _ in 0..30 {
+            bob.send(ClientCommand::JoinInvite { code: code.into() });
+            let event = bob
+                .until(|event| {
+                    matches!(
+                        event,
+                        ClientEvent::InviteCompleted { .. } | ClientEvent::InviteFailed { .. }
+                    )
+                })
+                .await;
+            match &event {
+                ClientEvent::InviteFailed { message, .. } if message.contains("non trovato") => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                _ => return event,
+            }
+        }
+        panic!("invito mai trovato nella DHT");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(windows, ignore = "il teardown libp2p può bloccare l'harness Windows")]
+    async fn invite_code_adds_both_contacts_through_the_dht() {
+        let root = test_root("invite");
+        let relay_port = available_udp_port();
+        let relay_listen: Multiaddr = format!("/ip4/127.0.0.1/udp/{relay_port}/quic-v1")
+            .parse()
+            .unwrap();
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut relay_config =
+                    loopback_config("Mininodo", &root.join("relay"), Some(relay_listen.clone()));
+                relay_config.relay_server = true;
+                let relay = TestNode::start(relay_config).await;
+                let bootstrap = relay_listen.clone().with(Protocol::P2p(relay.peer));
+                let client = |name: &str| {
+                    let mut config = loopback_config(name, &root.join(name), None);
+                    config.bootstrap = vec![bootstrap.clone()];
+                    config
+                };
+                let mut alice = TestNode::start(client("alice")).await;
+                let mut bob = TestNode::start(client("bob")).await;
+
+                alice.send(ClientCommand::CreateInvite);
+                let ClientEvent::Invite { code, .. } = alice
+                    .until(|event| matches!(event, ClientEvent::Invite { .. }))
+                    .await
+                else {
+                    unreachable!()
+                };
+
+                // Parola sbagliata: nessuna scheda passa, il contatto non c'è.
+                let mut parts = code.split('-').map(str::to_owned).collect::<Vec<_>>();
+                parts[3] = if parts[3] == "abaco" {
+                    "zuppa"
+                } else {
+                    "abaco"
+                }
+                .into();
+                let wrong = parts.join("-");
+                let ClientEvent::InviteFailed { inviter, message } =
+                    join_invite(&mut bob, &wrong).await
+                else {
+                    panic!("un codice sbagliato non deve aggiungere contatti");
+                };
+                assert!(!inviter);
+                assert_eq!(message, invite::INVITE_WRONG_CODE);
+
+                let ClientEvent::InviteCompleted { peer_id, name } =
+                    join_invite(&mut bob, &code).await
+                else {
+                    panic!("il codice giusto deve funzionare");
+                };
+                assert_eq!(peer_id, alice.peer.to_string());
+                assert_eq!(name, "alice");
+                let ClientEvent::InviteCompleted { peer_id, .. } = alice
+                    .until(|event| matches!(event, ClientEvent::InviteCompleted { .. }))
+                    .await
+                else {
+                    unreachable!()
+                };
+                assert_eq!(peer_id, bob.peer.to_string());
+
+                // Canale cifrato senza accettare richieste: la chiave ML-DSA
+                // fissata dalla scheda coincide con quella dell'handshake.
+                alice.until_secure().await;
+                bob.until_secure().await;
+                bob.send(ClientCommand::SendText {
+                    peer: alice.peer,
+                    text: "ciao dal codice".into(),
+                });
+                alice.until_text("ciao dal codice").await;
+
+                // Il codice è monouso.
+                let ClientEvent::InviteFailed { .. } = join_invite(&mut bob, &code).await else {
+                    panic!("un codice già usato non deve funzionare di nuovo");
+                };
+
+                alice.shutdown().await;
+                bob.shutdown().await;
+                relay.shutdown().await;
+            })
+            .await;
+        fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test(flavor = "current_thread")]
