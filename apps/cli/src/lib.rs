@@ -799,11 +799,11 @@ pub async fn run(
 
 async fn run_node(
     args: ClientConfig,
-    mut commands: mpsc::UnboundedReceiver<ClientCommand>,
+    commands: mpsc::UnboundedReceiver<ClientCommand>,
     events: mpsc::UnboundedSender<ClientEvent>,
 ) -> Result<(), Box<dyn Error>> {
     let identity = match args.identity_bytes {
-        Some(bytes) => Keypair::from_protobuf_encoding(&bytes)?,
+        Some(ref bytes) => Keypair::from_protobuf_encoding(bytes)?,
         None => load_or_create_identity(&args.identity)?,
     };
     let ml_dsa_seed = match args.ml_dsa_seed {
@@ -813,14 +813,14 @@ async fn run_node(
     let ml_dsa_identity = crypto::MlDsaIdentity::from_seed(&ml_dsa_seed)?;
     let contact_identity = identity.clone();
     let identity_bytes = identity.to_protobuf_encoding()?;
-    let mut account_key = args
+    let account_key = args
         .account_key
         .unwrap_or_else(|| blake3::derive_key("msnnext account root v1", &identity_bytes));
     let history_key = blake3::derive_key("msnnext local history v1", &identity_bytes);
     let attachment_key = blake3::derive_key("msnnext attachment vault v1", &identity_bytes);
     let history = History::open(&args.history, history_key)?;
     let persisted_contacts = history.contacts()?;
-    let mut ignored_contacts = history
+    let ignored_contacts = history
         .ignored_contacts()?
         .into_iter()
         .filter_map(|peer| peer.parse::<PeerId>().ok())
@@ -830,8 +830,8 @@ async fn run_node(
     // dispositivi collegati (la chiave stessa non lascia mai il dispositivo).
     // Firma la prova con cui i contatti riconoscono i nostri dispositivi senza
     // doverli approvare di nuovo.
-    let mut account_identity = AccountIdentity::from_account_key(&account_key)?;
-    let mut account_proof = account_identity.proof(local_peer_id).ok();
+    let account_identity = AccountIdentity::from_account_key(&account_key)?;
+    let account_proof = account_identity.proof(local_peer_id).ok();
     let mut swarm = build_swarm(identity, args.relay_server)?;
 
     swarm.listen_on(args.listen.clone())?;
@@ -870,26 +870,26 @@ async fn run_node(
 
     log::info!("peer: {local_peer_id}");
     log::info!("comandi: text <messaggio> | emote <trigger> <file> | file <percorso> | contact qr | contact export/import <file> | nudge | history | quit");
-    let mut display_name = args.name.clone();
+    let display_name = args.name.clone();
     let _ = events.send(ClientEvent::Started {
         peer_id: local_peer_id.to_string(),
         display_name: display_name.clone(),
         fingerprint: peer_fingerprint(local_peer_id),
     });
 
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut peers = HashSet::new();
+    let lines = BufReader::new(tokio::io::stdin()).lines();
+    let peers = HashSet::new();
     let mut dialing = HashSet::new();
-    let mut mdns_dialing = HashSet::new();
+    let mdns_dialing = HashSet::new();
     // Peer che ci hanno contattato ma non sono ancora contatti: in attesa che
     // l'utente accetti/rifiuti (niente auto-aggiunta senza consenso).
-    let mut pending_contact_requests = HashMap::<PeerId, String>::new();
+    let pending_contact_requests = HashMap::<PeerId, String>::new();
     // Account dimostrato da chi è ancora in attesa di approvazione: alla
     // conferma lega subito la persona, così i suoi altri dispositivi non
     // chiedono una seconda approvazione.
-    let mut pending_accounts = HashMap::<PeerId, String>::new();
-    let mut reconnect_at = HashMap::<PeerId, Instant>::new();
-    let mut reconnect_attempts = HashMap::<PeerId, u8>::new();
+    let pending_accounts = HashMap::<PeerId, String>::new();
+    let reconnect_at = HashMap::<PeerId, Instant>::new();
+    let reconnect_attempts = HashMap::<PeerId, u8>::new();
     let mut bootstrap_fallbacks = HashMap::<PeerId, VecDeque<Multiaddr>>::new();
     let mut known_contacts = HashSet::<PeerId>::new();
     // Dispositivi collegati dei contatti: un contatto è una persona, non un
@@ -908,68 +908,66 @@ async fn run_node(
     if let Some(peer) = manual_peer {
         known_contacts.insert(peer);
     }
-    let mut accept_unclassified_manual = args.connect.is_some() && manual_peer.is_none();
+    let accept_unclassified_manual = args.connect.is_some() && manual_peer.is_none();
     let mut fallback_planner = FallbackPlanner::new(args.relays.clone());
     let mut pending_dht = HashMap::<kad::QueryId, PeerId>::new();
-    let mut requested_relay_reservations = HashSet::<PeerId>::new();
-    let mut triggers = load_triggers(&args.emotes)?;
-    let mut nudge_limits = HashMap::<PeerId, NudgeRateLimit>::new();
-    let mut incoming_nudge_limits = HashMap::<PeerId, NudgeRateLimit>::new();
-    let mut notification_mutes = HashMap::<String, Option<u64>>::new();
-    let mut sent_numbers = HashMap::<PeerId, u64>::new();
-    let mut pending_offers = HashMap::<request_response::OutboundRequestId, PendingOffer>::new();
-    let mut pending_transfers =
-        HashMap::<request_response::OutboundRequestId, PendingTransfer>::new();
-    let mut pending_handshakes =
+    let requested_relay_reservations = HashSet::<PeerId>::new();
+    let triggers = load_triggers(&args.emotes)?;
+    let nudge_limits = HashMap::<PeerId, NudgeRateLimit>::new();
+    let incoming_nudge_limits = HashMap::<PeerId, NudgeRateLimit>::new();
+    let notification_mutes = HashMap::<String, Option<u64>>::new();
+    let sent_numbers = HashMap::<PeerId, u64>::new();
+    let pending_offers = HashMap::<request_response::OutboundRequestId, PendingOffer>::new();
+    let pending_transfers = HashMap::<request_response::OutboundRequestId, PendingTransfer>::new();
+    let pending_handshakes =
         HashMap::<request_response::OutboundRequestId, (PeerId, HybridInitiator)>::new();
     // Tentativi di handshake per peer: consente il retry se il primo invio
     // fallisce (frequente su mobile finché la connessione non è stabile).
-    let mut handshake_retries = HashMap::<PeerId, u8>::new();
+    let handshake_retries = HashMap::<PeerId, u8>::new();
     // Affidabilità messaggi: coda per-peer quando la sessione non è pronta, e
     // tracciamento (peer, evento, tentativi, invio) per retry e timeout.
-    let mut outbox = HashMap::<PeerId, VecDeque<(ChatEvent, u8)>>::new();
-    let mut pending_messages =
-        HashMap::<request_response::OutboundRequestId, PendingMessage>::new();
-    let mut delivery_tick = tokio::time::interval(DELIVERY_CHECK_INTERVAL);
+    let outbox = HashMap::<PeerId, VecDeque<(ChatEvent, u8)>>::new();
+    let pending_messages = HashMap::<request_response::OutboundRequestId, PendingMessage>::new();
+    let delivery_tick = tokio::time::interval(DELIVERY_CHECK_INTERVAL);
     #[cfg(test)]
-    let mut withhold_acks = false;
+    let withhold_acks = false;
     #[cfg(test)]
-    let mut held_responses = Vec::new();
+    let held_responses = Vec::new();
     // Estensioni (minuscole, senza punto) accettate automaticamente. Vuoto = off.
-    let mut auto_accept_extensions = HashSet::<String>::new();
+    let auto_accept_extensions = HashSet::<String>::new();
     // Stato di presenza comunicato ai contatti: "online" | "busy" | "away".
-    let mut presence_status = String::from("online");
-    let mut pending_inbound_handshakes =
+    let presence_status = String::from("online");
+    let pending_inbound_handshakes =
         HashMap::<request_response::InboundRequestId, (PeerId, SessionKey)>::new();
-    let mut sessions = HashMap::<PeerId, RatchetSession>::new();
+    let sessions = HashMap::<PeerId, RatchetSession>::new();
     // Errori di decifratura consecutivi per peer: oltre una soglia la sessione
     // è considerata rotta e si rifà l'handshake invece di rifiutare per sempre.
-    let mut decrypt_failures = HashMap::<PeerId, u8>::new();
-    let mut shared_emoticons = HashSet::<(PeerId, [u8; 32])>::new();
+    let decrypt_failures = HashMap::<PeerId, u8>::new();
+    let shared_emoticons = HashSet::<(PeerId, [u8; 32])>::new();
     // Offerte di file pronte per un contatto connesso ma ancora senza
     // sessione cifrata: partono quando l'handshake si completa.
-    let mut waiting_offers = HashMap::<PeerId, Vec<PendingOffer>>::new();
-    let mut pending_emoticons = HashMap::<[u8; 32], EmoticonOffer>::new();
-    let mut attachment_receiver = Receiver::new(args.downloads.clone(), attachment_key);
+    let waiting_offers = HashMap::<PeerId, Vec<PendingOffer>>::new();
+    let pending_emoticons = HashMap::<[u8; 32], EmoticonOffer>::new();
+    let attachment_receiver = Receiver::new(args.downloads.clone(), attachment_key);
     // Lavoro pesante sui file (hash in invio, verifica finale in ricezione)
     // fuori dal loop: i risultati tornano su questi canali.
-    let (prepared_files_tx, mut prepared_files) = mpsc::unbounded_channel::<PreparedFile>();
-    let (vault_jobs_tx, mut vault_jobs) = mpsc::unbounded_channel::<VaultJobDone>();
-    let mut incoming_attachments = HashMap::<(PeerId, [u8; 32]), HashSet<Option<String>>>::new();
-    let mut pending_inbound_offers = HashMap::<u64, PendingInboundOffer>::new();
-    let mut inbound_offer_counter = 0_u64;
+    let (prepared_files_tx, prepared_files) = mpsc::unbounded_channel::<PreparedFile>();
+    let (vault_jobs_tx, vault_jobs) = mpsc::unbounded_channel::<VaultJobDone>();
+    let incoming_attachments = HashMap::<(PeerId, [u8; 32]), HashSet<Option<String>>>::new();
+    let pending_inbound_offers = HashMap::<u64, PendingInboundOffer>::new();
+    let inbound_offer_counter = 0_u64;
     let mut peer_names = HashMap::<PeerId, String>::new();
-    let mut nudge_counter = 0_u64;
-    let mut stdin_open = args.read_stdin;
-    let mut commands_open = true;
-    let mut contact_link_requested = false;
-    let mut device_link_requested = false;
-    let mut pending_pairings = HashMap::<[u8; 16], PendingPairing>::new();
-    let mut pending_pair_targets = HashMap::<PeerId, PairingLink>::new();
-    let mut pending_device_requests =
+    let nudge_counter = 0_u64;
+    let stdin_open = args.read_stdin;
+    let commands_open = true;
+    let contact_link_requested = false;
+    let device_link_requested = false;
+    let pending_pairings = HashMap::<[u8; 16], PendingPairing>::new();
+    let pending_pair_targets = HashMap::<PeerId, PairingLink>::new();
+    let pending_device_requests =
         HashMap::<request_response::OutboundRequestId, PendingDeviceRequest>::new();
-    let mut online_devices = HashSet::<PeerId>::new();
-    let mut known_devices = history
+    let online_devices = HashSet::<PeerId>::new();
+    let known_devices = history
         .devices()?
         .into_iter()
         .filter_map(|device| {
@@ -1079,415 +1077,1064 @@ async fn run_node(
     let _ = events.send(ClientEvent::EmoticonCatalog { emoticons });
     let _ = events.send(ClientEvent::Ready);
 
+    let mut node = Node {
+        ml_dsa_identity,
+        contact_identity,
+        account_key,
+        history,
+        ignored_contacts,
+        local_peer_id,
+        account_identity,
+        account_proof,
+        swarm,
+        relay_addresses,
+        display_name,
+        lines,
+        peers,
+        dialing,
+        mdns_dialing,
+        pending_contact_requests,
+        pending_accounts,
+        reconnect_at,
+        reconnect_attempts,
+        bootstrap_fallbacks,
+        known_contacts,
+        contact_devices,
+        infrastructure_peers,
+        accept_unclassified_manual,
+        fallback_planner,
+        pending_dht,
+        requested_relay_reservations,
+        triggers,
+        nudge_limits,
+        incoming_nudge_limits,
+        notification_mutes,
+        sent_numbers,
+        pending_offers,
+        pending_transfers,
+        pending_handshakes,
+        handshake_retries,
+        outbox,
+        pending_messages,
+        delivery_tick,
+        #[cfg(test)]
+        withhold_acks,
+        #[cfg(test)]
+        held_responses,
+        auto_accept_extensions,
+        presence_status,
+        pending_inbound_handshakes,
+        sessions,
+        decrypt_failures,
+        shared_emoticons,
+        waiting_offers,
+        pending_emoticons,
+        attachment_receiver,
+        prepared_files_tx,
+        prepared_files,
+        vault_jobs_tx,
+        vault_jobs,
+        incoming_attachments,
+        pending_inbound_offers,
+        inbound_offer_counter,
+        peer_names,
+        nudge_counter,
+        stdin_open,
+        commands_open,
+        contact_link_requested,
+        device_link_requested,
+        pending_pairings,
+        pending_pair_targets,
+        pending_device_requests,
+        online_devices,
+        known_devices,
+        device_sync_tick,
+        handshake_tick,
+        args,
+        commands,
+        events,
+    };
     loop {
-        let next_reconnect = reconnect_at
+        let next_reconnect = node
+            .reconnect_at
             .iter()
             .min_by_key(|(_, deadline)| **deadline)
             .map(|(peer, deadline)| (*peer, *deadline));
-        // Ogni evento è gestito in un blocco a sé: un errore (SQLite, link
+        // Ogni evento è gestito in un metodo a sé: un errore (SQLite, link
         // malformato, dati di sync non validi...) diventa un ClientEvent::Error
         // e il nodo continua a girare invece di spegnersi.
         let step: Result<LoopFlow, Box<dyn Error>> = async {
-        tokio::select! {
-            Some(prepared) = prepared_files.recv() => {
-                let manifest = match prepared.manifest {
-                    Ok(manifest) => manifest,
-                    Err(message) => {
-                        let filename = prepared.path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
-                        report_file_failed(&events, &filename, &message);
-                        return Ok(LoopFlow::Continue);
-                    }
+            tokio::select! {
+            Some(prepared) = node.prepared_files.recv() => node.on_prepared_file(prepared),
+            Some(done) = node.vault_jobs.recv() => node.on_vault_job(done),
+            _ = node.device_sync_tick.tick(), if !node.online_devices.is_empty() => node.on_device_sync_tick(),
+            _ = node.delivery_tick.tick(), if !node.pending_messages.is_empty() => node.on_delivery_tick(),
+            _ = node.handshake_tick.tick(), if !node.peers.is_empty() => node.on_handshake_tick(),
+            _ = wait_for_reconnect(next_reconnect.map(|(_, deadline)| deadline)) => node.on_reconnect_due(next_reconnect),
+            line = node.lines.next_line(), if node.stdin_open => node.on_stdin_line(line?),
+            command = node.commands.recv(), if node.commands_open => node.on_command(command),
+            event = node.swarm.select_next_some() => node.on_swarm_event(event),
+            }
+        }
+        .await;
+        match step {
+            Ok(LoopFlow::Continue) => {}
+            Ok(LoopFlow::Stop) => break,
+            Err(error) => report_loop_error(&node.events, error.as_ref()),
+        }
+    }
+    Ok(())
+}
+
+/// Stato del nodo tra un evento e l'altro del loop di `run_node`. Ogni
+/// sorgente di eventi ha il suo gestore qui sotto.
+struct Node {
+    ml_dsa_identity: crypto::MlDsaIdentity,
+    contact_identity: Keypair,
+    account_key: [u8; 32],
+    history: History,
+    ignored_contacts: HashSet<PeerId>,
+    local_peer_id: PeerId,
+    account_identity: AccountIdentity,
+    account_proof: Option<AccountProof>,
+    swarm: Swarm<Behaviour>,
+    relay_addresses: HashMap<PeerId, Multiaddr>,
+    display_name: String,
+    lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::Stdin>>,
+    peers: HashSet<PeerId>,
+    dialing: HashSet<PeerId>,
+    mdns_dialing: HashSet<PeerId>,
+    pending_contact_requests: HashMap<PeerId, String>,
+    pending_accounts: HashMap<PeerId, String>,
+    reconnect_at: HashMap<PeerId, Instant>,
+    reconnect_attempts: HashMap<PeerId, u8>,
+    bootstrap_fallbacks: HashMap<PeerId, VecDeque<Multiaddr>>,
+    known_contacts: HashSet<PeerId>,
+    contact_devices: ContactDevices,
+    infrastructure_peers: HashSet<PeerId>,
+    accept_unclassified_manual: bool,
+    fallback_planner: FallbackPlanner,
+    pending_dht: HashMap<kad::QueryId, PeerId>,
+    requested_relay_reservations: HashSet<PeerId>,
+    triggers: Vec<Trigger>,
+    nudge_limits: HashMap<PeerId, NudgeRateLimit>,
+    incoming_nudge_limits: HashMap<PeerId, NudgeRateLimit>,
+    notification_mutes: HashMap<String, Option<u64>>,
+    sent_numbers: HashMap<PeerId, u64>,
+    pending_offers: HashMap<request_response::OutboundRequestId, PendingOffer>,
+    pending_transfers: HashMap<request_response::OutboundRequestId, PendingTransfer>,
+    pending_handshakes: HashMap<request_response::OutboundRequestId, (PeerId, HybridInitiator)>,
+    handshake_retries: HashMap<PeerId, u8>,
+    outbox: HashMap<PeerId, VecDeque<(ChatEvent, u8)>>,
+    pending_messages: HashMap<request_response::OutboundRequestId, PendingMessage>,
+    delivery_tick: tokio::time::Interval,
+    #[cfg(test)]
+    withhold_acks: bool,
+    #[cfg(test)]
+    held_responses: Vec<request_response::ResponseChannel<ProtocolResponse>>,
+    auto_accept_extensions: HashSet<String>,
+    presence_status: String,
+    pending_inbound_handshakes: HashMap<request_response::InboundRequestId, (PeerId, SessionKey)>,
+    sessions: HashMap<PeerId, RatchetSession>,
+    decrypt_failures: HashMap<PeerId, u8>,
+    shared_emoticons: HashSet<(PeerId, [u8; 32])>,
+    waiting_offers: HashMap<PeerId, Vec<PendingOffer>>,
+    pending_emoticons: HashMap<[u8; 32], EmoticonOffer>,
+    attachment_receiver: attachments::Receiver,
+    prepared_files_tx: mpsc::UnboundedSender<PreparedFile>,
+    prepared_files: mpsc::UnboundedReceiver<PreparedFile>,
+    vault_jobs_tx: mpsc::UnboundedSender<VaultJobDone>,
+    vault_jobs: mpsc::UnboundedReceiver<VaultJobDone>,
+    incoming_attachments: HashMap<(PeerId, [u8; 32]), HashSet<Option<String>>>,
+    pending_inbound_offers: HashMap<u64, PendingInboundOffer>,
+    inbound_offer_counter: u64,
+    peer_names: HashMap<PeerId, String>,
+    nudge_counter: u64,
+    stdin_open: bool,
+    commands_open: bool,
+    contact_link_requested: bool,
+    device_link_requested: bool,
+    pending_pairings: HashMap<[u8; 16], PendingPairing>,
+    pending_pair_targets: HashMap<PeerId, PairingLink>,
+    pending_device_requests: HashMap<request_response::OutboundRequestId, PendingDeviceRequest>,
+    online_devices: HashSet<PeerId>,
+    known_devices: HashMap<PeerId, DeviceEntry>,
+    device_sync_tick: tokio::time::Interval,
+    handshake_tick: tokio::time::Interval,
+    args: ClientConfig,
+    commands: mpsc::UnboundedReceiver<ClientCommand>,
+    events: mpsc::UnboundedSender<ClientEvent>,
+}
+
+impl Node {
+    fn on_prepared_file(&mut self, prepared: PreparedFile) -> Result<LoopFlow, Box<dyn Error>> {
+        let Node {
+            history,
+            local_peer_id,
+            swarm,
+            peers,
+            contact_devices,
+            sent_numbers,
+            pending_offers,
+            pending_handshakes,
+            sessions,
+            waiting_offers,
+            attachment_receiver,
+            events,
+            ..
+        } = self;
+        let local_peer_id = *local_peer_id;
+        let manifest = match prepared.manifest {
+            Ok(manifest) => manifest,
+            Err(message) => {
+                let filename = prepared
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                report_file_failed(events, &filename, &message);
+                return Ok(LoopFlow::Continue);
+            }
+        };
+        let path = prepared.path;
+        let attachment_hex = hex_asset_id(&manifest.attachment_id);
+        // Niente copia nel vault: solo un riferimento al file originale,
+        // che resta riapribile finché esiste.
+        if let Err(error) = attachment_receiver.store_reference(&manifest, &path) {
+            log::warn!("riferimento al file inviato non salvato: {error}");
+        }
+        match prepared.target {
+            FileTarget::Peer(peer) => {
+                if !contact_devices.online(peer, peers) {
+                    report_file_failed(events, &manifest.filename, "contatto non collegato");
+                    return Ok(LoopFlow::Continue);
+                }
+                let offer = PendingOffer {
+                    peer,
+                    path,
+                    manifest,
+                    retries: 0,
+                    group_id: None,
                 };
-                let path = prepared.path;
-                let attachment_hex = hex_asset_id(&manifest.attachment_id);
-                // Niente copia nel vault: solo un riferimento al file originale,
-                // che resta riapribile finché esiste.
-                if let Err(error) = attachment_receiver.store_reference(&manifest, &path) {
-                    log::warn!("riferimento al file inviato non salvato: {error}");
-                }
-                match prepared.target {
-                    FileTarget::Peer(peer) => {
-                        if !contact_devices.online(peer, &peers) {
-                            report_file_failed(&events, &manifest.filename, "contatto non collegato");
-                            return Ok(LoopFlow::Continue);
-                        }
-                        let offer = PendingOffer { peer, path, manifest, retries: 0, group_id: None };
-                        if contact_devices.secure(peer, &sessions) {
-                            offer_file(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_offers, &history, &events, local_peer_id, offer);
-                        } else {
-                            waiting_offers.entry(peer).or_default().push(offer);
-                            maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
-                        }
-                    }
-                    FileTarget::Group { group_id, parsed_id } => {
-                        let Some(group) = history.group_chat(&group_id)? else {
-                            report_file_failed(&events, &manifest.filename, "chat di gruppo non trovata");
-                            return Ok(LoopFlow::Continue);
-                        };
-                        let timestamp_ms = now_ms();
-                        let recipients = match group_file_recipients(&group, local_peer_id, &sessions, timestamp_ms) {
-                            Ok(recipients) => recipients,
-                            Err(message) => {
-                                report_file_failed(&events, &manifest.filename, message);
-                                return Ok(LoopFlow::Continue);
-                            }
-                        };
-                        let mut offered = 0;
-                        for recipient in recipients {
-                            if let Some(request_id) = send_event(
-                                &mut swarm,
-                                &mut sessions,
-                                &contact_devices,
-                                recipient,
-                                local_peer_id,
-                                &mut sent_numbers,
-                                ChatEvent::GroupAttachmentOffer(GroupAttachmentOffer {
-                                    group_id: parsed_id,
-                                    manifest: manifest.clone(),
-                                }),
-                            ) {
-                                offered += 1;
-                                pending_offers.insert(request_id, PendingOffer {
-                                    peer: recipient,
-                                    path: path.clone(),
-                                    manifest: manifest.clone(),
-                                    retries: 0,
-                                    group_id: Some(parsed_id),
-                                });
-                            } else {
-                                report_file_failed(&events, &manifest.filename, "canale cifrato non pronto");
-                            }
-                        }
-                        // In cronologia solo se almeno un'offerta è partita.
-                        if offered == 0 {
-                            return Ok(LoopFlow::Continue);
-                        }
-                        history.record(
-                            &group_history_key(&group_id),
-                            "out",
-                            &format!("group-file:{local_peer_id}"),
-                            &encode_attachment(&manifest),
-                            timestamp_ms,
-                        )?;
-                        let _ = events.send(ClientEvent::GroupMessage { message: ClientGroupMessage {
-                            group_id,
-                            sender_peer_id: local_peer_id.to_string(),
-                            direction: "out".into(),
-                            kind: "file".into(),
-                            body: manifest.filename.clone(),
-                            timestamp_ms,
-                            emoticons: Vec::new(),
-                            attachment_id: Some(attachment_hex),
-                            attachment_mime: Some(manifest.mime),
-                            event_id: None,
-                        }});
-                    }
-                    FileTarget::AllPeers => {
-                        log::info!("offerta file: {} ({} chunk)", manifest.filename, manifest.chunks.len());
-                        for peer in &peers {
-                            record(&history, peer, "out", "file", &manifest.filename);
-                            if let Some(request_id) = send_event(&mut swarm, &mut sessions, &contact_devices, *peer, local_peer_id, &mut sent_numbers, ChatEvent::AttachmentOffer(manifest.clone())) {
-                                pending_offers.insert(request_id, PendingOffer { peer: *peer, path: path.clone(), manifest: manifest.clone(), retries: 0, group_id: None });
-                            }
-                        }
-                    }
-                }
-            }
-            Some(done) = vault_jobs.recv() => {
-                let destinations = incoming_attachments
-                    .remove(&(done.peer, done.id))
-                    .unwrap_or_else(|| HashSet::from([None]));
-                match done.result {
-                    Ok(completed) => {
-                        log::info!("{}: file ricevuto nell'archivio cifrato", done.peer);
-                        let should_notify = args.notifications && destinations.iter().any(|group_id| {
-                            let conversation = group_id
-                                .as_ref()
-                                .map_or_else(|| format!("peer:{}", done.peer), |id| format!("group:{id}"));
-                            notification_mute_allows(&notification_mutes, &conversation, now_ms())
-                        });
-                        notify(should_notify, "File ricevuto", &completed.filename);
-                        for group_id in destinations {
-                            emit_attachment_received(&events, done.peer, group_id, &completed);
-                        }
-                    }
-                    Err(message) => {
-                        let _ = events.send(ClientEvent::Error { message: format!("file ricevuto non valido: {message}") });
-                    }
-                }
-            }
-            _ = device_sync_tick.tick(), if !online_devices.is_empty() => {
-                let latest_seq = history.latest_sync_seq()?;
-                let available = online_devices
-                    .iter()
-                    .copied()
-                    .filter(|peer| {
-                        history
-                            .sync_cursors(&peer.to_string())
-                            .map(|(_, sent_seq)| latest_seq > sent_seq)
-                            .unwrap_or(true)
-                    })
-                    .filter(|peer| !pending_device_requests.values().any(|pending| match pending {
-                        PendingDeviceRequest::Pair { peer: pending_peer, .. }
-                        | PendingDeviceRequest::Sync { peer: pending_peer }
-                        | PendingDeviceRequest::Relay { peer: pending_peer, .. } => pending_peer == peer,
-                    }))
-                    .collect::<Vec<_>>();
-                for peer in available {
-                    let descriptor = local_device_descriptor(
+                if contact_devices.secure(peer, sessions) {
+                    offer_file(
+                        swarm,
+                        sessions,
+                        contact_devices,
+                        sent_numbers,
+                        pending_offers,
+                        history,
+                        events,
                         local_peer_id,
-                        &display_name,
-                        contact_addresses(&swarm, &args.relays, local_peer_id),
+                        offer,
                     );
-                    send_device_sync(
-                        &mut swarm,
-                        &history,
-                        &account_key,
-                        &mut pending_device_requests,
+                } else {
+                    waiting_offers.entry(peer).or_default().push(offer);
+                    maybe_start_hybrid_handshake(
+                        swarm,
+                        pending_handshakes,
+                        sessions,
+                        local_peer_id,
                         peer,
-                        descriptor,
-                    )?;
+                    );
                 }
             }
-            _ = delivery_tick.tick(), if !pending_messages.is_empty() => {
-                // La richiesta cifrata ha un timeout di 5 minuti, pensato per le
-                // offerte di file che aspettano l'utente. Un messaggio senza
-                // conferma entro pochi secondi viene invece reinviato subito; il
-                // destinatario scarta i doppioni per id.
-                let now = now_ms();
-                let expired = pending_messages
-                    .iter()
-                    .filter(|(_, (_, _, _, sent_at))| now.saturating_sub(*sent_at) >= MESSAGE_ACK_TIMEOUT.as_millis() as u64)
-                    .map(|(request_id, _)| *request_id)
-                    .collect::<Vec<_>>();
-                for request_id in expired {
-                    let Some((msg_peer, event, attempts, _)) = pending_messages.remove(&request_id) else {
-                        continue;
-                    };
-                    match next_delivery_attempt(attempts) {
-                        Some(next) => {
-                            log::info!("nessuna conferma da {msg_peer}: reinvio");
-                            resend_pending(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, local_peer_id, msg_peer, event, next);
-                        }
-                        None => report_undelivered(&events, &mut shared_emoticons, msg_peer, &event, "nessuna conferma dal destinatario"),
-                    }
-                }
-            }
-            _ = handshake_tick.tick(), if !peers.is_empty() => {
-                // Per ogni contatto connesso senza canale cifrato: se siamo
-                // l'iniziatore ritentiamo l'handshake, altrimenti ri-annunciamo
-                // la presence per invitare l'altro lato ad avviarlo.
-                let stalled = peers
-                    .iter()
-                    .copied()
-                    .filter(|peer| !sessions.contains_key(peer))
-                    .collect::<Vec<_>>();
-                for peer in stalled {
-                    if should_initiate(local_peer_id, peer) {
-                        maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
-                    } else {
-                        send_event(&mut swarm, &mut sessions, &contact_devices, peer, local_peer_id, &mut sent_numbers, ChatEvent::Presence(presence_update(&display_name, &presence_status, true, &account_proof)));
-                    }
-                }
-            }
-            _ = wait_for_reconnect(next_reconnect.map(|(_, deadline)| deadline)) => {
-                let Some((peer, _)) = next_reconnect else {
+            FileTarget::Group {
+                group_id,
+                parsed_id,
+            } => {
+                let Some(group) = history.group_chat(&group_id)? else {
+                    report_file_failed(events, &manifest.filename, "chat di gruppo non trovata");
                     return Ok(LoopFlow::Continue);
                 };
-                reconnect_at.remove(&peer);
-                if (known_contacts.contains(&peer) || known_devices.contains_key(&peer))
-                    && !peers.contains(&peer)
-                    && !online_devices.contains(&peer)
-                    && dialing.insert(peer)
-                {
-                    if let Err(error) = swarm.dial(DialOpts::peer_id(peer).build()) {
-                        dialing.remove(&peer);
-                        log::warn!("riconnessione fallita per {peer}: {error}");
-                        schedule_reconnect(
-                            peer,
-                            &mut reconnect_at,
-                            &mut reconnect_attempts,
+                let timestamp_ms = now_ms();
+                let recipients =
+                    match group_file_recipients(&group, local_peer_id, sessions, timestamp_ms) {
+                        Ok(recipients) => recipients,
+                        Err(message) => {
+                            report_file_failed(events, &manifest.filename, message);
+                            return Ok(LoopFlow::Continue);
+                        }
+                    };
+                let mut offered = 0;
+                for recipient in recipients {
+                    if let Some(request_id) = send_event(
+                        swarm,
+                        sessions,
+                        contact_devices,
+                        recipient,
+                        local_peer_id,
+                        sent_numbers,
+                        ChatEvent::GroupAttachmentOffer(GroupAttachmentOffer {
+                            group_id: parsed_id,
+                            manifest: manifest.clone(),
+                        }),
+                    ) {
+                        offered += 1;
+                        pending_offers.insert(
+                            request_id,
+                            PendingOffer {
+                                peer: recipient,
+                                path: path.clone(),
+                                manifest: manifest.clone(),
+                                retries: 0,
+                                group_id: Some(parsed_id),
+                            },
+                        );
+                    } else {
+                        report_file_failed(events, &manifest.filename, "canale cifrato non pronto");
+                    }
+                }
+                // In cronologia solo se almeno un'offerta è partita.
+                if offered == 0 {
+                    return Ok(LoopFlow::Continue);
+                }
+                history.record(
+                    &group_history_key(&group_id),
+                    "out",
+                    &format!("group-file:{local_peer_id}"),
+                    &encode_attachment(&manifest),
+                    timestamp_ms,
+                )?;
+                let _ = events.send(ClientEvent::GroupMessage {
+                    message: ClientGroupMessage {
+                        group_id,
+                        sender_peer_id: local_peer_id.to_string(),
+                        direction: "out".into(),
+                        kind: "file".into(),
+                        body: manifest.filename.clone(),
+                        timestamp_ms,
+                        emoticons: Vec::new(),
+                        attachment_id: Some(attachment_hex),
+                        attachment_mime: Some(manifest.mime),
+                        event_id: None,
+                    },
+                });
+            }
+            FileTarget::AllPeers => {
+                log::info!(
+                    "offerta file: {} ({} chunk)",
+                    manifest.filename,
+                    manifest.chunks.len()
+                );
+                for peer in peers.iter() {
+                    record(history, peer, "out", "file", &manifest.filename);
+                    if let Some(request_id) = send_event(
+                        swarm,
+                        sessions,
+                        contact_devices,
+                        *peer,
+                        local_peer_id,
+                        sent_numbers,
+                        ChatEvent::AttachmentOffer(manifest.clone()),
+                    ) {
+                        pending_offers.insert(
+                            request_id,
+                            PendingOffer {
+                                peer: *peer,
+                                path: path.clone(),
+                                manifest: manifest.clone(),
+                                retries: 0,
+                                group_id: None,
+                            },
                         );
                     }
                 }
             }
-            line = lines.next_line(), if stdin_open => match line? {
-                Some(line) if line == "quit" => return Ok(LoopFlow::Stop),
-                Some(line) if line == "history" => match history.latest(20) {
-                    Ok(entries) => for entry in entries.iter().rev() {
-                        log::info!("{} {} {} {}: {}", entry.timestamp_ms, entry.direction, entry.peer, entry.kind, entry.body);
-                    },
-                    Err(error) => log::warn!("cronologia non disponibile: {error}"),
-                },
-                Some(line) if line.starts_with("contact export ") => {
-                    let path = Path::new(line[15..].trim());
-                    match contacts::export(
-                        path,
-                        &display_name,
-                        local_peer_id,
-                        &contact_identity,
-                        &ml_dsa_identity,
-                        contact_addresses(&swarm, &args.relays, local_peer_id).into_iter(),
-                    ) {
-                        Ok(()) => log::info!("scheda contatto salvata in {}", path.display()),
-                        Err(error) => log::warn!("esportazione contatto fallita: {error}"),
-                    }
-                },
-                Some(line) if line == "contact qr" => {
-                    let result = contacts::share_links(
-                        &display_name,
-                        local_peer_id,
-                        &contact_identity,
-                        &ml_dsa_identity,
-                        contact_addresses(&swarm, &args.relays, local_peer_id),
-                    )
-                    .and_then(|(link, qr_link)| {
-                        let qr = contacts::render_qr(&qr_link)?;
-                        Ok((link, qr))
+        }
+        Ok(LoopFlow::Continue)
+    }
+
+    fn on_vault_job(&mut self, done: VaultJobDone) -> Result<LoopFlow, Box<dyn Error>> {
+        let Node {
+            notification_mutes,
+            incoming_attachments,
+            args,
+            events,
+            ..
+        } = self;
+        let destinations = incoming_attachments
+            .remove(&(done.peer, done.id))
+            .unwrap_or_else(|| HashSet::from([None]));
+        match done.result {
+            Ok(completed) => {
+                log::info!("{}: file ricevuto nell'archivio cifrato", done.peer);
+                let should_notify = args.notifications
+                    && destinations.iter().any(|group_id| {
+                        let conversation = group_id.as_ref().map_or_else(
+                            || format!("peer:{}", done.peer),
+                            |id| format!("group:{id}"),
+                        );
+                        notification_mute_allows(notification_mutes, &conversation, now_ms())
                     });
-                    match result {
-                        Ok((link, qr)) => log::info!("{qr}\n{link}"),
-                        Err(error) => log::warn!("generazione QR fallita: {error}"),
+                notify(should_notify, "File ricevuto", &completed.filename);
+                for group_id in destinations {
+                    emit_attachment_received(events, done.peer, group_id, &completed);
+                }
+            }
+            Err(message) => {
+                let _ = events.send(ClientEvent::Error {
+                    message: format!("file ricevuto non valido: {message}"),
+                });
+            }
+        }
+        Ok(LoopFlow::Continue)
+    }
+
+    fn on_device_sync_tick(&mut self) -> Result<LoopFlow, Box<dyn Error>> {
+        let Node {
+            account_key,
+            history,
+            local_peer_id,
+            swarm,
+            display_name,
+            pending_device_requests,
+            online_devices,
+            args,
+            ..
+        } = self;
+        let local_peer_id = *local_peer_id;
+        let account_key = *account_key;
+        let latest_seq = history.latest_sync_seq()?;
+        let available = online_devices
+            .iter()
+            .copied()
+            .filter(|peer| {
+                history
+                    .sync_cursors(&peer.to_string())
+                    .map(|(_, sent_seq)| latest_seq > sent_seq)
+                    .unwrap_or(true)
+            })
+            .filter(|peer| {
+                !pending_device_requests
+                    .values()
+                    .any(|pending| match pending {
+                        PendingDeviceRequest::Pair {
+                            peer: pending_peer, ..
+                        }
+                        | PendingDeviceRequest::Sync { peer: pending_peer }
+                        | PendingDeviceRequest::Relay {
+                            peer: pending_peer, ..
+                        } => pending_peer == peer,
+                    })
+            })
+            .collect::<Vec<_>>();
+        for peer in available {
+            let descriptor = local_device_descriptor(
+                local_peer_id,
+                display_name,
+                contact_addresses(swarm, &args.relays, local_peer_id),
+            );
+            send_device_sync(
+                swarm,
+                history,
+                &account_key,
+                pending_device_requests,
+                peer,
+                descriptor,
+            )?;
+        }
+        Ok(LoopFlow::Continue)
+    }
+
+    fn on_delivery_tick(&mut self) -> Result<LoopFlow, Box<dyn Error>> {
+        let Node {
+            local_peer_id,
+            swarm,
+            contact_devices,
+            sent_numbers,
+            outbox,
+            pending_messages,
+            sessions,
+            shared_emoticons,
+            events,
+            ..
+        } = self;
+        let local_peer_id = *local_peer_id;
+        // La richiesta cifrata ha un timeout di 5 minuti, pensato per le
+        // offerte di file che aspettano l'utente. Un messaggio senza
+        // conferma entro pochi secondi viene invece reinviato subito; il
+        // destinatario scarta i doppioni per id.
+        let now = now_ms();
+        let expired = pending_messages
+            .iter()
+            .filter(|(_, (_, _, _, sent_at))| {
+                now.saturating_sub(*sent_at) >= MESSAGE_ACK_TIMEOUT.as_millis() as u64
+            })
+            .map(|(request_id, _)| *request_id)
+            .collect::<Vec<_>>();
+        for request_id in expired {
+            let Some((msg_peer, event, attempts, _)) = pending_messages.remove(&request_id) else {
+                continue;
+            };
+            match next_delivery_attempt(attempts) {
+                Some(next) => {
+                    log::info!("nessuna conferma da {msg_peer}: reinvio");
+                    resend_pending(
+                        swarm,
+                        sessions,
+                        contact_devices,
+                        sent_numbers,
+                        pending_messages,
+                        outbox,
+                        local_peer_id,
+                        msg_peer,
+                        event,
+                        next,
+                    );
+                }
+                None => report_undelivered(
+                    events,
+                    shared_emoticons,
+                    msg_peer,
+                    &event,
+                    "nessuna conferma dal destinatario",
+                ),
+            }
+        }
+        Ok(LoopFlow::Continue)
+    }
+
+    fn on_handshake_tick(&mut self) -> Result<LoopFlow, Box<dyn Error>> {
+        let Node {
+            local_peer_id,
+            account_proof,
+            swarm,
+            display_name,
+            peers,
+            contact_devices,
+            sent_numbers,
+            pending_handshakes,
+            presence_status,
+            sessions,
+            ..
+        } = self;
+        let local_peer_id = *local_peer_id;
+        // Per ogni contatto connesso senza canale cifrato: se siamo
+        // l'iniziatore ritentiamo l'handshake, altrimenti ri-annunciamo
+        // la presence per invitare l'altro lato ad avviarlo.
+        let stalled = peers
+            .iter()
+            .copied()
+            .filter(|peer| !sessions.contains_key(peer))
+            .collect::<Vec<_>>();
+        for peer in stalled {
+            if should_initiate(local_peer_id, peer) {
+                maybe_start_hybrid_handshake(
+                    swarm,
+                    pending_handshakes,
+                    sessions,
+                    local_peer_id,
+                    peer,
+                );
+            } else {
+                send_event(
+                    swarm,
+                    sessions,
+                    contact_devices,
+                    peer,
+                    local_peer_id,
+                    sent_numbers,
+                    ChatEvent::Presence(presence_update(
+                        display_name,
+                        presence_status,
+                        true,
+                        account_proof,
+                    )),
+                );
+            }
+        }
+        Ok(LoopFlow::Continue)
+    }
+
+    fn on_reconnect_due(
+        &mut self,
+        next_reconnect: Option<(PeerId, Instant)>,
+    ) -> Result<LoopFlow, Box<dyn Error>> {
+        let Node {
+            swarm,
+            peers,
+            dialing,
+            reconnect_at,
+            reconnect_attempts,
+            known_contacts,
+            online_devices,
+            known_devices,
+            ..
+        } = self;
+        let Some((peer, _)) = next_reconnect else {
+            return Ok(LoopFlow::Continue);
+        };
+        reconnect_at.remove(&peer);
+        if (known_contacts.contains(&peer) || known_devices.contains_key(&peer))
+            && !peers.contains(&peer)
+            && !online_devices.contains(&peer)
+            && dialing.insert(peer)
+        {
+            if let Err(error) = swarm.dial(DialOpts::peer_id(peer).build()) {
+                dialing.remove(&peer);
+                log::warn!("riconnessione fallita per {peer}: {error}");
+                schedule_reconnect(peer, reconnect_at, reconnect_attempts);
+            }
+        }
+        Ok(LoopFlow::Continue)
+    }
+
+    fn on_stdin_line(&mut self, line: Option<String>) -> Result<LoopFlow, Box<dyn Error>> {
+        let Node {
+            ml_dsa_identity,
+            contact_identity,
+            history,
+            local_peer_id,
+            swarm,
+            display_name,
+            peers,
+            dialing,
+            bootstrap_fallbacks,
+            known_contacts,
+            contact_devices,
+            fallback_planner,
+            pending_dht,
+            triggers,
+            nudge_limits,
+            sent_numbers,
+            sessions,
+            prepared_files_tx,
+            peer_names,
+            nudge_counter,
+            stdin_open,
+            args,
+            ..
+        } = self;
+        let local_peer_id = *local_peer_id;
+        match line {
+            Some(line) if line == "quit" => return Ok(LoopFlow::Stop),
+            Some(line) if line == "history" => match history.latest(20) {
+                Ok(entries) => {
+                    for entry in entries.iter().rev() {
+                        log::info!(
+                            "{} {} {} {}: {}",
+                            entry.timestamp_ms,
+                            entry.direction,
+                            entry.peer,
+                            entry.kind,
+                            entry.body
+                        );
                     }
-                },
-                Some(line) if line.starts_with("contact import-link ") => match contacts::import_link(line[20..].trim()) {
+                }
+                Err(error) => log::warn!("cronologia non disponibile: {error}"),
+            },
+            Some(line) if line.starts_with("contact export ") => {
+                let path = Path::new(line[15..].trim());
+                match contacts::export(
+                    path,
+                    display_name,
+                    local_peer_id,
+                    contact_identity,
+                    ml_dsa_identity,
+                    contact_addresses(swarm, &args.relays, local_peer_id).into_iter(),
+                ) {
+                    Ok(()) => log::info!("scheda contatto salvata in {}", path.display()),
+                    Err(error) => log::warn!("esportazione contatto fallita: {error}"),
+                }
+            }
+            Some(line) if line == "contact qr" => {
+                let result = contacts::share_links(
+                    display_name,
+                    local_peer_id,
+                    contact_identity,
+                    ml_dsa_identity,
+                    contact_addresses(swarm, &args.relays, local_peer_id),
+                )
+                .and_then(|(link, qr_link)| {
+                    let qr = contacts::render_qr(&qr_link)?;
+                    Ok((link, qr))
+                });
+                match result {
+                    Ok((link, qr)) => log::info!("{qr}\n{link}"),
+                    Err(error) => log::warn!("generazione QR fallita: {error}"),
+                }
+            }
+            Some(line) if line.starts_with("contact import-link ") => {
+                match contacts::import_link(line[20..].trim()) {
                     Ok((name, peer_id, addresses)) => {
                         peer_names.insert(peer_id, name.clone());
                         known_contacts.insert(peer_id);
                         log::info!("identità contatto verificata: {name} ({peer_id})");
                         connect_contact(
-                            &mut swarm,
+                            swarm,
                             peer_id,
                             addresses,
-                            &mut dialing,
-                            &mut bootstrap_fallbacks,
-                            &mut fallback_planner,
-                            &mut pending_dht,
+                            dialing,
+                            bootstrap_fallbacks,
+                            fallback_planner,
+                            pending_dht,
                         );
                     }
                     Err(error) => log::warn!("link contatto rifiutato: {error}"),
-                },
-                Some(line) if line.starts_with("contact import ") => match contacts::import(Path::new(line[15..].trim())) {
+                }
+            }
+            Some(line) if line.starts_with("contact import ") => {
+                match contacts::import(Path::new(line[15..].trim())) {
                     Ok((name, peer_id, addresses)) => {
                         peer_names.insert(peer_id, name.clone());
                         known_contacts.insert(peer_id);
                         log::info!("contatto importato: {name} ({peer_id})");
                         connect_contact(
-                            &mut swarm,
+                            swarm,
                             peer_id,
                             addresses,
-                            &mut dialing,
-                            &mut bootstrap_fallbacks,
-                            &mut fallback_planner,
-                            &mut pending_dht,
+                            dialing,
+                            bootstrap_fallbacks,
+                            fallback_planner,
+                            pending_dht,
                         );
                     }
                     Err(error) => log::warn!("importazione contatto fallita: {error}"),
-                },
-                Some(line) if line == "nudge" => {
-                    nudge_counter += 1;
-                    let now = now_ms();
-                    let mut id = [0; 16];
-                    id[..8].copy_from_slice(&now.to_be_bytes());
-                    id[8..].copy_from_slice(&nudge_counter.to_be_bytes());
-                    if peers.is_empty() { log::warn!("nessun peer collegato"); }
-                    for peer in &peers {
-                        match nudge_limits.entry(*peer).or_default().try_acquire(now) {
-                            Ok(()) => {
-                                send_event(&mut swarm, &mut sessions, &contact_devices, *peer, local_peer_id, &mut sent_numbers, ChatEvent::Nudge(Nudge { id, intensity: 1, timestamp_ms: now }));
-                                record(&history, peer, "out", "nudge", "trillo");
-                            }
-                            Err(wait_ms) => log::warn!("trillo limitato per {peer}: riprova tra {}s", wait_ms.div_ceil(1_000)),
+                }
+            }
+            Some(line) if line == "nudge" => {
+                *nudge_counter += 1;
+                let now = now_ms();
+                let mut id = [0; 16];
+                id[..8].copy_from_slice(&now.to_be_bytes());
+                id[8..].copy_from_slice(&nudge_counter.to_be_bytes());
+                if peers.is_empty() {
+                    log::warn!("nessun peer collegato");
+                }
+                for peer in peers.iter() {
+                    match nudge_limits.entry(*peer).or_default().try_acquire(now) {
+                        Ok(()) => {
+                            send_event(
+                                swarm,
+                                sessions,
+                                contact_devices,
+                                *peer,
+                                local_peer_id,
+                                sent_numbers,
+                                ChatEvent::Nudge(Nudge {
+                                    id,
+                                    intensity: 1,
+                                    timestamp_ms: now,
+                                }),
+                            );
+                            record(history, peer, "out", "nudge", "trillo");
                         }
+                        Err(wait_ms) => log::warn!(
+                            "trillo limitato per {peer}: riprova tra {}s",
+                            wait_ms.div_ceil(1_000)
+                        ),
                     }
                 }
-                Some(line) if line.starts_with("text ") => {
-                    let text = line[5..].to_owned();
-                    let emoticons = resolve_emoticons(&text, &triggers)
-                        .map_err(|error| format!("trigger emoticon non valido: {error:?}"))?;
-                    let mut message_id = [0u8; 16];
-                    OsRng.fill_bytes(&mut message_id);
-                    let message = TextMessage { text, emoticons, id: message_id };
-                    for peer in &peers { record_text(&history, peer, "out", &message); }
-                    let event = ChatEvent::Text(message);
-                    broadcast(&mut swarm, &mut sessions, &contact_devices, &peers, local_peer_id, &mut sent_numbers, event);
+            }
+            Some(line) if line.starts_with("text ") => {
+                let text = line[5..].to_owned();
+                let emoticons = resolve_emoticons(&text, triggers)
+                    .map_err(|error| format!("trigger emoticon non valido: {error:?}"))?;
+                let mut message_id = [0u8; 16];
+                OsRng.fill_bytes(&mut message_id);
+                let message = TextMessage {
+                    text,
+                    emoticons,
+                    id: message_id,
+                };
+                for peer in peers.iter() {
+                    record_text(history, peer, "out", &message);
                 }
-                Some(line) if line.starts_with("emote ") => match parse_emote_command(&line, &args.emotes, &mut triggers) {
+                let event = ChatEvent::Text(message);
+                broadcast(
+                    swarm,
+                    sessions,
+                    contact_devices,
+                    peers,
+                    local_peer_id,
+                    sent_numbers,
+                    event,
+                );
+            }
+            Some(line) if line.starts_with("emote ") => {
+                match parse_emote_command(&line, &args.emotes, triggers) {
                     Ok(offer) => {
                         log::info!("emoticon salvata: {}", offer.metadata.name);
-                        for peer in &peers { record(&history, peer, "out", "emote", &offer.metadata.name); }
-                        broadcast(&mut swarm, &mut sessions, &contact_devices, &peers, local_peer_id, &mut sent_numbers, ChatEvent::EmoticonOffer(offer));
+                        for peer in peers.iter() {
+                            record(history, peer, "out", "emote", &offer.metadata.name);
+                        }
+                        broadcast(
+                            swarm,
+                            sessions,
+                            contact_devices,
+                            peers,
+                            local_peer_id,
+                            sent_numbers,
+                            ChatEvent::EmoticonOffer(offer),
+                        );
                     }
                     Err(error) => log::warn!("emoticon rifiutata: {error}"),
-                },
-                Some(line) if line.starts_with("file ") => {
-                    if peers.is_empty() {
-                        log::warn!("nessun peer collegato");
-                    } else {
-                        prepare_file(&prepared_files_tx, FileTarget::AllPeers, PathBuf::from(line[5..].trim()));
-                    }
                 }
-                Some(_) => log::warn!("comando non valido"),
-                None => stdin_open = false,
-            },
-            command = commands.recv(), if commands_open => match command {
-                Some(ClientCommand::Shutdown) => return Ok(LoopFlow::Stop),
-                #[cfg(test)]
-                Some(ClientCommand::ForgetSession { peer }) => {
-                    sessions.remove(&peer);
-                    let _ = events.send(ClientEvent::ContactStatus {
-                        peer_id: peer.to_string(),
-                        status: "session-forgotten".into(),
+            }
+            Some(line) if line.starts_with("file ") => {
+                if peers.is_empty() {
+                    log::warn!("nessun peer collegato");
+                } else {
+                    prepare_file(
+                        prepared_files_tx,
+                        FileTarget::AllPeers,
+                        PathBuf::from(line[5..].trim()),
+                    );
+                }
+            }
+            Some(_) => log::warn!("comando non valido"),
+            None => *stdin_open = false,
+        }
+        Ok(LoopFlow::Continue)
+    }
+
+    fn on_command(&mut self, command: Option<ClientCommand>) -> Result<LoopFlow, Box<dyn Error>> {
+        let Node {
+            local_peer_id,
+            account_proof,
+            swarm,
+            display_name,
+            peers,
+            contact_devices,
+            notification_mutes,
+            sent_numbers,
+            #[cfg(test)]
+            withhold_acks,
+            auto_accept_extensions,
+            presence_status,
+            sessions,
+            commands_open,
+            events,
+            ..
+        } = self;
+        let local_peer_id = *local_peer_id;
+        match command {
+            Some(
+                command @ (ClientCommand::RequestContactLink
+                | ClientCommand::RequestDeviceLink
+                | ClientCommand::ImportDeviceLink { .. }
+                | ClientCommand::ImportContactLink { .. }),
+            ) => return self.on_link_command(command),
+            Some(
+                command @ (ClientCommand::SendText { .. }
+                | ClientCommand::SendNudge { .. }
+                | ClientCommand::SendFile { .. }
+                | ClientCommand::DeleteMessageForMe { .. }
+                | ClientCommand::DeleteMessageForEveryone { .. }
+                | ClientCommand::LoadOlderMessages { .. }),
+            ) => return self.on_message_command(command),
+            Some(
+                command @ (ClientCommand::CreateEmoticon { .. }
+                | ClientCommand::SaveEmoticon { .. }
+                | ClientCommand::UpdateEmoticon { .. }
+                | ClientCommand::DeleteEmoticon { .. }),
+            ) => return self.on_emoticon_command(command),
+            Some(
+                command @ (ClientCommand::RenameContact { .. }
+                | ClientCommand::ClearConversation { .. }
+                | ClientCommand::DeleteContact { .. }
+                | ClientCommand::AcceptContactRequest { .. }
+                | ClientCommand::RejectContactRequest { .. }
+                | ClientCommand::RequestPendingContactRequests),
+            ) => return self.on_contact_command(command),
+            Some(
+                command @ (ClientCommand::CreateChatGroup { .. }
+                | ClientCommand::ModerateGroup { .. }
+                | ClientCommand::SendGroupText { .. }
+                | ClientCommand::SendGroupFile { .. }
+                | ClientCommand::LoadOlderGroupMessages { .. }
+                | ClientCommand::ClearGroupConversation { .. }
+                | ClientCommand::DeleteChatGroup { .. }),
+            ) => return self.on_group_command(command),
+            Some(
+                command @ (ClientCommand::ReadAttachment { .. }
+                | ClientCommand::ExportAttachment { .. }
+                | ClientCommand::CancelFileTransfers { .. }
+                | ClientCommand::AcceptAttachment { .. }
+                | ClientCommand::RejectAttachment { .. }),
+            ) => return self.on_attachment_command(command),
+            Some(ClientCommand::Shutdown) => return Ok(LoopFlow::Stop),
+            #[cfg(test)]
+            Some(ClientCommand::ForgetSession { peer }) => {
+                sessions.remove(&peer);
+                let _ = events.send(ClientEvent::ContactStatus {
+                    peer_id: peer.to_string(),
+                    status: "session-forgotten".into(),
+                });
+            }
+            #[cfg(test)]
+            Some(ClientCommand::ScrambleSession { peer }) => {
+                sessions.insert(
+                    peer,
+                    RatchetSession::new(SessionKey::random_for_test(), local_peer_id, peer),
+                );
+                let _ = events.send(ClientEvent::ContactStatus {
+                    peer_id: peer.to_string(),
+                    status: "session-scrambled".into(),
+                });
+            }
+            #[cfg(test)]
+            Some(ClientCommand::WithholdAcks { enabled }) => {
+                // Le risposte trattenute restano aperte: chiuderle farebbe
+                // fallire subito la richiesta invece di farla scadere.
+                *withhold_acks = enabled;
+            }
+            Some(ClientCommand::UpdateDisplayName { name }) => {
+                let name = name.trim();
+                if name.is_empty() || name.len() > 64 {
+                    let _ = events.send(ClientEvent::Error {
+                        message: "nome non valido".into(),
                     });
+                } else {
+                    *display_name = name.to_owned();
+                    broadcast(
+                        swarm,
+                        sessions,
+                        contact_devices,
+                        peers,
+                        local_peer_id,
+                        sent_numbers,
+                        ChatEvent::Presence(presence_update(
+                            display_name,
+                            presence_status,
+                            true,
+                            account_proof,
+                        )),
+                    );
                 }
-                #[cfg(test)]
-                Some(ClientCommand::ScrambleSession { peer }) => {
-                    sessions.insert(peer, RatchetSession::new(SessionKey::random_for_test(), local_peer_id, peer));
-                    let _ = events.send(ClientEvent::ContactStatus {
-                        peer_id: peer.to_string(),
-                        status: "session-scrambled".into(),
-                    });
+            }
+            Some(ClientCommand::SetNotificationMute {
+                conversation,
+                muted,
+                until_ms,
+            }) => {
+                if muted {
+                    notification_mutes.insert(conversation, until_ms);
+                } else {
+                    notification_mutes.remove(&conversation);
                 }
-                #[cfg(test)]
-                Some(ClientCommand::WithholdAcks { enabled }) => {
-                    // Le risposte trattenute restano aperte: chiuderle farebbe
-                    // fallire subito la richiesta invece di farla scadere.
-                    withhold_acks = enabled;
+            }
+            Some(ClientCommand::SetAutoAcceptExtensions { extensions }) => {
+                *auto_accept_extensions = extensions
+                    .into_iter()
+                    .map(|ext| ext.trim().trim_start_matches('.').to_ascii_lowercase())
+                    .filter(|ext| !ext.is_empty())
+                    .collect();
+            }
+            Some(ClientCommand::SetPresenceStatus { status }) => {
+                *presence_status = match status.as_str() {
+                    "busy" | "away" => status,
+                    _ => "online".to_string(),
+                };
+                let update = presence_update(display_name, presence_status, true, account_proof);
+                for &peer in peers.iter() {
+                    send_event(
+                        swarm,
+                        sessions,
+                        contact_devices,
+                        peer,
+                        local_peer_id,
+                        sent_numbers,
+                        ChatEvent::Presence(update.clone()),
+                    );
                 }
-                Some(ClientCommand::RequestContactLink) => {
-                    contact_link_requested = true;
-                    let addresses = contact_addresses(&swarm, &args.relays, local_peer_id);
+            }
+            None => *commands_open = false,
+        }
+        Ok(LoopFlow::Continue)
+    }
+
+    fn on_swarm_event(
+        &mut self,
+        event: SwarmEvent<BehaviourEvent>,
+    ) -> Result<LoopFlow, Box<dyn Error>> {
+        let Node {
+            ml_dsa_identity,
+            contact_identity,
+            history,
+            local_peer_id,
+            swarm,
+            display_name,
+            peers,
+            dialing,
+            mdns_dialing,
+            reconnect_at,
+            reconnect_attempts,
+            bootstrap_fallbacks,
+            known_contacts,
+            contact_devices,
+            infrastructure_peers,
+            fallback_planner,
+            pending_dht,
+            triggers,
+            nudge_limits,
+            incoming_nudge_limits,
+            sent_numbers,
+            pending_offers,
+            pending_transfers,
+            pending_handshakes,
+            handshake_retries,
+            outbox,
+            pending_messages,
+            pending_inbound_handshakes,
+            sessions,
+            decrypt_failures,
+            shared_emoticons,
+            waiting_offers,
+            pending_inbound_offers,
+            peer_names,
+            contact_link_requested,
+            device_link_requested,
+            pending_pairings,
+            pending_pair_targets,
+            pending_device_requests,
+            online_devices,
+            known_devices,
+            args,
+            events,
+            ..
+        } = self;
+        let local_peer_id = *local_peer_id;
+        match event {
+            SwarmEvent::NewListenAddr { address, .. } => {
+                let address = if split_peer_address(&address).is_ok() {
+                    address
+                } else {
+                    address.with(Protocol::P2p(local_peer_id))
+                };
+                log::info!("ascolto: {address}");
+                if *contact_link_requested {
+                    let addresses = contact_addresses(swarm, &args.relays, local_peer_id);
                     if !addresses.is_empty() {
                         let links = contacts::share_links(
-                            &display_name,
+                            display_name,
                             local_peer_id,
-                            &contact_identity,
-                            &ml_dsa_identity,
+                            contact_identity,
+                            ml_dsa_identity,
                             addresses,
                         );
                         match links {
                             Ok((link, qr_link)) => {
-                                contact_link_requested = false;
+                                *contact_link_requested = false;
                                 let _ = events.send(ClientEvent::ContactLink { link, qr_link });
                             }
                             Err(error) => {
-                                let _ = events.send(ClientEvent::Error { message: error.to_string() });
+                                let _ = events.send(ClientEvent::Error {
+                                    message: error.to_string(),
+                                });
                             }
                         }
                     }
                 }
-                Some(ClientCommand::RequestDeviceLink) => {
-                    device_link_requested = true;
-                    let addresses = contact_addresses(&swarm, &args.relays, local_peer_id);
+                if *device_link_requested {
+                    let addresses = contact_addresses(swarm, &args.relays, local_peer_id);
                     if !addresses.is_empty() {
-                        let descriptor = local_device_descriptor(
-                            local_peer_id,
-                            &display_name,
-                            addresses,
-                        );
+                        let descriptor =
+                            local_device_descriptor(local_peer_id, display_name, addresses);
                         match devices::create_pairing_link(descriptor, now_ms()) {
                             Ok((link, pairing)) => {
-                                device_link_requested = false;
+                                *device_link_requested = false;
                                 pending_pairings.insert(
                                     devices::key_id(&pairing.secret),
                                     PendingPairing {
@@ -1502,1611 +2149,1444 @@ async fn run_node(
                                 });
                             }
                             Err(error) => {
-                                let _ = events.send(ClientEvent::Error { message: error.to_string() });
+                                let _ = events.send(ClientEvent::Error {
+                                    message: error.to_string(),
+                                });
                             }
                         }
                     }
                 }
-                Some(ClientCommand::ImportDeviceLink { link }) => {
-                    match devices::parse_pairing_link(&link, now_ms()) {
-                        Ok(pairing) => {
-                            let peer = pairing.inviter.peer_id.parse::<PeerId>()?;
-                            if peer == local_peer_id {
-                                let _ = events.send(ClientEvent::Error { message: "non puoi collegare il dispositivo a se stesso".into() });
-                                return Ok(LoopFlow::Continue);
-                            }
-                            let addresses = pairing
-                                .inviter
-                                .addresses
-                                .iter()
-                                .map(|address| address.parse::<Multiaddr>())
-                                .collect::<Result<Vec<_>, _>>()?;
-                            let secret = pairing.secret;
-                            pending_pair_targets.insert(peer, pairing);
-                            if swarm.is_connected(&peer) {
-                                let descriptor = local_device_descriptor(
-                                    local_peer_id,
-                                    &display_name,
-                                    contact_addresses(&swarm, &args.relays, local_peer_id),
-                                );
-                                let records = history
-                                    .sync_records_since(0, devices::MAX_SYNC_RECORDS)?;
-                                let request = DeviceRequest::Pair {
-                                    device: descriptor,
-                                    records,
-                                };
-                                let sealed = devices::seal(&secret, &request)?;
-                                let request_id = swarm
-                                    .behaviour_mut()
-                                    .devices
-                                    .send_request(&peer, sealed);
-                                pending_device_requests.insert(
-                                    request_id,
-                                    PendingDeviceRequest::Pair { peer, key: secret },
-                                );
-                            } else {
-                                connect_contact(
-                                    &mut swarm,
-                                    peer,
-                                    addresses,
-                                    &mut dialing,
-                                    &mut bootstrap_fallbacks,
-                                    &mut fallback_planner,
-                                    &mut pending_dht,
-                                );
-                            }
-                        }
-                        Err(error) => {
-                            let _ = events.send(ClientEvent::Error { message: error.to_string() });
+            }
+            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                return self.on_connection_established(peer_id)
+            }
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                num_established,
+                cause,
+                ..
+            } => {
+                if num_established == 0 {
+                    if online_devices.remove(&peer_id) {
+                        send_devices(known_devices, online_devices, events);
+                    }
+                    let was_application_peer = peers.remove(&peer_id);
+                    sessions.remove(&peer_id);
+                    shared_emoticons.retain(|(peer, _)| *peer != peer_id);
+                    pending_handshakes.retain(|_, (pending_peer, _)| *pending_peer != peer_id);
+                    pending_inbound_handshakes
+                        .retain(|_, (pending_peer, _)| *pending_peer != peer_id);
+                    handshake_retries.remove(&peer_id);
+                    decrypt_failures.remove(&peer_id);
+                    if !contact_devices.online(contact_devices.canonical(peer_id), peers) {
+                        for offer in take_waiting_offers(waiting_offers, contact_devices, peer_id) {
+                            report_file_failed(
+                                events,
+                                &offer.manifest.filename,
+                                "contatto disconnesso",
+                            );
                         }
                     }
-                }
-                Some(ClientCommand::UpdateDisplayName { name }) => {
-                    let name = name.trim();
-                    if name.is_empty() || name.len() > 64 {
-                        let _ = events.send(ClientEvent::Error { message: "nome non valido".into() });
-                    } else {
-                        display_name = name.to_owned();
-                        broadcast(
-                            &mut swarm,
-                            &mut sessions,
-                            &contact_devices,
-                            &peers,
-                            local_peer_id,
-                            &mut sent_numbers,
-                            ChatEvent::Presence(presence_update(&display_name, &presence_status, true, &account_proof)),
+                    nudge_limits.remove(&peer_id);
+                    incoming_nudge_limits.remove(&peer_id);
+                    if was_application_peer {
+                        log::info!(
+                            "offline: {} ({cause:?})",
+                            peer_names
+                                .get(&peer_id)
+                                .map_or_else(|| peer_id.to_string(), Clone::clone)
                         );
-                    }
-                }
-                Some(ClientCommand::SetNotificationMute { conversation, muted, until_ms }) => {
-                    if muted {
-                        notification_mutes.insert(conversation, until_ms);
-                    } else {
-                        notification_mutes.remove(&conversation);
-                    }
-                }
-                Some(ClientCommand::ImportContactLink { link }) => {
-                    match contacts::import_link(&link) {
-                        Ok((name, peer_id, addresses)) => {
-                            history.allow_contact(&peer_id.to_string())?;
-                            ignored_contacts.remove(&peer_id);
-                            history.save_contact(
-                                &peer_id.to_string(),
-                                &name,
-                                &link,
-                                now_ms(),
-                            )?;
-                            peer_names.insert(peer_id, name.clone());
-                            known_contacts.insert(peer_id);
+                        log::info!("offline: {peer_id} ({cause:?})");
+                        // Un contatto va offline solo quando cade l'ultimo dei
+                        // suoi dispositivi.
+                        let contact = contact_devices.canonical(peer_id);
+                        if !contact_devices.online(contact, peers) {
                             let _ = events.send(ClientEvent::ContactUpdated {
                                 contact: ClientContact {
-                                    peer_id: peer_id.to_string(),
-                                    name,
+                                    peer_id: contact.to_string(),
+                                    name: peer_names
+                                        .get(&contact)
+                                        .cloned()
+                                        .unwrap_or_else(|| "Contatto".into()),
                                     online: false,
                                     secure: false,
-                                    fingerprint: peer_fingerprint(peer_id),
+                                    fingerprint: peer_fingerprint(contact),
                                 },
                             });
-                            connect_contact(
-                                &mut swarm,
-                                peer_id,
-                                addresses,
-                                &mut dialing,
-                                &mut bootstrap_fallbacks,
-                                &mut fallback_planner,
-                                &mut pending_dht,
+                        }
+                    }
+                    if should_reconnect_closed_peer(
+                        known_contacts.contains(&peer_id) || known_devices.contains_key(&peer_id),
+                        num_established,
+                    ) {
+                        dialing.remove(&peer_id);
+                        schedule_reconnect(peer_id, reconnect_at, reconnect_attempts);
+                    }
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Chat(request_response::Event::Message {
+                peer,
+                message,
+                ..
+            })) => return self.on_chat_message(peer, message),
+            SwarmEvent::Behaviour(BehaviourEvent::SecureChat(
+                request_response::Event::Message { peer, message, .. },
+            )) => return self.on_secure_chat_message(peer, message),
+            SwarmEvent::Behaviour(BehaviourEvent::SecureChat(
+                request_response::Event::OutboundFailure {
+                    peer,
+                    request_id,
+                    error,
+                    ..
+                },
+            )) => {
+                if let Some(mut pending) = pending_offers.remove(&request_id) {
+                    if let Some(retries) = next_request_retry(pending.retries) {
+                        pending.retries = retries;
+                        let event = offer_event(&pending);
+                        if let Some(next_id) = send_event(
+                            swarm,
+                            sessions,
+                            contact_devices,
+                            pending.peer,
+                            local_peer_id,
+                            sent_numbers,
+                            event,
+                        ) {
+                            pending_offers.insert(next_id, pending);
+                        } else {
+                            report_file_failed(
+                                events,
+                                &pending.manifest.filename,
+                                "sessione cifrata persa",
                             );
                         }
-                        Err(error) => {
-                            let _ = events.send(ClientEvent::Error { message: error.to_string() });
-                        }
-                    }
-                }
-                Some(ClientCommand::SendText { peer, text }) => {
-                    if let Err(message) = check_outgoing_text(&text) {
-                        let _ = events.send(ClientEvent::Error { message });
-                        return Ok(LoopFlow::Continue);
-                    }
-                    let emoticons = resolve_emoticons(&text, &triggers)
-                        .map_err(|error| format!("trigger emoticon non valido: {error:?}"))?;
-                    let mut message_id = [0u8; 16];
-                    OsRng.fill_bytes(&mut message_id);
-                    let message = TextMessage {
-                        text: text.clone(),
-                        emoticons,
-                        id: message_id,
-                    };
-                    let client_emoticons = client_emoticon_spans(&message);
-                    // Contatto non connesso ma un mio dispositivo collegato è online:
-                    // gli chiedo di consegnare il messaggio (relay). Uno solo, così il
-                    // contatto non riceve doppioni; se il relay fallisce il messaggio
-                    // torna nella coda diretta. Con il contatto connesso e l'handshake
-                    // ancora in corso si aspetta la sessione diretta, che arriva a breve.
-                    let relay_device = if contact_devices.online(peer, &peers) {
-                        None
                     } else {
-                        online_devices.iter().min().copied()
-                    };
-                    let relayed = relay_device.is_some_and(|device| {
-                        log::info!("relay: chiedo a {device} di consegnare a {peer}");
-                        let offers = relay_emoticon_offers(&message.emoticons, &triggers, &args.emotes);
-                        send_relay_text(&mut swarm, &account_key, &mut pending_device_requests, device, peer, message.clone(), offers)
-                            .inspect_err(|error| log::warn!("relay verso dispositivo fallito: {error}"))
-                            .is_ok()
-                    });
-                    if !relayed {
-                        // Le emoticon partono prima del testo e con la stessa
-                        // consegna affidabile: il destinatario le ha quando lo legge.
-                        for offer in new_emoticon_offers(&message.emoticons, peer, &mut shared_emoticons, &triggers, &args.emotes, &events) {
-                            deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, peer, ChatEvent::EmoticonOffer(offer));
-                        }
-                        deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, peer, ChatEvent::Text(message.clone()));
+                        log::warn!("offerta file fallita definitivamente per {peer}: {error}");
+                        report_file_failed(events, &pending.manifest.filename, &error.to_string());
                     }
-                    record_text(&history, &peer, "out", &message);
-                    let _ = events.send(ClientEvent::Message {
-                        message: ClientMessage {
-                            peer_id: peer.to_string(),
-                            direction: "out".into(),
-                            kind: "text".into(),
-                            body: text,
-                            timestamp_ms: now_ms(),
-                            emoticons: client_emoticons,
-                            attachment_id: None,
-                            attachment_mime: None,
-                            event_id: Some(hex_group_id(&message_id)),
-                            relayed,
-                        },
-                    });
+                } else if let Some(mut transfer) = pending_transfers.remove(&request_id) {
+                    if let Some(retries) = next_request_retry(transfer.retries) {
+                        transfer.retries = retries;
+                        send_current_transfer_chunk(
+                            swarm,
+                            sessions,
+                            contact_devices,
+                            sent_numbers,
+                            pending_transfers,
+                            local_peer_id,
+                            events,
+                            transfer,
+                        );
+                    } else {
+                        log::warn!(
+                            "trasferimento file fallito definitivamente per {peer}: {error}"
+                        );
+                        report_file_failed(events, &transfer.manifest.filename, &error.to_string());
+                    }
+                } else if let Some((msg_peer, event, retries, _)) =
+                    pending_messages.remove(&request_id)
+                {
+                    // Retry di un messaggio di testo fallito in transito.
+                    if let Some(next) = next_delivery_attempt(retries) {
+                        resend_pending(
+                            swarm,
+                            sessions,
+                            contact_devices,
+                            sent_numbers,
+                            pending_messages,
+                            outbox,
+                            local_peer_id,
+                            msg_peer,
+                            event,
+                            next,
+                        );
+                    } else {
+                        log::warn!("messaggio non consegnato definitivamente a {peer}: {error}");
+                        report_undelivered(
+                            events,
+                            shared_emoticons,
+                            msg_peer,
+                            &event,
+                            &error.to_string(),
+                        );
+                    }
+                } else {
+                    log::warn!("invio cifrato fallito per {peer}: {error}");
                 }
-                Some(ClientCommand::SendNudge { peer }) => {
-                    // Prima la connessione, poi il limite: un trillo che non può
-                    // partire non deve consumare il rate limit.
-                    if !contact_devices.online(peer, &peers) {
-                        let _ = events.send(ClientEvent::Error {
-                            message: "contatto non collegato".into(),
-                        });
-                        return Ok(LoopFlow::Continue);
-                    }
-                    let timestamp_ms = now_ms();
-                    if let Err(wait_ms) = nudge_limits.entry(peer).or_default().try_acquire(timestamp_ms) {
-                        let _ = events.send(ClientEvent::Error {
-                            message: format!(
-                                "trillo limitato: riprova tra {}s",
-                                wait_ms.div_ceil(1_000)
-                            ),
-                        });
-                        return Ok(LoopFlow::Continue);
-                    }
-                    nudge_counter += 1;
-                    let mut id = [0; 16];
-                    id[..8].copy_from_slice(&timestamp_ms.to_be_bytes());
-                    id[8..].copy_from_slice(&nudge_counter.to_be_bytes());
-                    deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, peer,
-                        ChatEvent::Nudge(Nudge { id, intensity: 1, timestamp_ms }));
-                    record(&history, &peer, "out", "nudge", "trillo");
-                    let _ = events.send(ClientEvent::Message {
-                        message: ClientMessage {
-                            peer_id: peer.to_string(),
-                            direction: "out".into(),
-                            kind: "nudge".into(),
-                            body: "trillo".into(),
-                            timestamp_ms,
-                            emoticons: Vec::new(),
-                            attachment_id: None,
-                            attachment_mime: None,
-                            event_id: None,
-                            relayed: false,
-                        },
-                    });
-                }
-                Some(ClientCommand::SendFile { peer, path }) => {
-                    if !contact_devices.online(peer, &peers) {
-                        let _ = events.send(ClientEvent::Error {
-                            message: "contatto non collegato".into(),
-                        });
-                        return Ok(LoopFlow::Continue);
-                    }
-                    // L'hash di un file fino a 5 GB richiede minuti: lo calcola un
-                    // thread a parte e l'offerta parte quando è pronto. Intanto il
-                    // loop continua a gestire messaggi, ping e handshake.
-                    prepare_file(&prepared_files_tx, FileTarget::Peer(peer), path);
-                }
-                Some(ClientCommand::CreateEmoticon { path, trigger }) => {
-                    match create_emoticon(&path, &trigger, &args.emotes, &mut triggers) {
-                        Ok(offer) => {
-                            let trigger = offer
-                                .metadata
-                                .suggested_triggers
-                                .first()
-                                .cloned()
-                                .unwrap_or_default();
-                            let _ = events.send(ClientEvent::EmoticonCatalog {
-                                emoticons: vec![client_emoticon(&offer, &trigger, true)],
-                            });
-                        }
-                        Err(error) => {
-                            let _ = events.send(ClientEvent::Error {
-                                message: format!("emoticon non creata: {error}"),
-                            });
-                        }
-                    }
-                }
-                Some(ClientCommand::SaveEmoticon { asset_id, trigger }) => {
-                    let parsed = blake3::Hash::from_hex(&asset_id)
-                        .map(|hash| *hash.as_bytes())
-                        .map_err(|error| format!("id emoticon non valido: {error}"));
-                    match parsed.and_then(|asset_id| {
-                        pending_emoticons
-                            .get(&asset_id)
-                            .cloned()
-                            .ok_or_else(|| "emoticon ricevuta non disponibile".to_owned())
-                            .map(|offer| (asset_id, offer))
-                    }) {
-                        Ok((asset_id, mut offer)) => {
-                            offer.metadata.suggested_triggers = vec![trigger.trim().to_owned()];
-                            match save_offer(&args.emotes, &offer, &mut triggers) {
-                                Ok(_) => {
-                                    pending_emoticons.remove(&asset_id);
-                                    let _ = events.send(ClientEvent::EmoticonCatalog {
-                                        emoticons: vec![client_emoticon(
-                                            &offer,
-                                            trigger.trim(),
-                                            true,
-                                        )],
-                                    });
-                                }
-                                Err(error) => {
-                                    let _ = events.send(ClientEvent::Error {
-                                        message: format!("emoticon non salvata: {error}"),
-                                    });
-                                }
-                            }
-                        }
-                        Err(message) => {
-                            let _ = events.send(ClientEvent::Error { message });
-                        }
-                    }
-                }
-                Some(ClientCommand::UpdateEmoticon { asset_id, trigger }) => {
-                    match parse_asset_id(&asset_id).and_then(|asset_id| {
-                        let current = triggers.iter().find(|item| item.asset_id == asset_id).cloned()
-                            .ok_or_else(|| "emoticon non trovata".to_owned())?;
-                        let mut offer = load_emoticon_offer(&args.emotes, &current)
-                            .map_err(|error| error.to_string())?;
-                        offer.metadata.suggested_triggers = vec![trigger.trim().to_owned()];
-                        save_offer(&args.emotes, &offer, &mut triggers)
-                            .map_err(|error| error.to_string())?;
-                        Ok((offer, trigger.trim().to_owned()))
-                    }) {
-                        Ok((offer, trigger)) => {
-                            let _ = events.send(ClientEvent::EmoticonCatalog {
-                                emoticons: vec![client_emoticon(&offer, &trigger, true)],
-                            });
-                        }
-                        Err(message) => { let _ = events.send(ClientEvent::Error { message }); }
-                    }
-                }
-                Some(ClientCommand::DeleteEmoticon { asset_id }) => {
-                    match parse_asset_id(&asset_id).and_then(|asset_id| {
-                        delete_emoticon(&args.emotes, asset_id, &mut triggers)
-                            .map_err(|error| error.to_string())
-                    }) {
-                        Ok(()) => { let _ = events.send(ClientEvent::EmoticonRemoved { asset_id }); }
-                        Err(message) => { let _ = events.send(ClientEvent::Error { message }); }
-                    }
-                }
-                Some(ClientCommand::RenameContact { peer, name }) => {
-                    match history.rename_contact(&peer.to_string(), &name) {
-                        Ok(()) => {
-                            let name = name.trim().to_owned();
-                            peer_names.insert(peer, name.clone());
-                            let _ = events.send(ClientEvent::ContactUpdated { contact: ClientContact {
-                                peer_id: peer.to_string(), name, online: contact_devices.online(peer, &peers), secure: contact_devices.secure(peer, &sessions), fingerprint: peer_fingerprint(peer),
-                            }});
-                        }
-                        Err(error) => { let _ = events.send(ClientEvent::Error { message: error.to_string() }); }
-                    }
-                }
-                Some(ClientCommand::ClearConversation { peer }) => {
-                    match history.clear_conversation(&peer.to_string()) {
-                        Ok(()) => { let _ = events.send(ClientEvent::ConversationCleared { peer_id: peer.to_string() }); }
-                        Err(error) => { let _ = events.send(ClientEvent::Error { message: error.to_string() }); }
-                    }
-                }
-                Some(ClientCommand::DeleteContact { peer }) => {
-                    match history.delete_contact(&peer.to_string()) {
-                        Ok(()) => {
-                            // Bloccare una persona blocca tutti i suoi dispositivi.
-                            for device in contact_devices.forget(peer) {
-                                history.delete_contact(&device.to_string())?;
-                                ignored_contacts.insert(device);
-                                known_contacts.remove(&device);
-                                peer_names.remove(&device);
-                                peers.remove(&device);
-                                sessions.remove(&device);
-                                reconnect_at.remove(&device);
-                                reconnect_attempts.remove(&device);
-                                let _ = swarm.disconnect_peer_id(device);
-                            }
-                            ignored_contacts.insert(peer);
-                            known_contacts.remove(&peer);
-                            peer_names.remove(&peer);
-                            peers.remove(&peer);
-                            sessions.remove(&peer);
-                            reconnect_at.remove(&peer);
-                            reconnect_attempts.remove(&peer);
-                            let _ = swarm.disconnect_peer_id(peer);
-                            let _ = events.send(ClientEvent::ContactRemoved { peer_id: peer.to_string(), reason: "deleted".into() });
-                        }
-                        Err(error) => { let _ = events.send(ClientEvent::Error { message: error.to_string() }); }
-                    }
-                }
-                Some(ClientCommand::AcceptContactRequest { peer }) => {
-                    if let Some(name) = pending_contact_requests.remove(&peer) {
-                        ignored_contacts.remove(&peer);
-                        history.allow_contact(&peer.to_string())?;
-                        history.ensure_contact(&peer.to_string(), &name, now_ms())?;
-                        // Approvata la persona, i suoi altri dispositivi non
-                        // dovranno più chiedere.
-                        if let Some(account) = pending_accounts.remove(&peer) {
-                            if contact_devices.bind(peer, account.clone()) {
-                                history.bind_contact_account(&peer.to_string(), &account, now_ms())?;
-                            }
-                        }
-                        known_contacts.insert(peer);
-                        peer_names.entry(peer).or_insert_with(|| name.clone());
-                        peers.insert(peer);
-                        let _ = events.send(ClientEvent::ContactUpdated { contact: ClientContact {
-                            peer_id: peer.to_string(),
-                            name: peer_names.get(&peer).cloned().unwrap_or(name),
-                            online: true,
-                            secure: contact_devices.secure(peer, &sessions),
-                            fingerprint: peer_fingerprint(peer),
-                        }});
-                        // Ricambia la presence e avvia il canale cifrato.
-                        send_event(&mut swarm, &mut sessions, &contact_devices, peer, local_peer_id, &mut sent_numbers,
-                            ChatEvent::Presence(presence_update(&display_name, &presence_status, true, &account_proof)));
-                        maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
-                    }
-                }
-                Some(ClientCommand::RejectContactRequest { peer }) => {
-                    pending_contact_requests.remove(&peer);
-                    pending_accounts.remove(&peer);
-                    // Il rifiuto resta dopo un riavvio e arriva agli altri
-                    // dispositivi: lo stesso sconosciuto non può richiedere di nuovo.
-                    history.delete_contact(&peer.to_string())?;
-                    ignored_contacts.insert(peer);
-                    known_contacts.remove(&peer);
-                    peers.remove(&peer);
-                    sessions.remove(&peer);
-                    let _ = swarm.disconnect_peer_id(peer);
-                    let _ = events.send(ClientEvent::ContactRemoved { peer_id: peer.to_string(), reason: "rejected".into() });
-                }
-                Some(ClientCommand::RequestPendingContactRequests) => {
-                    // Gli eventi UI non vengono conservati da Tauri. Su mobile la
-                    // WebView può essere sospesa o ricreata mentre il nodo continua
-                    // a girare: ripubblica quindi le richieste ancora in attesa.
-                    for (peer, name) in &pending_contact_requests {
-                        let _ = events.send(ClientEvent::ContactRequest {
-                            peer_id: peer.to_string(),
-                            name: name.clone(),
-                        });
-                    }
-                }
-                Some(ClientCommand::DeleteMessageForMe { event_id }) => {
-                    if let Err(error) = history.delete_event(&event_id, now_ms()) {
-                        let _ = events.send(ClientEvent::Error { message: error.to_string() });
-                    }
-                }
-                Some(ClientCommand::DeleteMessageForEveryone { peer, event_id }) => {
-                    const DELETE_WINDOW_MS: u64 = 15 * 60 * 1000;
-                    // Solo un mio messaggio (direction "out") verso questo peer e
-                    // dentro la finestra può essere cancellato per tutti.
-                    match history.event_meta(&event_id) {
-                        Ok(Some((stored_peer, direction, timestamp_ms))) => {
-                            if stored_peer != peer.to_string() || direction != "out" {
-                                let _ = events.send(ClientEvent::Error { message: "puoi cancellare per tutti solo i tuoi messaggi".into() });
-                            } else if now_ms().saturating_sub(timestamp_ms) > DELETE_WINDOW_MS {
-                                let _ = events.send(ClientEvent::Error { message: "tempo scaduto per la cancellazione per tutti".into() });
-                            } else if let Some(id) = parse_message_id(&event_id) {
-                                // Come i messaggi: in coda se il contatto è offline,
-                                // con retry e avviso se non arriva.
-                                deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, peer,
-                                    ChatEvent::DeleteMessage(DeleteRequest { id, group_id: None }));
-                                if let Err(error) = history.tombstone_event(&event_id, now_ms()) {
-                                    let _ = events.send(ClientEvent::Error { message: error.to_string() });
-                                } else {
-                                    let _ = events.send(ClientEvent::MessageDeleted { peer_id: peer.to_string(), event_id });
-                                }
-                            } else {
-                                let _ = events.send(ClientEvent::Error { message: "id messaggio non valido".into() });
-                            }
-                        }
-                        Ok(None) => { let _ = events.send(ClientEvent::Error { message: "messaggio non trovato".into() }); }
-                        Err(error) => { let _ = events.send(ClientEvent::Error { message: error.to_string() }); }
-                    }
-                }
-                Some(ClientCommand::SetAutoAcceptExtensions { extensions }) => {
-                    auto_accept_extensions = extensions
-                        .into_iter()
-                        .map(|ext| ext.trim().trim_start_matches('.').to_ascii_lowercase())
-                        .filter(|ext| !ext.is_empty())
-                        .collect();
-                }
-                Some(ClientCommand::SetPresenceStatus { status }) => {
-                    presence_status = match status.as_str() {
-                        "busy" | "away" => status,
-                        _ => "online".to_string(),
-                    };
-                    let update =
-                        presence_update(&display_name, &presence_status, true, &account_proof);
-                    for &peer in &peers {
-                        send_event(&mut swarm, &mut sessions, &contact_devices, peer, local_peer_id, &mut sent_numbers, ChatEvent::Presence(update.clone()));
-                    }
-                }
-                Some(ClientCommand::CreateChatGroup { name, members }) => {
-                    let name = name.trim();
-                    let mut members = members.into_iter().filter(|peer| *peer != local_peer_id).collect::<HashSet<_>>();
-                    if name.is_empty() || name.len() > 64 {
-                        let _ = events.send(ClientEvent::Error { message: "nome della chat non valido".into() });
-                        return Ok(LoopFlow::Continue);
-                    }
-                    if members.len() < 2 || members.len() > 31 || members.iter().any(|peer| !known_contacts.contains(peer)) {
-                        let _ = events.send(ClientEvent::Error { message: "scegli da 2 a 31 contatti validi".into() });
-                        return Ok(LoopFlow::Continue);
-                    }
-                    let mut group_id = [0_u8; 16];
-                    OsRng.fill_bytes(&mut group_id);
-                    let mut member_ids = members.drain().map(|peer| peer.to_string()).collect::<Vec<_>>();
-                    member_ids.push(local_peer_id.to_string());
-                    member_ids.sort();
-                    let group = GroupChatEntry {
-                        id: hex_group_id(&group_id),
-                        name: name.to_owned(),
-                        owner_peer: local_peer_id.to_string(),
-                        members: member_ids,
-                        admins: Vec::new(),
-                        silenced: Vec::new(),
-                        bans: Vec::new(),
-                        revision: 1,
-                    };
-                    history.save_group_chat(&group)?;
-                    let definition = group_definition(&group)?;
-                    for member in group.members.iter().filter_map(|value| value.parse::<PeerId>().ok()).filter(|peer| *peer != local_peer_id) {
-                        send_event(&mut swarm, &mut sessions, &contact_devices, member, local_peer_id, &mut sent_numbers, ChatEvent::GroupDefinition(definition.clone()));
-                    }
-                    send_group_chats(&history.group_chats()?, &events);
-                    let _ = events.send(ClientEvent::GroupConversationLoaded { group_id: group.id, messages: Vec::new() });
-                }
-                Some(ClientCommand::ModerateGroup { group_id, peer, action }) => {
-                    if let Err(message) = parse_group_id(&group_id) {
-                        let _ = events.send(ClientEvent::Error { message });
-                        return Ok(LoopFlow::Continue);
-                    }
-                    let Some(mut group) = history.group_chat(&group_id)? else {
-                        let _ = events.send(ClientEvent::Error { message: "chat di gruppo non trovata".into() });
-                        return Ok(LoopFlow::Continue);
-                    };
-                    if let Err(message) = apply_group_moderation(
-                        &mut group,
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::SecureChat(
+                request_response::Event::InboundFailure {
+                    peer,
+                    request_id,
+                    error,
+                    ..
+                },
+            )) => {
+                pending_inbound_offers.retain(|_, pending| pending.request_id != request_id);
+                log::warn!("messaggio cifrato non ricevibile da {peer}: {error}");
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::SecureChat(
+                request_response::Event::ResponseSent { .. },
+            )) => {}
+            SwarmEvent::Behaviour(BehaviourEvent::Handshake(
+                request_response::Event::Message { peer, message, .. },
+            )) => return self.on_handshake_message(peer, message),
+            SwarmEvent::Behaviour(BehaviourEvent::Handshake(
+                request_response::Event::OutboundFailure {
+                    peer,
+                    request_id,
+                    error,
+                    ..
+                },
+            )) => {
+                pending_handshakes.remove(&request_id);
+                log::warn!("handshake ibrido fallito con {peer}: {error}");
+                log::warn!("handshake ibrido fallito con {peer}: {error}");
+                // Riprova finché il peer è connesso e non è già cifrato: evita
+                // di restare bloccati su "preparazione" per un invio transitorio.
+                let attempts = handshake_retries.entry(peer).or_insert(0);
+                if *attempts < MAX_REQUEST_RETRIES
+                    && peers.contains(&peer)
+                    && !sessions.contains_key(&peer)
+                {
+                    *attempts += 1;
+                    maybe_start_hybrid_handshake(
+                        swarm,
+                        pending_handshakes,
+                        sessions,
                         local_peer_id,
                         peer,
-                        action,
-                        now_ms(),
-                    ) {
-                        let _ = events.send(ClientEvent::Error { message: message.into() });
-                        return Ok(LoopFlow::Continue);
-                    }
-                    history.save_group_chat(&group)?;
-                    let definition = group_definition(&group)?;
-                    let recipients = group
-                        .members
-                        .iter()
-                        .filter_map(|value| value.parse::<PeerId>().ok())
-                        .filter(|member| *member != local_peer_id && sessions.contains_key(member))
-                        .collect::<Vec<_>>();
-                    for member in recipients {
-                        send_event(
-                            &mut swarm,
-                            &mut sessions,
-                            &contact_devices,
-                            member,
-                            local_peer_id,
-                            &mut sent_numbers,
-                            ChatEvent::GroupDefinition(definition.clone()),
-                        );
-                    }
-                    send_group_chats(&history.group_chats()?, &events);
-                }
-                Some(ClientCommand::SendGroupText { group_id, text }) => {
-                    if let Err(message) = check_outgoing_text(&text) {
-                        let _ = events.send(ClientEvent::Error { message });
-                        return Ok(LoopFlow::Continue);
-                    }
-                    let parsed_id = match parse_group_id(&group_id) {
-                        Ok(id) => id,
-                        Err(message) => { let _ = events.send(ClientEvent::Error { message }); return Ok(LoopFlow::Continue); }
-                    };
-                    let Some(group) = history.group_chat(&group_id)? else {
-                        let _ = events.send(ClientEvent::Error { message: "chat di gruppo non trovata".into() });
-                        return Ok(LoopFlow::Continue);
-                    };
-                    let timestamp_ms = now_ms();
-                    if !group_member_can_send(&group, &local_peer_id.to_string(), timestamp_ms) {
-                        let _ = events.send(ClientEvent::Error { message: "non puoi scrivere: sei silenziato o bannato".into() });
-                        return Ok(LoopFlow::Continue);
-                    }
-                    let emoticons = match resolve_emoticons(&text, &triggers) {
-                        Ok(emoticons) => emoticons,
-                        Err(error) => { let _ = events.send(ClientEvent::Error { message: format!("trigger emoticon non valido: {error:?}") }); return Ok(LoopFlow::Continue); }
-                    };
-                    let mut group_message_id = [0u8; 16];
-                    OsRng.fill_bytes(&mut group_message_id);
-                    let message = TextMessage { text: text.clone(), emoticons: emoticons.clone(), id: group_message_id };
-                    let group_event = ChatEvent::GroupText(GroupTextMessage {
-                        group_id: parsed_id,
-                        message: message.clone(),
-                        timestamp_ms,
-                    });
-                    let recipients = group.members.iter()
-                        .filter_map(|value| value.parse::<PeerId>().ok())
-                        .filter(|peer| {
-                            *peer != local_peer_id
-                                && sessions.contains_key(peer)
-                                && !active_group_ban(&group, &peer.to_string(), timestamp_ms)
-                        })
-                        .collect::<Vec<_>>();
-                    if recipients.is_empty() {
-                        let _ = events.send(ClientEvent::Error { message: "nessun partecipante è online con una sessione protetta".into() });
-                        return Ok(LoopFlow::Continue);
-                    }
-                    for recipient in recipients {
-                        for offer in new_emoticon_offers(&emoticons, recipient, &mut shared_emoticons, &triggers, &args.emotes, &events) {
-                            deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, recipient, ChatEvent::EmoticonOffer(offer));
-                        }
-                        deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, recipient, group_event.clone());
-                    }
-                    history.record(&group_history_key(&group_id), "out", &format!("group-text:{local_peer_id}"), &encode_text_history(&message)?, timestamp_ms)?;
-                    let _ = events.send(ClientEvent::GroupMessage { message: ClientGroupMessage {
-                        group_id,
-                        sender_peer_id: local_peer_id.to_string(),
-                        direction: "out".into(),
-                        kind: "text".into(),
-                        body: text,
-                        timestamp_ms,
-                        emoticons: emoticons.iter().map(|span| ClientEmoticonSpan { start: span.start, end: span.end, asset_id: hex_asset_id(&span.asset_id) }).collect(),
-                        attachment_id: None,
-                        attachment_mime: None,
-                        event_id: None,
-                    }});
-                }
-                Some(ClientCommand::SendGroupFile { group_id, path }) => {
-                    let parsed_id = match parse_group_id(&group_id) {
-                        Ok(id) => id,
-                        Err(message) => { let _ = events.send(ClientEvent::Error { message }); return Ok(LoopFlow::Continue); }
-                    };
-                    let Some(group) = history.group_chat(&group_id)? else {
-                        let _ = events.send(ClientEvent::Error { message: "chat di gruppo non trovata".into() });
-                        return Ok(LoopFlow::Continue);
-                    };
-                    if let Err(message) = group_file_recipients(&group, local_peer_id, &sessions, now_ms()) {
-                        let _ = events.send(ClientEvent::Error { message: message.into() });
-                        return Ok(LoopFlow::Continue);
-                    }
-                    prepare_file(&prepared_files_tx, FileTarget::Group { group_id, parsed_id }, path);
-                }
-                Some(ClientCommand::LoadOlderMessages { peer, before_event_id }) => {
-                    let messages = conversation_page(&history, &peer.to_string(), Some(&before_event_id))?;
-                    let _ = events.send(ClientEvent::OlderMessagesLoaded {
-                        peer_id: peer.to_string(),
-                        has_more: messages.len() == HISTORY_PAGE,
-                        messages,
-                    });
-                }
-                Some(ClientCommand::LoadOlderGroupMessages { group_id, before_event_id }) => {
-                    let messages = group_conversation_messages(&history, &group_id, Some(&before_event_id))?;
-                    let _ = events.send(ClientEvent::OlderGroupMessagesLoaded {
-                        group_id,
-                        has_more: messages.len() == HISTORY_PAGE,
-                        messages,
-                    });
-                }
-                Some(ClientCommand::ClearGroupConversation { group_id }) => {
-                    match parse_group_id(&group_id).and_then(|_| history.clear_conversation(&group_history_key(&group_id)).map_err(|error| error.to_string())) {
-                        Ok(()) => { let _ = events.send(ClientEvent::GroupConversationCleared { group_id }); }
-                        Err(message) => { let _ = events.send(ClientEvent::Error { message }); }
-                    }
-                }
-                Some(ClientCommand::DeleteChatGroup { group_id }) => {
-                    match parse_group_id(&group_id).and_then(|_| history.delete_group_chat(&group_id).map_err(|error| error.to_string())) {
-                        Ok(()) => send_group_chats(&history.group_chats()?, &events),
-                        Err(message) => { let _ = events.send(ClientEvent::Error { message }); }
-                    }
-                }
-                Some(ClientCommand::ReadAttachment { id, mime, thumbnail }) => {
-                    match parse_asset_id(&id) {
-                        Ok(id_bytes) => open_attachment(attachment_receiver.vault(), &events, id, id_bytes, mime, thumbnail),
-                        Err(message) => { let _ = events.send(ClientEvent::Error { message }); }
-                    }
-                }
-                Some(ClientCommand::ExportAttachment { id, path }) => {
-                    match parse_asset_id(&id).and_then(|id_bytes| {
-                        attachment_receiver
-                            .export(&id_bytes, &path)
-                            .map_err(|error| error.to_string())
-                    }) {
-                        Ok(()) => { let _ = events.send(ClientEvent::AttachmentExported { path: path.to_string_lossy().into_owned() }); }
-                        Err(message) => { let _ = events.send(ClientEvent::Error { message }); }
-                    }
-                }
-                Some(ClientCommand::CancelFileTransfers { conversation }) => {
-                    // Solo gli invii della conversazione aperta, e il destinatario
-                    // lo viene a sapere invece di restare con un file a metà.
-                    let in_scope = |peer: PeerId, group_id: Option<[u8; 16]>| match conversation.as_deref() {
-                        None => true,
-                        Some(key) => match key.strip_prefix("group:") {
-                            Some(group) => group_id.is_some_and(|id| hex_group_id(&id) == group),
-                            None => group_id.is_none() && contact_devices.canonical(peer).to_string() == key,
-                        },
-                    };
-                    let mut cancelled = Vec::new();
-                    pending_offers.retain(|_, offer| {
-                        let keep = !in_scope(offer.peer, offer.group_id);
-                        if !keep {
-                            cancelled.push((offer.peer, offer.manifest.attachment_id));
-                        }
-                        keep
-                    });
-                    pending_transfers.retain(|_, transfer| {
-                        let keep = !in_scope(transfer.peer, transfer.group_id);
-                        if !keep {
-                            cancelled.push((transfer.peer, transfer.manifest.attachment_id));
-                        }
-                        keep
-                    });
-                    waiting_offers.retain(|_, offers| {
-                        offers.retain(|offer| !in_scope(offer.peer, offer.group_id));
-                        !offers.is_empty()
-                    });
-                    for (peer, attachment_id) in cancelled {
-                        // Avviso senza retry: se non arriva, il destinatario scarta
-                        // comunque le parti quando l'offerta scade.
-                        send_event(&mut swarm, &mut sessions, &contact_devices, peer, local_peer_id, &mut sent_numbers,
-                            ChatEvent::AttachmentCancelled(AttachmentCancel { attachment_id }));
-                    }
-                    let _ = events.send(ClientEvent::AttachmentTransfersCancelled);
-                }
-                Some(ClientCommand::AcceptAttachment { offer_id }) => {
-                    let Some(pending) = pending_inbound_offers.remove(&offer_id) else {
-                        let _ = events.send(ClientEvent::Error { message: "offerta file scaduta".into() });
-                        return Ok(LoopFlow::Continue);
-                    };
-                    let client_event = client_event_from_chat(
-                        pending.peer,
-                        &pending.event,
-                        "in",
-                        true,
-                        peer_names.get(&pending.peer).map(String::as_str),
                     );
-                    let response = receive_event(pending.peer, &pending.event, &mut Incoming {
-                        pending_emoticons: &mut pending_emoticons,
-                        events: &events,
-                        nudge_limits: &mut incoming_nudge_limits,
-                        attachments: &mut attachment_receiver,
-                        history: &history,
-                        notifications: args.notifications,
-                        notification_mutes: &notification_mutes,
-                        peer_names: &mut peer_names,
-                        local_peer_id,
-                        incoming_attachments: &mut incoming_attachments,
-                        vault_jobs: &vault_jobs_tx,
-                    });
-                    if !matches!(&response, ProtocolResponse::Rejected(_)) {
-                        if let Some(event) = client_event {
-                            let _ = events.send(event);
-                        }
-                    }
-                    swarm.behaviour_mut().secure_chat.send_response(pending.channel, response).ok();
                 }
-                Some(ClientCommand::RejectAttachment { offer_id }) => {
-                    let Some(pending) = pending_inbound_offers.remove(&offer_id) else {
-                        return Ok(LoopFlow::Continue);
-                    };
-                    swarm.behaviour_mut().secure_chat.send_response(
-                        pending.channel,
-                        ProtocolResponse::Rejected("file rifiutato dall'utente".into()),
-                    ).ok();
-                }
-                None => commands_open = false,
-            },
-            event = swarm.select_next_some() => match event {
-                SwarmEvent::NewListenAddr { address, .. } => {
-                    let address = if split_peer_address(&address).is_ok() {
-                        address
-                    } else {
-                        address.with(Protocol::P2p(local_peer_id))
-                    };
-                    log::info!("ascolto: {address}");
-                    if contact_link_requested {
-                        let addresses = contact_addresses(&swarm, &args.relays, local_peer_id);
-                        if !addresses.is_empty() {
-                            let links = contacts::share_links(
-                                &display_name,
-                                local_peer_id,
-                                &contact_identity,
-                                &ml_dsa_identity,
-                                addresses,
-                            );
-                            match links {
-                                Ok((link, qr_link)) => {
-                                    contact_link_requested = false;
-                                    let _ = events.send(ClientEvent::ContactLink { link, qr_link });
-                                }
-                                Err(error) => {
-                                    let _ = events.send(ClientEvent::Error {
-                                        message: error.to_string(),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    if device_link_requested {
-                        let addresses = contact_addresses(&swarm, &args.relays, local_peer_id);
-                        if !addresses.is_empty() {
-                            let descriptor = local_device_descriptor(
-                                local_peer_id,
-                                &display_name,
-                                addresses,
-                            );
-                            match devices::create_pairing_link(descriptor, now_ms()) {
-                                Ok((link, pairing)) => {
-                                    device_link_requested = false;
-                                    pending_pairings.insert(
-                                        devices::key_id(&pairing.secret),
-                                        PendingPairing {
-                                            secret: pairing.secret,
-                                            expires_at_ms: pairing.expires_at_ms,
-                                        },
-                                    );
-                                    let _ = events.send(ClientEvent::DeviceLink {
-                                        qr_link: link.clone(),
-                                        link,
-                                        expires_at_ms: pairing.expires_at_ms,
-                                    });
-                                }
-                                Err(error) => {
-                                    let _ = events.send(ClientEvent::Error { message: error.to_string() });
-                                }
-                            }
-                        }
-                    }
-                }
-                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                    dialing.remove(&peer_id);
-                    mdns_dialing.remove(&peer_id);
-                    bootstrap_fallbacks.remove(&peer_id);
-                    reconnect_at.remove(&peer_id);
-                    reconnect_attempts.remove(&peer_id);
-                    fallback_planner.connected(peer_id);
-                    if let Some(address) = relay_addresses.get(&peer_id) {
-                        if requested_relay_reservations.insert(peer_id) {
-                            if let Err(error) =
-                                swarm.listen_on(address.clone().with(Protocol::P2pCircuit))
-                            {
-                                log::warn!("prenotazione relay fallita: {error}");
-                                log::warn!("prenotazione relay fallita: {error}");
-                            }
-                        }
-                    }
-                    let device_request_pending = pending_device_requests.values().any(|pending| {
-                        match pending {
-                            PendingDeviceRequest::Pair { peer, .. }
-                            | PendingDeviceRequest::Sync { peer }
-                            | PendingDeviceRequest::Relay { peer, .. } => *peer == peer_id,
-                        }
-                    });
-                    if let Some(pairing) = pending_pair_targets
-                        .get(&peer_id)
-                        .filter(|_| !device_request_pending)
-                    {
-                        let descriptor = local_device_descriptor(
-                            local_peer_id,
-                            &display_name,
-                            contact_addresses(&swarm, &args.relays, local_peer_id),
-                        );
-                        let records = history.sync_records_since(0, devices::MAX_SYNC_RECORDS)?;
-                        let request = DeviceRequest::Pair { device: descriptor, records };
-                        let sealed = devices::seal(&pairing.secret, &request)?;
-                        let request_id = swarm.behaviour_mut().devices.send_request(&peer_id, sealed);
-                        pending_device_requests.insert(
-                            request_id,
-                            PendingDeviceRequest::Pair { peer: peer_id, key: pairing.secret },
-                        );
-                    } else if known_devices.contains_key(&peer_id) && !device_request_pending {
-                        online_devices.insert(peer_id);
-                        if let Some(device) = known_devices.get_mut(&peer_id) {
-                            device.last_seen_ms = now_ms();
-                            history.save_device(device)?;
-                        }
-                        send_devices(&known_devices, &online_devices, &events);
-                        let descriptor = local_device_descriptor(
-                            local_peer_id,
-                            &display_name,
-                            contact_addresses(&swarm, &args.relays, local_peer_id),
-                        );
-                        send_device_sync(
-                            &mut swarm,
-                            &history,
-                            &account_key,
-                            &mut pending_device_requests,
-                            peer_id,
-                            descriptor,
-                        )?;
-                    }
-                    let is_manual = accept_unclassified_manual && !infrastructure_peers.contains(&peer_id);
-                    if is_manual {
-                        accept_unclassified_manual = false;
-                        known_contacts.insert(peer_id);
-                    }
-                    if (known_contacts.contains(&peer_id) || is_manual) && peers.insert(peer_id) {
-                        log::info!("connesso: {peer_id}");
-                        log::info!("connesso: {peer_id}");
-                        // La UI conosce il contatto, non il suo singolo dispositivo.
-                        let contact = contact_devices.canonical(peer_id);
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Handshake(
+                request_response::Event::InboundFailure {
+                    peer,
+                    request_id,
+                    error,
+                    ..
+                },
+            )) => {
+                pending_inbound_handshakes.remove(&request_id);
+                log::warn!("richiesta handshake non valida da {peer}: {error}");
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Handshake(
+                request_response::Event::ResponseSent {
+                    peer, request_id, ..
+                },
+            )) => {
+                if let Some((expected_peer, session_key)) =
+                    pending_inbound_handshakes.remove(&request_id)
+                {
+                    if expected_peer == peer {
+                        sessions
+                            .insert(peer, RatchetSession::new(session_key, local_peer_id, peer));
+                        log::info!("handshake ibrido completato: {peer}");
+                        log::info!("handshake ibrido completato (responder): {peer}");
+                        let contact = contact_devices.canonical(peer);
                         let _ = events.send(ClientEvent::ContactUpdated {
                             contact: ClientContact {
                                 peer_id: contact.to_string(),
                                 name: peer_names
                                     .get(&contact)
                                     .cloned()
-                                    .unwrap_or_else(|| "Nuovo contatto".into()),
+                                    .unwrap_or_else(|| "Contatto".into()),
                                 online: true,
-                                secure: contact_devices.secure(contact, &sessions),
+                                secure: true,
                                 fingerprint: peer_fingerprint(contact),
                             },
                         });
-                        send_event(&mut swarm, &mut sessions, &contact_devices, peer_id, local_peer_id, &mut sent_numbers, ChatEvent::Presence(presence_update(&display_name, &presence_status, true, &account_proof)));
-                        // Avvia subito l'handshake appena la connessione è su, senza
-                        // attendere il round-trip della presence (che può perdersi).
-                        handshake_retries.remove(&peer_id);
-                        maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer_id);
+                        send_group_definitions_for_peer(
+                            history,
+                            swarm,
+                            sessions,
+                            contact_devices,
+                            sent_numbers,
+                            local_peer_id,
+                            peer,
+                        );
+                        flush_outbox(
+                            swarm,
+                            sessions,
+                            contact_devices,
+                            sent_numbers,
+                            pending_messages,
+                            outbox,
+                            local_peer_id,
+                            peer,
+                        );
+                        for offer in take_waiting_offers(waiting_offers, contact_devices, peer) {
+                            offer_file(
+                                swarm,
+                                sessions,
+                                contact_devices,
+                                sent_numbers,
+                                pending_offers,
+                                history,
+                                events,
+                                local_peer_id,
+                                offer,
+                            );
+                        }
                     }
                 }
-                SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
-                    if num_established == 0 {
-                        if online_devices.remove(&peer_id) {
-                            send_devices(&known_devices, &online_devices, &events);
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Devices(request_response::Event::Message {
+                peer,
+                message,
+                ..
+            })) => return self.on_device_message(peer, message),
+            SwarmEvent::Behaviour(BehaviourEvent::Devices(
+                request_response::Event::OutboundFailure {
+                    peer,
+                    request_id,
+                    error,
+                    ..
+                },
+            )) => {
+                if let Some(PendingDeviceRequest::Relay {
+                    target, message, ..
+                }) = pending_device_requests.remove(&request_id)
+                {
+                    // Relay non riuscito: il messaggio torna nella coda diretta.
+                    log::warn!("relay tramite {peer} fallito: {error}");
+                    for offer in new_emoticon_offers(
+                        &message.emoticons,
+                        target,
+                        shared_emoticons,
+                        triggers,
+                        &args.emotes,
+                        events,
+                    ) {
+                        deliver_event(
+                            swarm,
+                            sessions,
+                            contact_devices,
+                            sent_numbers,
+                            pending_messages,
+                            outbox,
+                            pending_handshakes,
+                            local_peer_id,
+                            target,
+                            ChatEvent::EmoticonOffer(offer),
+                        );
+                    }
+                    deliver_event(
+                        swarm,
+                        sessions,
+                        contact_devices,
+                        sent_numbers,
+                        pending_messages,
+                        outbox,
+                        pending_handshakes,
+                        local_peer_id,
+                        target,
+                        ChatEvent::Text(message),
+                    );
+                    return Ok(LoopFlow::Continue);
+                }
+                let _ = events.send(ClientEvent::Error {
+                    message: format!("sincronizzazione con {peer} fallita: {error}"),
+                });
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Devices(
+                request_response::Event::InboundFailure { peer, error, .. },
+            )) => {
+                log::warn!("sincronizzazione non ricevibile da {peer}: {error}");
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Devices(
+                request_response::Event::ResponseSent { .. },
+            )) => {}
+            SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
+                peer_id,
+                info,
+                ..
+            })) => {
+                for address in info.listen_addrs {
+                    let address = match split_peer_address(&address) {
+                        Ok((address_peer, base)) if address_peer == peer_id => base,
+                        Ok(_) => continue,
+                        Err(_) => address,
+                    };
+                    swarm.behaviour_mut().kad.add_address(&peer_id, address);
+                }
+                swarm.add_external_address(info.observed_addr);
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
+                id,
+                step,
+                ..
+            })) if step.last => {
+                if let Some(peer) = pending_dht.remove(&id) {
+                    let recovery = fallback_planner.after_dht(peer);
+                    execute_recovery(swarm, pending_dht, fallback_planner, peer, recovery);
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Autonat(autonat::Event::StatusChanged {
+                new,
+                ..
+            })) => {
+                log::info!("raggiungibilità: {new:?}");
+                log::info!("raggiungibilità (autonat): {new:?}");
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::RelayClient(event)) => {
+                log::info!("relay client: {event:?}");
+                log::info!("relay client: {event:?}");
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::RelayServer(event)) => {
+                log::info!("relay server: {event:?}");
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Dcutr(event)) => {
+                log::info!("hole punching: {event:?}");
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Ping(_)) => {}
+            SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(discovered))) => {
+                for (peer_id, address) in discovered {
+                    let base = split_peer_address(&address)
+                        .map(|(_, base)| base)
+                        .unwrap_or(address);
+                    swarm
+                        .behaviour_mut()
+                        .kad
+                        .add_address(&peer_id, base.clone());
+                    let is_device = known_devices.contains_key(&peer_id)
+                        || pending_pair_targets.contains_key(&peer_id);
+                    // Privacy: sulla LAN ci si connette solo ai device in
+                    // pairing e ai contatti GIÀ noti. Mai auto-aggiungere o
+                    // dialare uno sconosciuto trovato via mDNS: la presence
+                    // scambiata lo trasformerebbe in contatto senza consenso.
+                    if !args.relay_server
+                        && peer_id != local_peer_id
+                        && !infrastructure_peers.contains(&peer_id)
+                        && (is_device || known_contacts.contains(&peer_id))
+                        && if is_device {
+                            !online_devices.contains(&peer_id)
+                        } else {
+                            !peers.contains(&peer_id)
                         }
-                        let was_application_peer = peers.remove(&peer_id);
-                        sessions.remove(&peer_id);
-                        shared_emoticons.retain(|(peer, _)| *peer != peer_id);
-                        pending_handshakes
-                            .retain(|_, (pending_peer, _)| *pending_peer != peer_id);
-                        pending_inbound_handshakes
-                            .retain(|_, (pending_peer, _)| *pending_peer != peer_id);
-                        handshake_retries.remove(&peer_id);
-                        decrypt_failures.remove(&peer_id);
-                        if !contact_devices.online(contact_devices.canonical(peer_id), &peers) {
-                            for offer in take_waiting_offers(&mut waiting_offers, &contact_devices, peer_id) {
-                                report_file_failed(&events, &offer.manifest.filename, "contatto disconnesso");
+                        && mdns_dialing.insert(peer_id)
+                    {
+                        dialing.insert(peer_id);
+                        log::info!("peer LAN trovato: {peer_id}");
+                        let address = base.with(Protocol::P2p(peer_id));
+                        let options = DialOpts::peer_id(peer_id)
+                            .condition(PeerCondition::Always)
+                            .addresses(vec![address])
+                            .build();
+                        if let Err(error) = swarm.dial(options) {
+                            log::warn!("dial mDNS fallito: {error}");
+                        }
+                    }
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Expired(_))) => {}
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                if let Some(peer_id) = peer_id {
+                    mdns_dialing.remove(&peer_id);
+                    if peers.contains(&peer_id) || online_devices.contains(&peer_id) {
+                        log::warn!("dial duplicato ignorato per peer già connesso: {peer_id}");
+                    } else if let Some(address) = bootstrap_fallbacks
+                        .get_mut(&peer_id)
+                        .and_then(VecDeque::pop_front)
+                    {
+                        log::warn!("bootstrap fallito, provo il prossimo indirizzo: {error}");
+                        if let Err(next_error) = swarm.dial(address) {
+                            log::warn!("indirizzo non raggiungibile: {next_error}");
+                        }
+                    } else {
+                        dialing.remove(&peer_id);
+                        log::warn!("connessione fallita: {error}");
+                        log::warn!("connessione fallita: {error}");
+                        if pending_pair_targets.contains_key(&peer_id) {
+                            let _ = events.send(ClientEvent::Error {
+                                    message: "l'altro dispositivo non è raggiungibile; verifica che sia online e che il codice non sia scaduto".into(),
+                                });
+                        }
+                        if known_contacts.contains(&peer_id) || known_devices.contains_key(&peer_id)
+                        {
+                            let recovery = fallback_planner.after_failure(peer_id);
+                            execute_recovery(
+                                swarm,
+                                pending_dht,
+                                fallback_planner,
+                                peer_id,
+                                recovery,
+                            );
+                            schedule_reconnect(peer_id, reconnect_at, reconnect_attempts);
+                        }
+                    }
+                } else {
+                    log::warn!("connessione fallita: {error}");
+                }
+            }
+            _ => {}
+        }
+        Ok(LoopFlow::Continue)
+    }
+
+    fn on_connection_established(&mut self, peer_id: PeerId) -> Result<LoopFlow, Box<dyn Error>> {
+        let Node {
+            account_key,
+            history,
+            local_peer_id,
+            account_proof,
+            swarm,
+            relay_addresses,
+            display_name,
+            peers,
+            dialing,
+            mdns_dialing,
+            reconnect_at,
+            reconnect_attempts,
+            bootstrap_fallbacks,
+            known_contacts,
+            contact_devices,
+            infrastructure_peers,
+            accept_unclassified_manual,
+            fallback_planner,
+            requested_relay_reservations,
+            sent_numbers,
+            pending_handshakes,
+            handshake_retries,
+            presence_status,
+            sessions,
+            peer_names,
+            pending_pair_targets,
+            pending_device_requests,
+            online_devices,
+            known_devices,
+            args,
+            events,
+            ..
+        } = self;
+        let local_peer_id = *local_peer_id;
+        let account_key = *account_key;
+        dialing.remove(&peer_id);
+        mdns_dialing.remove(&peer_id);
+        bootstrap_fallbacks.remove(&peer_id);
+        reconnect_at.remove(&peer_id);
+        reconnect_attempts.remove(&peer_id);
+        fallback_planner.connected(peer_id);
+        if let Some(address) = relay_addresses.get(&peer_id) {
+            if requested_relay_reservations.insert(peer_id) {
+                if let Err(error) = swarm.listen_on(address.clone().with(Protocol::P2pCircuit)) {
+                    log::warn!("prenotazione relay fallita: {error}");
+                    log::warn!("prenotazione relay fallita: {error}");
+                }
+            }
+        }
+        let device_request_pending =
+            pending_device_requests
+                .values()
+                .any(|pending| match pending {
+                    PendingDeviceRequest::Pair { peer, .. }
+                    | PendingDeviceRequest::Sync { peer }
+                    | PendingDeviceRequest::Relay { peer, .. } => *peer == peer_id,
+                });
+        if let Some(pairing) = pending_pair_targets
+            .get(&peer_id)
+            .filter(|_| !device_request_pending)
+        {
+            let descriptor = local_device_descriptor(
+                local_peer_id,
+                display_name,
+                contact_addresses(swarm, &args.relays, local_peer_id),
+            );
+            let records = history.sync_records_since(0, devices::MAX_SYNC_RECORDS)?;
+            let request = DeviceRequest::Pair {
+                device: descriptor,
+                records,
+            };
+            let sealed = devices::seal(&pairing.secret, &request)?;
+            let request_id = swarm.behaviour_mut().devices.send_request(&peer_id, sealed);
+            pending_device_requests.insert(
+                request_id,
+                PendingDeviceRequest::Pair {
+                    peer: peer_id,
+                    key: pairing.secret,
+                },
+            );
+        } else if known_devices.contains_key(&peer_id) && !device_request_pending {
+            online_devices.insert(peer_id);
+            if let Some(device) = known_devices.get_mut(&peer_id) {
+                device.last_seen_ms = now_ms();
+                history.save_device(device)?;
+            }
+            send_devices(known_devices, online_devices, events);
+            let descriptor = local_device_descriptor(
+                local_peer_id,
+                display_name,
+                contact_addresses(swarm, &args.relays, local_peer_id),
+            );
+            send_device_sync(
+                swarm,
+                history,
+                &account_key,
+                pending_device_requests,
+                peer_id,
+                descriptor,
+            )?;
+        }
+        let is_manual = *accept_unclassified_manual && !infrastructure_peers.contains(&peer_id);
+        if is_manual {
+            *accept_unclassified_manual = false;
+            known_contacts.insert(peer_id);
+        }
+        if (known_contacts.contains(&peer_id) || is_manual) && peers.insert(peer_id) {
+            log::info!("connesso: {peer_id}");
+            log::info!("connesso: {peer_id}");
+            // La UI conosce il contatto, non il suo singolo dispositivo.
+            let contact = contact_devices.canonical(peer_id);
+            let _ = events.send(ClientEvent::ContactUpdated {
+                contact: ClientContact {
+                    peer_id: contact.to_string(),
+                    name: peer_names
+                        .get(&contact)
+                        .cloned()
+                        .unwrap_or_else(|| "Nuovo contatto".into()),
+                    online: true,
+                    secure: contact_devices.secure(contact, sessions),
+                    fingerprint: peer_fingerprint(contact),
+                },
+            });
+            send_event(
+                swarm,
+                sessions,
+                contact_devices,
+                peer_id,
+                local_peer_id,
+                sent_numbers,
+                ChatEvent::Presence(presence_update(
+                    display_name,
+                    presence_status,
+                    true,
+                    account_proof,
+                )),
+            );
+            // Avvia subito l'handshake appena la connessione è su, senza
+            // attendere il round-trip della presence (che può perdersi).
+            handshake_retries.remove(&peer_id);
+            maybe_start_hybrid_handshake(
+                swarm,
+                pending_handshakes,
+                sessions,
+                local_peer_id,
+                peer_id,
+            );
+        }
+        Ok(LoopFlow::Continue)
+    }
+
+    fn on_chat_message(
+        &mut self,
+        peer: PeerId,
+        message: request_response::Message<Envelope, ProtocolResponse>,
+    ) -> Result<LoopFlow, Box<dyn Error>> {
+        let Node {
+            history,
+            ignored_contacts,
+            local_peer_id,
+            account_proof,
+            swarm,
+            display_name,
+            peers,
+            pending_contact_requests,
+            pending_accounts,
+            known_contacts,
+            contact_devices,
+            infrastructure_peers,
+            incoming_nudge_limits,
+            notification_mutes,
+            sent_numbers,
+            pending_handshakes,
+            presence_status,
+            sessions,
+            pending_emoticons,
+            attachment_receiver,
+            vault_jobs_tx,
+            incoming_attachments,
+            peer_names,
+            known_devices,
+            args,
+            events,
+            ..
+        } = self;
+        let local_peer_id = *local_peer_id;
+        match message {
+            request_response::Message::Request {
+                request, channel, ..
+            } => {
+                // Riconosci il mittente PRIMA di decidere se è uno
+                // sconosciuto: un dispositivo che dimostra di appartenere
+                // all'account di un contatto già approvato non lo è.
+                let mut source_account = None;
+                if let ChatEvent::Presence(presence) = &request.event {
+                    let source = recognize_presence(
+                        contact_devices,
+                        known_contacts,
+                        &history.contacts()?,
+                        peer,
+                        presence,
+                    );
+                    source_account = source.account.clone();
+                    apply_presence_source(
+                        &source,
+                        peer,
+                        &mut PresenceBinding {
+                            history,
+                            events,
+                            known_contacts,
+                            ignored_contacts,
+                            peer_names,
+                            pending_contact_requests,
+                        },
+                    )?;
+                }
+                // Cronologia e UI seguono sempre il contatto, non il
+                // singolo dispositivo che ha aperto la connessione.
+                let contact = contact_devices.canonical(peer);
+                let validation =
+                    if ignored_contacts.contains(&peer) || ignored_contacts.contains(&contact) {
+                        Err("contatto rimosso")
+                    } else if matches!(&request.event, ChatEvent::Presence(_)) {
+                        validate_envelope(peer, local_peer_id, &request)
+                    } else {
+                        Err("usa il protocollo chat cifrato")
+                    };
+                let (response, valid) = match validation {
+                    Ok(()) => (
+                        receive_event(
+                            contact,
+                            &request.event,
+                            &mut Incoming {
+                                pending_emoticons,
+                                events,
+                                nudge_limits: incoming_nudge_limits,
+                                attachments: attachment_receiver,
+                                history,
+                                notifications: args.notifications,
+                                notification_mutes,
+                                peer_names,
+                                local_peer_id,
+                                incoming_attachments,
+                                vault_jobs: vault_jobs_tx,
+                            },
+                        ),
+                        true,
+                    ),
+                    Err(error) => (ProtocolResponse::Rejected(error.into()), false),
+                };
+                swarm
+                    .behaviour_mut()
+                    .chat
+                    .send_response(channel, response)
+                    .ok();
+                if valid {
+                    let is_known_peer = known_contacts.contains(&peer)
+                        || known_devices.contains_key(&peer)
+                        || infrastructure_peers.contains(&peer);
+                    if !is_known_peer {
+                        // Presence non sollecitata da uno sconosciuto: niente
+                        // auto-aggiunta. Chiedi conferma all'utente una volta.
+                        if let ChatEvent::Presence(presence) = &request.event {
+                            // Tetto alle richieste in attesa: uno spam di
+                            // peer nuovi non riempie memoria e UI.
+                            let accepting = !ignored_contacts.contains(&peer)
+                                && (pending_contact_requests.contains_key(&peer)
+                                    || pending_contact_requests.len()
+                                        < MAX_PENDING_CONTACT_REQUESTS);
+                            if !accepting && !ignored_contacts.contains(&peer) {
+                                log::warn!(
+                                    "richiesta di contatto da {peer} ignorata: troppe in attesa"
+                                );
                             }
-                        }
-                        nudge_limits.remove(&peer_id);
-                        incoming_nudge_limits.remove(&peer_id);
-                        if was_application_peer {
-                            log::info!("offline: {} ({cause:?})", peer_names.get(&peer_id).map_or_else(|| peer_id.to_string(), Clone::clone));
-                            log::info!("offline: {peer_id} ({cause:?})");
-                            // Un contatto va offline solo quando cade l'ultimo dei
-                            // suoi dispositivi.
-                            let contact = contact_devices.canonical(peer_id);
-                            if !contact_devices.online(contact, &peers) {
-                                let _ = events.send(ClientEvent::ContactUpdated {
-                                    contact: ClientContact {
-                                        peer_id: contact.to_string(),
-                                        name: peer_names
-                                            .get(&contact)
-                                            .cloned()
-                                            .unwrap_or_else(|| "Contatto".into()),
-                                        online: false,
-                                        secure: false,
-                                        fingerprint: peer_fingerprint(contact),
-                                    },
+                            if accepting {
+                                if let Some(account) = &source_account {
+                                    pending_accounts.insert(peer, account.clone());
+                                }
+                            }
+                            if accepting
+                                && pending_contact_requests
+                                    .insert(peer, presence.display_name.clone())
+                                    .is_none()
+                            {
+                                peer_names.insert(peer, presence.display_name.clone());
+                                let _ = events.send(ClientEvent::ContactRequest {
+                                    peer_id: peer.to_string(),
+                                    name: presence.display_name.clone(),
                                 });
                             }
                         }
-                        if should_reconnect_closed_peer(
-                            known_contacts.contains(&peer_id) || known_devices.contains_key(&peer_id),
-                            num_established,
+                    } else {
+                        if let ChatEvent::Presence(presence) = &request.event {
+                            // Un nostro dispositivo collegato non è un
+                            // contatto: non deve finire in rubrica.
+                            if !known_devices.contains_key(&peer) {
+                                history.ensure_contact(
+                                    &contact.to_string(),
+                                    &presence.display_name,
+                                    now_ms(),
+                                )?;
+                            }
+                        }
+                        if let Some(event) = client_event_from_chat(
+                            contact,
+                            &request.event,
+                            "in",
+                            contact_devices.secure(contact, sessions),
+                            peer_names.get(&contact).map(String::as_str),
                         ) {
-                            dialing.remove(&peer_id);
-                            schedule_reconnect(
-                                peer_id,
-                                &mut reconnect_at,
-                                &mut reconnect_attempts,
+                            let _ = events.send(event);
+                        }
+                        emit_contact_status(events, contact, &request.event);
+                        if should_classify_application_peer(
+                            true,
+                            infrastructure_peers.contains(&peer),
+                            peers.contains(&peer),
+                        ) {
+                            known_contacts.insert(peer);
+                            peers.insert(peer);
+                            log::info!("connesso: {peer}");
+                            send_event(
+                                swarm,
+                                sessions,
+                                contact_devices,
+                                peer,
+                                local_peer_id,
+                                sent_numbers,
+                                ChatEvent::Presence(presence_update(
+                                    display_name,
+                                    presence_status,
+                                    true,
+                                    account_proof,
+                                )),
+                            );
+                        }
+                        if event_authorizes_handshake(&request.event) {
+                            // Una presence IN CHIARO da un contatto con cui
+                            // crediamo di avere una sessione significa che
+                            // l'altro lato l'ha persa (un restart, altrimenti
+                            // userebbe il canale cifrato). La nostra è stale:
+                            // la scartiamo così l'handshake riparte pulito
+                            // (l'iniziatore reinvia l'hello; il responder
+                            // accetta e sostituisce la sessione). Auto-heal
+                            // del caso "connesso ma bloccato su preparazione".
+                            if known_contacts.contains(&peer) && sessions.remove(&peer).is_some() {
+                                log::info!(
+                                    "sessione stale scartata per {peer}: presence in chiaro"
+                                );
+                            }
+                            maybe_start_hybrid_handshake(
+                                swarm,
+                                pending_handshakes,
+                                sessions,
+                                local_peer_id,
+                                peer,
                             );
                         }
                     }
                 }
-                SwarmEvent::Behaviour(BehaviourEvent::Chat(request_response::Event::Message { peer, message, .. })) => match message {
-                    request_response::Message::Request { request, channel, .. } => {
-                        // Riconosci il mittente PRIMA di decidere se è uno
-                        // sconosciuto: un dispositivo che dimostra di appartenere
-                        // all'account di un contatto già approvato non lo è.
-                        let mut source_account = None;
-                        if let ChatEvent::Presence(presence) = &request.event {
-                            let source = recognize_presence(
-                                &mut contact_devices,
-                                &known_contacts,
-                                &history.contacts()?,
-                                peer,
-                                presence,
-                            );
-                            source_account = source.account.clone();
-                            apply_presence_source(&source, peer, &mut PresenceBinding {
-                                history: &history,
-                                events: &events,
-                                known_contacts: &mut known_contacts,
-                                ignored_contacts: &mut ignored_contacts,
-                                peer_names: &mut peer_names,
-                                pending_contact_requests: &mut pending_contact_requests,
-                            })?;
-                        }
-                        // Cronologia e UI seguono sempre il contatto, non il
-                        // singolo dispositivo che ha aperto la connessione.
-                        let contact = contact_devices.canonical(peer);
-                        let validation = if ignored_contacts.contains(&peer)
-                            || ignored_contacts.contains(&contact)
-                        {
-                            Err("contatto rimosso")
-                        } else if matches!(&request.event, ChatEvent::Presence(_)) {
-                            validate_envelope(peer, local_peer_id, &request)
-                        } else {
-                            Err("usa il protocollo chat cifrato")
-                        };
-                        let (response, valid) = match validation {
-                            Ok(()) => (
-                                receive_event(contact, &request.event, &mut Incoming {
-                                    pending_emoticons: &mut pending_emoticons,
-                                    events: &events,
-                                    nudge_limits: &mut incoming_nudge_limits,
-                                    attachments: &mut attachment_receiver,
-                                    history: &history,
-                                    notifications: args.notifications,
-                                    notification_mutes: &notification_mutes,
-                                    peer_names: &mut peer_names,
+            }
+            request_response::Message::Response { .. } => {}
+        }
+        Ok(LoopFlow::Continue)
+    }
+
+    fn on_secure_chat_message(
+        &mut self,
+        peer: PeerId,
+        message: request_response::Message<RatchetMessage, ProtocolResponse>,
+    ) -> Result<LoopFlow, Box<dyn Error>> {
+        let Node {
+            history,
+            ignored_contacts,
+            local_peer_id,
+            account_proof,
+            swarm,
+            display_name,
+            pending_contact_requests,
+            known_contacts,
+            contact_devices,
+            incoming_nudge_limits,
+            notification_mutes,
+            sent_numbers,
+            pending_offers,
+            pending_transfers,
+            pending_handshakes,
+            outbox,
+            pending_messages,
+            #[cfg(test)]
+            withhold_acks,
+            #[cfg(test)]
+            held_responses,
+            auto_accept_extensions,
+            presence_status,
+            sessions,
+            decrypt_failures,
+            shared_emoticons,
+            waiting_offers,
+            pending_emoticons,
+            attachment_receiver,
+            vault_jobs_tx,
+            incoming_attachments,
+            pending_inbound_offers,
+            inbound_offer_counter,
+            peer_names,
+            known_devices,
+            args,
+            events,
+            ..
+        } = self;
+        let local_peer_id = *local_peer_id;
+        match message {
+            request_response::Message::Request {
+                request_id,
+                request,
+                channel,
+            } => {
+                // Il canale è per dispositivo, la conversazione è per
+                // contatto: cronologia e UI seguono il contatto.
+                let contact = contact_devices.canonical(peer);
+                let envelope =
+                    if ignored_contacts.contains(&peer) || ignored_contacts.contains(&contact) {
+                        Err("contatto rimosso")
+                    } else {
+                        sessions
+                            .get_mut(&peer)
+                            .ok_or(REJECT_NO_SESSION)
+                            .and_then(|session| {
+                                decrypt_envelope(session, peer, local_peer_id, &request)
+                                    .map_err(|_| REJECT_UNDECRYPTABLE)
+                            })
+                    };
+                match &envelope {
+                    Ok(_) => {
+                        decrypt_failures.remove(&peer);
+                    }
+                    Err(reason) if *reason == REJECT_UNDECRYPTABLE => {
+                        let failures = decrypt_failures.entry(peer).or_insert(0);
+                        *failures += 1;
+                        if *failures >= MAX_DECRYPT_FAILURES {
+                            decrypt_failures.remove(&peer);
+                            log::warn!("sessione con {peer} non decifrabile: nuovo handshake");
+                            sessions.remove(&peer);
+                            if should_initiate(local_peer_id, peer) {
+                                maybe_start_hybrid_handshake(
+                                    swarm,
+                                    pending_handshakes,
+                                    sessions,
                                     local_peer_id,
-                                    incoming_attachments: &mut incoming_attachments,
-                                    vault_jobs: &vault_jobs_tx,
-                                }),
-                                true,
-                            ),
-                            Err(error) => (ProtocolResponse::Rejected(error.into()), false),
-                        };
-                        swarm.behaviour_mut().chat.send_response(channel, response).ok();
-                        if valid {
-                            let is_known_peer = known_contacts.contains(&peer)
-                                || known_devices.contains_key(&peer)
-                                || infrastructure_peers.contains(&peer);
-                            if !is_known_peer {
-                                // Presence non sollecitata da uno sconosciuto: niente
-                                // auto-aggiunta. Chiedi conferma all'utente una volta.
-                                if let ChatEvent::Presence(presence) = &request.event {
-                                    // Tetto alle richieste in attesa: uno spam di
-                                    // peer nuovi non riempie memoria e UI.
-                                    let accepting = !ignored_contacts.contains(&peer)
-                                        && (pending_contact_requests.contains_key(&peer)
-                                            || pending_contact_requests.len() < MAX_PENDING_CONTACT_REQUESTS);
-                                    if !accepting && !ignored_contacts.contains(&peer) {
-                                        log::warn!("richiesta di contatto da {peer} ignorata: troppe in attesa");
-                                    }
-                                    if accepting {
-                                        if let Some(account) = &source_account {
-                                            pending_accounts.insert(peer, account.clone());
-                                        }
-                                    }
-                                    if accepting
-                                        && pending_contact_requests
-                                            .insert(peer, presence.display_name.clone())
-                                            .is_none()
-                                    {
-                                        peer_names.insert(peer, presence.display_name.clone());
-                                        let _ = events.send(ClientEvent::ContactRequest {
-                                            peer_id: peer.to_string(),
-                                            name: presence.display_name.clone(),
-                                        });
-                                    }
-                                }
+                                    peer,
+                                );
                             } else {
-                                if let ChatEvent::Presence(presence) = &request.event {
-                                    // Un nostro dispositivo collegato non è un
-                                    // contatto: non deve finire in rubrica.
-                                    if !known_devices.contains_key(&peer) {
-                                        history.ensure_contact(
-                                            &contact.to_string(),
-                                            &presence.display_name,
-                                            now_ms(),
-                                        )?;
-                                    }
-                                }
-                                if let Some(event) =
-                                    client_event_from_chat(contact, &request.event, "in", contact_devices.secure(contact, &sessions), peer_names.get(&contact).map(String::as_str))
-                                {
-                                    let _ = events.send(event);
-                                }
-                                emit_contact_status(&events, contact, &request.event);
-                                if should_classify_application_peer(
-                                    true,
-                                    infrastructure_peers.contains(&peer),
-                                    peers.contains(&peer),
-                                ) {
-                                    known_contacts.insert(peer);
-                                    peers.insert(peer);
-                                    log::info!("connesso: {peer}");
-                                    send_event(
-                                        &mut swarm,
-                                        &mut sessions,
-                                        &contact_devices,
-                                        peer,
-                                        local_peer_id,
-                                        &mut sent_numbers,
-                                        ChatEvent::Presence(presence_update(
-                                            &display_name,
-                                            &presence_status,
-                                            true,
-                                            &account_proof,
-                                        )),
-                                    );
-                                }
-                                if event_authorizes_handshake(&request.event) {
-                                    // Una presence IN CHIARO da un contatto con cui
-                                    // crediamo di avere una sessione significa che
-                                    // l'altro lato l'ha persa (un restart, altrimenti
-                                    // userebbe il canale cifrato). La nostra è stale:
-                                    // la scartiamo così l'handshake riparte pulito
-                                    // (l'iniziatore reinvia l'hello; il responder
-                                    // accetta e sostituisce la sessione). Auto-heal
-                                    // del caso "connesso ma bloccato su preparazione".
-                                    if known_contacts.contains(&peer)
-                                        && sessions.remove(&peer).is_some()
-                                    {
-                                        log::info!(
-                                            "sessione stale scartata per {peer}: presence in chiaro"
-                                        );
-                                    }
-                                    maybe_start_hybrid_handshake(
-                                        &mut swarm,
-                                        &mut pending_handshakes,
-                                        &sessions,
-                                        local_peer_id,
-                                        peer,
-                                    );
-                                }
+                                // Senza sessione la presence parte in chiaro:
+                                // per l'iniziatore è il segnale di rifare
+                                // l'handshake.
+                                send_event(
+                                    swarm,
+                                    sessions,
+                                    contact_devices,
+                                    peer,
+                                    local_peer_id,
+                                    sent_numbers,
+                                    ChatEvent::Presence(presence_update(
+                                        display_name,
+                                        presence_status,
+                                        true,
+                                        account_proof,
+                                    )),
+                                );
                             }
                         }
                     }
-                    request_response::Message::Response { .. } => {}
-                },
-                SwarmEvent::Behaviour(BehaviourEvent::SecureChat(request_response::Event::Message { peer, message, .. })) => match message {
-                    request_response::Message::Request { request_id, request, channel } => {
-                        // Il canale è per dispositivo, la conversazione è per
-                        // contatto: cronologia e UI seguono il contatto.
-                        let contact = contact_devices.canonical(peer);
-                        let envelope = if ignored_contacts.contains(&peer)
-                            || ignored_contacts.contains(&contact)
-                        {
-                            Err("contatto rimosso")
-                        } else {
-                            sessions
-                                .get_mut(&peer)
-                                .ok_or(REJECT_NO_SESSION)
-                                .and_then(|session| {
-                                    decrypt_envelope(session, peer, local_peer_id, &request)
-                                        .map_err(|_| REJECT_UNDECRYPTABLE)
-                                })
-                        };
-                        match &envelope {
-                            Ok(_) => {
-                                decrypt_failures.remove(&peer);
-                            }
-                            Err(reason) if *reason == REJECT_UNDECRYPTABLE => {
-                                let failures = decrypt_failures.entry(peer).or_insert(0);
-                                *failures += 1;
-                                if *failures >= MAX_DECRYPT_FAILURES {
-                                    decrypt_failures.remove(&peer);
-                                    log::warn!("sessione con {peer} non decifrabile: nuovo handshake");
-                                    sessions.remove(&peer);
-                                    if should_initiate(local_peer_id, peer) {
-                                        maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
-                                    } else {
-                                        // Senza sessione la presence parte in chiaro:
-                                        // per l'iniziatore è il segnale di rifare
-                                        // l'handshake.
-                                        send_event(&mut swarm, &mut sessions, &contact_devices, peer, local_peer_id, &mut sent_numbers, ChatEvent::Presence(presence_update(&display_name, &presence_status, true, &account_proof)));
-                                    }
-                                }
-                            }
-                            Err(_) => {}
-                        }
-                        let response = match envelope {
-                            Ok(envelope) => match validate_envelope(peer, local_peer_id, &envelope) {
-                                Ok(()) => {
-                                    match incoming_offer_details(
-                                        contact,
-                                        local_peer_id,
-                                        &envelope.event,
-                                        &history,
-                                    ) {
-                                        Ok(Some((manifest, group_id))) => {
-                                            if offer_auto_accepted(&manifest, &auto_accept_extensions) {
-                                                // Estensione consentita e file piccolo: accetta senza chiedere.
-                                                let client_event = client_event_from_chat(contact, &envelope.event, "in", true, peer_names.get(&contact).map(String::as_str));
-                                                let resp = receive_event(contact, &envelope.event, &mut Incoming {
-                                                    pending_emoticons: &mut pending_emoticons,
-                                                    events: &events,
-                                                    nudge_limits: &mut incoming_nudge_limits,
-                                                    attachments: &mut attachment_receiver,
-                                                    history: &history,
-                                                    notifications: args.notifications,
-                                                    notification_mutes: &notification_mutes,
-                                                    peer_names: &mut peer_names,
-                                                    local_peer_id,
-                                                    incoming_attachments: &mut incoming_attachments,
-                                                    vault_jobs: &vault_jobs_tx,
-                                                });
-                                                if !matches!(&resp, ProtocolResponse::Rejected(_)) {
-                                                    if let Some(event) = client_event {
-                                                        let _ = events.send(event);
-                                                    }
-                                                }
-                                                swarm.behaviour_mut().secure_chat.send_response(channel, resp).ok();
-                                                return Ok(LoopFlow::Continue);
-                                            }
-                                            if pending_inbound_offers.len() >= MAX_PENDING_INBOUND_OFFERS {
-                                                swarm.behaviour_mut().secure_chat.send_response(
-                                                    channel,
-                                                    ProtocolResponse::Rejected("troppe offerte file in attesa".into()),
-                                                ).ok();
-                                                return Ok(LoopFlow::Continue);
-                                            }
-                                            inbound_offer_counter = inbound_offer_counter
-                                                .checked_add(1)
-                                                .unwrap_or(1);
-                                            let offer_id = inbound_offer_counter;
-                                            let _ = events.send(ClientEvent::IncomingAttachmentOffered {
-                                                offer_id,
-                                                peer_id: contact.to_string(),
-                                                filename: manifest.filename.clone(),
-                                                mime: manifest.mime.clone(),
-                                                size: manifest.size,
-                                                group_id,
-                                            });
-                                            pending_inbound_offers.insert(offer_id, PendingInboundOffer {
-                                                // Il trasferimento appartiene alla
-                                                // conversazione del contatto, non al
-                                                // dispositivo che l'ha aperto.
-                                                peer: contact,
-                                                request_id,
-                                                event: envelope.event,
-                                                channel,
-                                            });
-                                            return Ok(LoopFlow::Continue);
-                                        }
-                                        Ok(None) => {}
-                                        Err(error) => {
-                                            swarm.behaviour_mut().secure_chat.send_response(
-                                                channel,
-                                                ProtocolResponse::Rejected(error),
-                                            ).ok();
-                                            return Ok(LoopFlow::Continue);
-                                        }
-                                    }
-                                    // Annullato un file ancora in attesa di risposta:
-                                    // chiudi l'offerta invece di lasciarla aperta.
-                                    if let ChatEvent::AttachmentCancelled(cancel) = &envelope.event {
-                                        let offers = pending_inbound_offers
-                                            .iter()
-                                            .filter(|(_, pending)| {
-                                                pending.peer == contact
-                                                    && offered_attachment_id(&pending.event) == Some(cancel.attachment_id)
-                                            })
-                                            .map(|(offer_id, _)| *offer_id)
-                                            .collect::<Vec<_>>();
-                                        for offer_id in offers {
-                                            if let Some(pending) = pending_inbound_offers.remove(&offer_id) {
-                                                swarm.behaviour_mut().secure_chat.send_response(
-                                                    pending.channel,
-                                                    ProtocolResponse::Rejected("invio annullato dal mittente".into()),
-                                                ).ok();
-                                                let _ = events.send(ClientEvent::IncomingAttachmentCancelled {
-                                                    peer_id: contact.to_string(),
-                                                    attachment_id: hex_asset_id(&cancel.attachment_id),
-                                                    offer_id: Some(offer_id),
-                                                });
-                                            }
-                                        }
-                                    }
-                                    let client_event = client_event_from_chat(
-                                        contact, &envelope.event, "in", true,
-                                        peer_names.get(&contact).map(String::as_str),
-                                    );
-                                    if let ChatEvent::Presence(presence) = &envelope.event {
-                                        // Aggiorna anche qui il legame con l'account:
-                                        // la prova viaggia su entrambi i canali.
-                                        let source = recognize_presence(
-                                            &mut contact_devices,
-                                            &known_contacts,
-                                            &history.contacts()?,
-                                            peer,
-                                            presence,
+                    Err(_) => {}
+                }
+                let response = match envelope {
+                    Ok(envelope) => match validate_envelope(peer, local_peer_id, &envelope) {
+                        Ok(()) => {
+                            match incoming_offer_details(
+                                contact,
+                                local_peer_id,
+                                &envelope.event,
+                                history,
+                            ) {
+                                Ok(Some((manifest, group_id))) => {
+                                    if offer_auto_accepted(&manifest, auto_accept_extensions) {
+                                        // Estensione consentita e file piccolo: accetta senza chiedere.
+                                        let client_event = client_event_from_chat(
+                                            contact,
+                                            &envelope.event,
+                                            "in",
+                                            true,
+                                            peer_names.get(&contact).map(String::as_str),
                                         );
-                                        apply_presence_source(&source, peer, &mut PresenceBinding {
-                                            history: &history,
-                                            events: &events,
-                                            known_contacts: &mut known_contacts,
-                                            ignored_contacts: &mut ignored_contacts,
-                                            peer_names: &mut peer_names,
-                                            pending_contact_requests: &mut pending_contact_requests,
-                                        })?;
-                                        // Difesa: aggiorna il contatto solo se già
-                                        // noto; mai auto-aggiungere via canale cifrato.
-                                        // Un nostro dispositivo collegato non è un
-                                        // contatto e non va in rubrica.
-                                        if known_contacts.contains(&peer)
-                                            && !known_devices.contains_key(&peer)
-                                        {
-                                            history.ensure_contact(
-                                                &contact.to_string(),
-                                                &presence.display_name,
-                                                now_ms(),
-                                            )?;
+                                        let resp = receive_event(
+                                            contact,
+                                            &envelope.event,
+                                            &mut Incoming {
+                                                pending_emoticons,
+                                                events,
+                                                nudge_limits: incoming_nudge_limits,
+                                                attachments: attachment_receiver,
+                                                history,
+                                                notifications: args.notifications,
+                                                notification_mutes,
+                                                peer_names,
+                                                local_peer_id,
+                                                incoming_attachments,
+                                                vault_jobs: vault_jobs_tx,
+                                            },
+                                        );
+                                        if !matches!(&resp, ProtocolResponse::Rejected(_)) {
+                                            if let Some(event) = client_event {
+                                                let _ = events.send(event);
+                                            }
                                         }
-                                    }
-                                    // Un reinvio dopo un timeout può far arrivare due volte
-                                    // lo stesso messaggio: confermalo senza mostrarlo di nuovo.
-                                    if already_received(&history, &envelope.event) {
-                                        #[cfg(test)]
-                                        let _ = events.send(ClientEvent::ContactStatus {
-                                            peer_id: contact.to_string(),
-                                            status: "duplicate-ignored".into(),
-                                        });
-                                        swarm.behaviour_mut().secure_chat.send_response(channel, ProtocolResponse::Ack).ok();
+                                        swarm
+                                            .behaviour_mut()
+                                            .secure_chat
+                                            .send_response(channel, resp)
+                                            .ok();
                                         return Ok(LoopFlow::Continue);
                                     }
-                                    let response = receive_event(contact, &envelope.event, &mut Incoming {
-                                        pending_emoticons: &mut pending_emoticons,
-                                        events: &events,
-                                        nudge_limits: &mut incoming_nudge_limits,
-                                        attachments: &mut attachment_receiver,
-                                        history: &history,
-                                        notifications: args.notifications,
-                                        notification_mutes: &notification_mutes,
-                                        peer_names: &mut peer_names,
-                                        local_peer_id,
-                                        incoming_attachments: &mut incoming_attachments,
-                                        vault_jobs: &vault_jobs_tx,
-                                    });
-                                    if let Some(event) = client_event {
-                                        let _ = events.send(event);
+                                    if pending_inbound_offers.len() >= MAX_PENDING_INBOUND_OFFERS {
+                                        swarm
+                                            .behaviour_mut()
+                                            .secure_chat
+                                            .send_response(
+                                                channel,
+                                                ProtocolResponse::Rejected(
+                                                    "troppe offerte file in attesa".into(),
+                                                ),
+                                            )
+                                            .ok();
+                                        return Ok(LoopFlow::Continue);
                                     }
-                                    emit_contact_status(&events, contact, &envelope.event);
-                                    response
-                                }
-                                Err(error) => ProtocolResponse::Rejected(error.into()),
-                            },
-                            Err(error) => ProtocolResponse::Rejected(error.into()),
-                        };
-                        #[cfg(test)]
-                        if withhold_acks {
-                            held_responses.push(channel);
-                            return Ok(LoopFlow::Continue);
-                        }
-                        swarm.behaviour_mut().secure_chat.send_response(channel, response).ok();
-                    }
-                    request_response::Message::Response { request_id, response } => {
-                        if let Some(pending) = pending_offers.remove(&request_id) {
-                            match response {
-                                ProtocolResponse::MissingChunks(indices) => {
-                                    match validate_missing_chunks(indices, pending.manifest.chunks.len()) {
-                                        Ok(remaining) => {
-                                            log::info!("invio {}: {} chunk richiesti", pending.manifest.filename, remaining.len());
-                                            let total = remaining.len();
-                                            let _ = events.send(ClientEvent::AttachmentProgress {
-                                                filename: pending.manifest.filename.clone(),
-                                                completed_chunks: 0,
-                                                total_chunks: total,
-                                            });
-                                            send_next_transfer_chunk(
-                                                &mut swarm,
-                                                &mut sessions,
-                                                &contact_devices,
-                                                &mut sent_numbers,
-                                                &mut pending_transfers,
-                                                local_peer_id,
-                                                &events,
-                                                PendingTransfer {
-                                                    peer: pending.peer,
-                                                    path: pending.path,
-                                                    manifest: pending.manifest,
-                                                    group_id: pending.group_id,
-                                                    remaining,
-                                                    current: 0,
-                                                    retries: 0,
-                                                    completed: 0,
-                                                    total,
-                                                },
-                                            );
-                                        }
-                                        Err(error) => {
-                                            report_file_failed(&events, &pending.manifest.filename, &format!("richiesta chunk non valida: {error}"));
-                                        }
-                                    }
-                                }
-                                // Come per i messaggi: un'offerta cifrata con una
-                                // sessione che il destinatario non ha più va
-                                // riproposta dopo un nuovo handshake, non persa.
-                                ProtocolResponse::Rejected(reason)
-                                    if is_session_rejection(&reason) && pending.retries < MAX_DELIVERY_ATTEMPTS =>
-                                {
-                                    log::info!("offerta file rifiutata da {peer} ({reason}): nuova sessione e reinvio");
-                                    sessions.remove(&peer);
-                                    let mut offer = pending;
-                                    offer.retries += 1;
-                                    waiting_offers.entry(offer.peer).or_default().push(offer);
-                                    maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
-                                }
-                                ProtocolResponse::Rejected(error) => {
-                                    report_file_failed(&events, &pending.manifest.filename, &format!("file rifiutato: {error}"));
-                                }
-                                ProtocolResponse::Ack => {
-                                    let _ = events.send(ClientEvent::AttachmentSent {
-                                        peer_id: pending.peer.to_string(),
-                                        filename: pending.manifest.filename,
+                                    *inbound_offer_counter =
+                                        inbound_offer_counter.checked_add(1).unwrap_or(1);
+                                    let offer_id = *inbound_offer_counter;
+                                    let _ = events.send(ClientEvent::IncomingAttachmentOffered {
+                                        offer_id,
+                                        peer_id: contact.to_string(),
+                                        filename: manifest.filename.clone(),
+                                        mime: manifest.mime.clone(),
+                                        size: manifest.size,
+                                        group_id,
                                     });
+                                    pending_inbound_offers.insert(
+                                        offer_id,
+                                        PendingInboundOffer {
+                                            // Il trasferimento appartiene alla
+                                            // conversazione del contatto, non al
+                                            // dispositivo che l'ha aperto.
+                                            peer: contact,
+                                            request_id,
+                                            event: envelope.event,
+                                            channel,
+                                        },
+                                    );
+                                    return Ok(LoopFlow::Continue);
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    swarm
+                                        .behaviour_mut()
+                                        .secure_chat
+                                        .send_response(channel, ProtocolResponse::Rejected(error))
+                                        .ok();
+                                    return Ok(LoopFlow::Continue);
                                 }
                             }
-                        } else if let Some(transfer) = pending_transfers.remove(&request_id) {
-                            match response {
-                                ProtocolResponse::Ack => {
-                                    let mut transfer = transfer;
-                                    transfer.completed += 1;
+                            // Annullato un file ancora in attesa di risposta:
+                            // chiudi l'offerta invece di lasciarla aperta.
+                            if let ChatEvent::AttachmentCancelled(cancel) = &envelope.event {
+                                let offers = pending_inbound_offers
+                                    .iter()
+                                    .filter(|(_, pending)| {
+                                        pending.peer == contact
+                                            && offered_attachment_id(&pending.event)
+                                                == Some(cancel.attachment_id)
+                                    })
+                                    .map(|(offer_id, _)| *offer_id)
+                                    .collect::<Vec<_>>();
+                                for offer_id in offers {
+                                    if let Some(pending) = pending_inbound_offers.remove(&offer_id)
+                                    {
+                                        swarm
+                                            .behaviour_mut()
+                                            .secure_chat
+                                            .send_response(
+                                                pending.channel,
+                                                ProtocolResponse::Rejected(
+                                                    "invio annullato dal mittente".into(),
+                                                ),
+                                            )
+                                            .ok();
+                                        let _ =
+                                            events.send(ClientEvent::IncomingAttachmentCancelled {
+                                                peer_id: contact.to_string(),
+                                                attachment_id: hex_asset_id(&cancel.attachment_id),
+                                                offer_id: Some(offer_id),
+                                            });
+                                    }
+                                }
+                            }
+                            let client_event = client_event_from_chat(
+                                contact,
+                                &envelope.event,
+                                "in",
+                                true,
+                                peer_names.get(&contact).map(String::as_str),
+                            );
+                            if let ChatEvent::Presence(presence) = &envelope.event {
+                                // Aggiorna anche qui il legame con l'account:
+                                // la prova viaggia su entrambi i canali.
+                                let source = recognize_presence(
+                                    contact_devices,
+                                    known_contacts,
+                                    &history.contacts()?,
+                                    peer,
+                                    presence,
+                                );
+                                apply_presence_source(
+                                    &source,
+                                    peer,
+                                    &mut PresenceBinding {
+                                        history,
+                                        events,
+                                        known_contacts,
+                                        ignored_contacts,
+                                        peer_names,
+                                        pending_contact_requests,
+                                    },
+                                )?;
+                                // Difesa: aggiorna il contatto solo se già
+                                // noto; mai auto-aggiungere via canale cifrato.
+                                // Un nostro dispositivo collegato non è un
+                                // contatto e non va in rubrica.
+                                if known_contacts.contains(&peer)
+                                    && !known_devices.contains_key(&peer)
+                                {
+                                    history.ensure_contact(
+                                        &contact.to_string(),
+                                        &presence.display_name,
+                                        now_ms(),
+                                    )?;
+                                }
+                            }
+                            // Un reinvio dopo un timeout può far arrivare due volte
+                            // lo stesso messaggio: confermalo senza mostrarlo di nuovo.
+                            if already_received(history, &envelope.event) {
+                                #[cfg(test)]
+                                let _ = events.send(ClientEvent::ContactStatus {
+                                    peer_id: contact.to_string(),
+                                    status: "duplicate-ignored".into(),
+                                });
+                                swarm
+                                    .behaviour_mut()
+                                    .secure_chat
+                                    .send_response(channel, ProtocolResponse::Ack)
+                                    .ok();
+                                return Ok(LoopFlow::Continue);
+                            }
+                            let response = receive_event(
+                                contact,
+                                &envelope.event,
+                                &mut Incoming {
+                                    pending_emoticons,
+                                    events,
+                                    nudge_limits: incoming_nudge_limits,
+                                    attachments: attachment_receiver,
+                                    history,
+                                    notifications: args.notifications,
+                                    notification_mutes,
+                                    peer_names,
+                                    local_peer_id,
+                                    incoming_attachments,
+                                    vault_jobs: vault_jobs_tx,
+                                },
+                            );
+                            if let Some(event) = client_event {
+                                let _ = events.send(event);
+                            }
+                            emit_contact_status(events, contact, &envelope.event);
+                            response
+                        }
+                        Err(error) => ProtocolResponse::Rejected(error.into()),
+                    },
+                    Err(error) => ProtocolResponse::Rejected(error.into()),
+                };
+                #[cfg(test)]
+                if *withhold_acks {
+                    held_responses.push(channel);
+                    return Ok(LoopFlow::Continue);
+                }
+                swarm
+                    .behaviour_mut()
+                    .secure_chat
+                    .send_response(channel, response)
+                    .ok();
+            }
+            request_response::Message::Response {
+                request_id,
+                response,
+            } => {
+                if let Some(pending) = pending_offers.remove(&request_id) {
+                    match response {
+                        ProtocolResponse::MissingChunks(indices) => {
+                            match validate_missing_chunks(indices, pending.manifest.chunks.len()) {
+                                Ok(remaining) => {
+                                    log::info!(
+                                        "invio {}: {} chunk richiesti",
+                                        pending.manifest.filename,
+                                        remaining.len()
+                                    );
+                                    let total = remaining.len();
                                     let _ = events.send(ClientEvent::AttachmentProgress {
-                                        filename: transfer.manifest.filename.clone(),
-                                        completed_chunks: transfer.completed,
-                                        total_chunks: transfer.total,
+                                        filename: pending.manifest.filename.clone(),
+                                        completed_chunks: 0,
+                                        total_chunks: total,
                                     });
                                     send_next_transfer_chunk(
-                                        &mut swarm,
-                                        &mut sessions,
-                                        &contact_devices,
-                                        &mut sent_numbers,
-                                        &mut pending_transfers,
+                                        swarm,
+                                        sessions,
+                                        contact_devices,
+                                        sent_numbers,
+                                        pending_transfers,
                                         local_peer_id,
-                                        &events,
-                                        transfer,
-                                    )
-                                },
-                                ProtocolResponse::Rejected(error) => {
-                                    report_file_failed(&events, &transfer.manifest.filename, &format!("trasferimento rifiutato: {error}"));
-                                }
-                                ProtocolResponse::MissingChunks(_) => {
-                                    report_file_failed(&events, &transfer.manifest.filename, "risposta non valida durante il trasferimento");
-                                }
-                            }
-                        } else if let Some((msg_peer, event, attempts, _)) = pending_messages.remove(&request_id) {
-                            match response {
-                                // Consegnato: smetti di tracciarlo.
-                                ProtocolResponse::Ack => {}
-                                // Il destinatario non riesce a decifrare (sessione
-                                // persa o sostituita da un nuovo handshake): la
-                                // nostra è stale. La scartiamo, rimettiamo il
-                                // messaggio in testa alla coda e rifacciamo
-                                // l'handshake; parte appena il canale è pronto.
-                                ProtocolResponse::Rejected(reason)
-                                    if is_session_rejection(&reason)
-                                        && attempts < MAX_DELIVERY_ATTEMPTS =>
-                                {
-                                    log::info!("messaggio rifiutato da {peer} ({reason}): nuova sessione e reinvio");
-                                    sessions.remove(&peer);
-                                    requeue_in_order(outbox.entry(msg_peer).or_default(), event, attempts + 1);
-                                    maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
-                                }
-                                ProtocolResponse::Rejected(reason) => {
-                                    report_undelivered(&events, &mut shared_emoticons, msg_peer, &event, &reason);
-                                }
-                                ProtocolResponse::MissingChunks(_) => {
-                                    report_undelivered(&events, &mut shared_emoticons, msg_peer, &event, "risposta non valida");
-                                }
-                            }
-                        }
-                    }
-                },
-                SwarmEvent::Behaviour(BehaviourEvent::SecureChat(request_response::Event::OutboundFailure { peer, request_id, error, .. })) => {
-                    if let Some(mut pending) = pending_offers.remove(&request_id) {
-                        if let Some(retries) = next_request_retry(pending.retries) {
-                            pending.retries = retries;
-                            let event = offer_event(&pending);
-                            if let Some(next_id) = send_event(
-                                &mut swarm,
-                                &mut sessions,
-                                &contact_devices,
-                                pending.peer,
-                                local_peer_id,
-                                &mut sent_numbers,
-                                event,
-                            ) {
-                                pending_offers.insert(next_id, pending);
-                            } else {
-                                report_file_failed(&events, &pending.manifest.filename, "sessione cifrata persa");
-                            }
-                        } else {
-                            log::warn!("offerta file fallita definitivamente per {peer}: {error}");
-                            report_file_failed(&events, &pending.manifest.filename, &error.to_string());
-                        }
-                    } else if let Some(mut transfer) = pending_transfers.remove(&request_id) {
-                        if let Some(retries) = next_request_retry(transfer.retries) {
-                            transfer.retries = retries;
-                            send_current_transfer_chunk(
-                                &mut swarm,
-                                &mut sessions,
-                                &contact_devices,
-                                &mut sent_numbers,
-                                &mut pending_transfers,
-                                local_peer_id,
-                                &events,
-                                transfer,
-                            );
-                        } else {
-                            log::warn!("trasferimento file fallito definitivamente per {peer}: {error}");
-                            report_file_failed(&events, &transfer.manifest.filename, &error.to_string());
-                        }
-                    } else if let Some((msg_peer, event, retries, _)) = pending_messages.remove(&request_id) {
-                        // Retry di un messaggio di testo fallito in transito.
-                        if let Some(next) = next_delivery_attempt(retries) {
-                            resend_pending(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, local_peer_id, msg_peer, event, next);
-                        } else {
-                            log::warn!("messaggio non consegnato definitivamente a {peer}: {error}");
-                            report_undelivered(&events, &mut shared_emoticons, msg_peer, &event, &error.to_string());
-                        }
-                    } else {
-                        log::warn!("invio cifrato fallito per {peer}: {error}");
-                    }
-                }
-                SwarmEvent::Behaviour(BehaviourEvent::SecureChat(request_response::Event::InboundFailure { peer, request_id, error, .. })) => {
-                    pending_inbound_offers.retain(|_, pending| pending.request_id != request_id);
-                    log::warn!("messaggio cifrato non ricevibile da {peer}: {error}");
-                }
-                SwarmEvent::Behaviour(BehaviourEvent::SecureChat(request_response::Event::ResponseSent { .. })) => {}
-                SwarmEvent::Behaviour(BehaviourEvent::Handshake(request_response::Event::Message { peer, message, .. })) => match message {
-                    request_response::Message::Request { request_id, request, channel } => {
-                        let authorized = handshake_peer_authorized(
-                            known_contacts.contains(&peer),
-                            peers.contains(&peer),
-                            swarm.is_connected(&peer)
-                                && !infrastructure_peers.contains(&peer)
-                                && !ignored_contacts.contains(&peer),
-                        );
-                        let (response, pending_key) = if !accepts_inbound(local_peer_id, peer)
-                            || !authorized
-                        {
-                            (
-                                HybridResponse::Rejected("handshake non autorizzato".into()),
-                                None,
-                            )
-                        } else {
-                            match respond_hybrid(&request, peer, local_peer_id) {
-                                Ok((hello, session_key)) => (
-                                    HybridResponse::Accepted(hello),
-                                    Some(session_key),
-                                ),
-                                Err(error) => (HybridResponse::Rejected(error.to_string()), None),
-                            }
-                        };
-                        if swarm.behaviour_mut().handshake.send_response(channel, response).is_ok() {
-                            if let Some(session_key) = pending_key {
-                                pending_inbound_handshakes.insert(request_id, (peer, session_key));
-                            }
-                        } else {
-                            log::warn!("risposta handshake non consegnata a {peer}");
-                        }
-                    }
-                    request_response::Message::Response { request_id, response } => {
-                        let Some((expected_peer, initiator)) = pending_handshakes.remove(&request_id) else {
-                            return Ok(LoopFlow::Continue);
-                        };
-                        if expected_peer != peer {
-                            log::warn!("risposta handshake ricevuta dal peer errato");
-                            return Ok(LoopFlow::Continue);
-                        }
-                        match response {
-                            HybridResponse::Accepted(hello) => match initiator.finish(&hello) {
-                                Ok(session_key) => {
-                                    sessions.insert(
-                                        peer,
-                                        RatchetSession::new(session_key, local_peer_id, peer),
-                                    );
-                                    handshake_retries.remove(&peer);
-                                    log::info!("handshake ibrido completato: {peer}");
-                                    log::info!("handshake ibrido completato: {peer}");
-                                    let contact = contact_devices.canonical(peer);
-                                    let _ = events.send(ClientEvent::ContactUpdated {
-                                        contact: ClientContact {
-                                            peer_id: contact.to_string(),
-                                            name: peer_names
-                                                .get(&contact)
-                                                .cloned()
-                                                .unwrap_or_else(|| "Contatto".into()),
-                                            online: true,
-                                            secure: true,
-                                            fingerprint: peer_fingerprint(contact),
+                                        events,
+                                        PendingTransfer {
+                                            peer: pending.peer,
+                                            path: pending.path,
+                                            manifest: pending.manifest,
+                                            group_id: pending.group_id,
+                                            remaining,
+                                            current: 0,
+                                            retries: 0,
+                                            completed: 0,
+                                            total,
                                         },
-                                    });
-                                    send_group_definitions_for_peer(
-                                        &history,
-                                        &mut swarm,
-                                        &mut sessions,
-                                        &contact_devices,
-                                        &mut sent_numbers,
-                                        local_peer_id,
-                                        peer,
                                     );
-                                    flush_outbox(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, local_peer_id, peer);
-                                    for offer in take_waiting_offers(&mut waiting_offers, &contact_devices, peer) {
-                                        offer_file(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_offers, &history, &events, local_peer_id, offer);
-                                    }
                                 }
-                                Err(error) => log::warn!("handshake ibrido fallito con {peer}: {error}"),
-                            },
-                            HybridResponse::Rejected(error) => {
-                                log::warn!("handshake ibrido rifiutato da {peer}: {error:?}");
+                                Err(error) => {
+                                    report_file_failed(
+                                        events,
+                                        &pending.manifest.filename,
+                                        &format!("richiesta chunk non valida: {error}"),
+                                    );
+                                }
                             }
                         }
+                        // Come per i messaggi: un'offerta cifrata con una
+                        // sessione che il destinatario non ha più va
+                        // riproposta dopo un nuovo handshake, non persa.
+                        ProtocolResponse::Rejected(reason)
+                            if is_session_rejection(&reason)
+                                && pending.retries < MAX_DELIVERY_ATTEMPTS =>
+                        {
+                            log::info!("offerta file rifiutata da {peer} ({reason}): nuova sessione e reinvio");
+                            sessions.remove(&peer);
+                            let mut offer = pending;
+                            offer.retries += 1;
+                            waiting_offers.entry(offer.peer).or_default().push(offer);
+                            maybe_start_hybrid_handshake(
+                                swarm,
+                                pending_handshakes,
+                                sessions,
+                                local_peer_id,
+                                peer,
+                            );
+                        }
+                        ProtocolResponse::Rejected(error) => {
+                            report_file_failed(
+                                events,
+                                &pending.manifest.filename,
+                                &format!("file rifiutato: {error}"),
+                            );
+                        }
+                        ProtocolResponse::Ack => {
+                            let _ = events.send(ClientEvent::AttachmentSent {
+                                peer_id: pending.peer.to_string(),
+                                filename: pending.manifest.filename,
+                            });
+                        }
                     }
-                },
-                SwarmEvent::Behaviour(BehaviourEvent::Handshake(request_response::Event::OutboundFailure { peer, request_id, error, .. })) => {
-                    pending_handshakes.remove(&request_id);
-                    log::warn!("handshake ibrido fallito con {peer}: {error}");
-                    log::warn!("handshake ibrido fallito con {peer}: {error}");
-                    // Riprova finché il peer è connesso e non è già cifrato: evita
-                    // di restare bloccati su "preparazione" per un invio transitorio.
-                    let attempts = handshake_retries.entry(peer).or_insert(0);
-                    if *attempts < MAX_REQUEST_RETRIES && peers.contains(&peer) && !sessions.contains_key(&peer) {
-                        *attempts += 1;
-                        maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
+                } else if let Some(transfer) = pending_transfers.remove(&request_id) {
+                    match response {
+                        ProtocolResponse::Ack => {
+                            let mut transfer = transfer;
+                            transfer.completed += 1;
+                            let _ = events.send(ClientEvent::AttachmentProgress {
+                                filename: transfer.manifest.filename.clone(),
+                                completed_chunks: transfer.completed,
+                                total_chunks: transfer.total,
+                            });
+                            send_next_transfer_chunk(
+                                swarm,
+                                sessions,
+                                contact_devices,
+                                sent_numbers,
+                                pending_transfers,
+                                local_peer_id,
+                                events,
+                                transfer,
+                            )
+                        }
+                        ProtocolResponse::Rejected(error) => {
+                            report_file_failed(
+                                events,
+                                &transfer.manifest.filename,
+                                &format!("trasferimento rifiutato: {error}"),
+                            );
+                        }
+                        ProtocolResponse::MissingChunks(_) => {
+                            report_file_failed(
+                                events,
+                                &transfer.manifest.filename,
+                                "risposta non valida durante il trasferimento",
+                            );
+                        }
+                    }
+                } else if let Some((msg_peer, event, attempts, _)) =
+                    pending_messages.remove(&request_id)
+                {
+                    match response {
+                        // Consegnato: smetti di tracciarlo.
+                        ProtocolResponse::Ack => {}
+                        // Il destinatario non riesce a decifrare (sessione
+                        // persa o sostituita da un nuovo handshake): la
+                        // nostra è stale. La scartiamo, rimettiamo il
+                        // messaggio in testa alla coda e rifacciamo
+                        // l'handshake; parte appena il canale è pronto.
+                        ProtocolResponse::Rejected(reason)
+                            if is_session_rejection(&reason)
+                                && attempts < MAX_DELIVERY_ATTEMPTS =>
+                        {
+                            log::info!("messaggio rifiutato da {peer} ({reason}): nuova sessione e reinvio");
+                            sessions.remove(&peer);
+                            requeue_in_order(
+                                outbox.entry(msg_peer).or_default(),
+                                event,
+                                attempts + 1,
+                            );
+                            maybe_start_hybrid_handshake(
+                                swarm,
+                                pending_handshakes,
+                                sessions,
+                                local_peer_id,
+                                peer,
+                            );
+                        }
+                        ProtocolResponse::Rejected(reason) => {
+                            report_undelivered(events, shared_emoticons, msg_peer, &event, &reason);
+                        }
+                        ProtocolResponse::MissingChunks(_) => {
+                            report_undelivered(
+                                events,
+                                shared_emoticons,
+                                msg_peer,
+                                &event,
+                                "risposta non valida",
+                            );
+                        }
                     }
                 }
-                SwarmEvent::Behaviour(BehaviourEvent::Handshake(request_response::Event::InboundFailure { peer, request_id, error, .. })) => {
-                    pending_inbound_handshakes.remove(&request_id);
-                    log::warn!("richiesta handshake non valida da {peer}: {error}");
+            }
+        }
+        Ok(LoopFlow::Continue)
+    }
+
+    fn on_handshake_message(
+        &mut self,
+        peer: PeerId,
+        message: request_response::Message<crypto::HybridClientHello, HybridResponse>,
+    ) -> Result<LoopFlow, Box<dyn Error>> {
+        let Node {
+            history,
+            ignored_contacts,
+            local_peer_id,
+            swarm,
+            peers,
+            known_contacts,
+            contact_devices,
+            infrastructure_peers,
+            sent_numbers,
+            pending_offers,
+            pending_handshakes,
+            handshake_retries,
+            outbox,
+            pending_messages,
+            pending_inbound_handshakes,
+            sessions,
+            waiting_offers,
+            peer_names,
+            events,
+            ..
+        } = self;
+        let local_peer_id = *local_peer_id;
+        match message {
+            request_response::Message::Request {
+                request_id,
+                request,
+                channel,
+            } => {
+                let authorized = handshake_peer_authorized(
+                    known_contacts.contains(&peer),
+                    peers.contains(&peer),
+                    swarm.is_connected(&peer)
+                        && !infrastructure_peers.contains(&peer)
+                        && !ignored_contacts.contains(&peer),
+                );
+                let (response, pending_key) =
+                    if !accepts_inbound(local_peer_id, peer) || !authorized {
+                        (
+                            HybridResponse::Rejected("handshake non autorizzato".into()),
+                            None,
+                        )
+                    } else {
+                        match respond_hybrid(&request, peer, local_peer_id) {
+                            Ok((hello, session_key)) => {
+                                (HybridResponse::Accepted(hello), Some(session_key))
+                            }
+                            Err(error) => (HybridResponse::Rejected(error.to_string()), None),
+                        }
+                    };
+                if swarm
+                    .behaviour_mut()
+                    .handshake
+                    .send_response(channel, response)
+                    .is_ok()
+                {
+                    if let Some(session_key) = pending_key {
+                        pending_inbound_handshakes.insert(request_id, (peer, session_key));
+                    }
+                } else {
+                    log::warn!("risposta handshake non consegnata a {peer}");
                 }
-                SwarmEvent::Behaviour(BehaviourEvent::Handshake(request_response::Event::ResponseSent { peer, request_id, .. })) => {
-                    if let Some((expected_peer, session_key)) = pending_inbound_handshakes.remove(&request_id) {
-                        if expected_peer == peer {
+            }
+            request_response::Message::Response {
+                request_id,
+                response,
+            } => {
+                let Some((expected_peer, initiator)) = pending_handshakes.remove(&request_id)
+                else {
+                    return Ok(LoopFlow::Continue);
+                };
+                if expected_peer != peer {
+                    log::warn!("risposta handshake ricevuta dal peer errato");
+                    return Ok(LoopFlow::Continue);
+                }
+                match response {
+                    HybridResponse::Accepted(hello) => match initiator.finish(&hello) {
+                        Ok(session_key) => {
                             sessions.insert(
                                 peer,
                                 RatchetSession::new(session_key, local_peer_id, peer),
                             );
+                            handshake_retries.remove(&peer);
                             log::info!("handshake ibrido completato: {peer}");
-                            log::info!("handshake ibrido completato (responder): {peer}");
+                            log::info!("handshake ibrido completato: {peer}");
                             let contact = contact_devices.canonical(peer);
                             let _ = events.send(ClientEvent::ContactUpdated {
                                 contact: ClientContact {
@@ -3121,437 +3601,1874 @@ async fn run_node(
                                 },
                             });
                             send_group_definitions_for_peer(
-                                &history,
-                                &mut swarm,
-                                &mut sessions,
-                                &contact_devices,
-                                &mut sent_numbers,
+                                history,
+                                swarm,
+                                sessions,
+                                contact_devices,
+                                sent_numbers,
                                 local_peer_id,
                                 peer,
                             );
-                            flush_outbox(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, local_peer_id, peer);
-                            for offer in take_waiting_offers(&mut waiting_offers, &contact_devices, peer) {
-                                offer_file(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_offers, &history, &events, local_peer_id, offer);
+                            flush_outbox(
+                                swarm,
+                                sessions,
+                                contact_devices,
+                                sent_numbers,
+                                pending_messages,
+                                outbox,
+                                local_peer_id,
+                                peer,
+                            );
+                            for offer in take_waiting_offers(waiting_offers, contact_devices, peer)
+                            {
+                                offer_file(
+                                    swarm,
+                                    sessions,
+                                    contact_devices,
+                                    sent_numbers,
+                                    pending_offers,
+                                    history,
+                                    events,
+                                    local_peer_id,
+                                    offer,
+                                );
                             }
                         }
+                        Err(error) => {
+                            log::warn!("handshake ibrido fallito con {peer}: {error}")
+                        }
+                    },
+                    HybridResponse::Rejected(error) => {
+                        log::warn!("handshake ibrido rifiutato da {peer}: {error:?}");
                     }
                 }
-                SwarmEvent::Behaviour(BehaviourEvent::Devices(request_response::Event::Message { peer, message, .. })) => match message {
-                    request_response::Message::Request { request, channel, .. } => {
-                        pending_pairings.retain(|_, pairing| pairing.expires_at_ms >= now_ms());
-                        let pairing_key = pending_pairings
-                            .get(&request.key_id)
-                            .map(|pairing| pairing.secret);
-                        let selected_key = if request.key_id == devices::key_id(&account_key) {
-                            Some(account_key)
-                        } else {
-                            pairing_key
-                        };
-                        let response = match selected_key {
-                            Some(key) => match devices::open::<DeviceRequest>(&key, &request) {
-                                Ok(DeviceRequest::Pair { device, records })
-                                    if pairing_key.is_some() && device.peer_id == peer.to_string() =>
-                                {
-                                    let applied = history.apply_sync_records(&records)?;
-                                    let entry = device_entry(&device, now_ms());
-                                    history.save_device(&entry)?;
-                                    known_devices.insert(peer, entry);
-                                    peers.remove(&peer);
-                                    sessions.remove(&peer);
-                                    known_contacts.remove(&peer);
-                                    peer_names.remove(&peer);
-                                    if history.contacts()?.iter().any(|contact| contact.peer == peer.to_string()) {
-                                        history.delete_contact(&peer.to_string())?;
-                                    }
-                                    online_devices.insert(peer);
-                                    pending_pairings.remove(&request.key_id);
-                                    let mut linked = known_devices
-                                        .values()
-                                        .map(device_descriptor)
-                                        .collect::<Vec<_>>();
-                                    linked.push(local_device_descriptor(
-                                        local_peer_id,
-                                        &display_name,
-                                        contact_addresses(&swarm, &args.relays, local_peer_id),
-                                    ));
-                                    let outgoing = history.sync_records_since(0, devices::MAX_SYNC_RECORDS)?;
-                                    let accepted_through = records.last().map_or(0, |record| record.seq);
-                                    let payload = DeviceResponse::Paired {
-                                        account_key,
-                                        devices: linked,
-                                        records: outgoing,
-                                        latest_seq: history.latest_sync_seq()?,
-                                        accepted_through,
-                                    };
-                                    refresh_synced_state(
-                                        &history,
-                                        &mut known_contacts,
-                                        &mut ignored_contacts,
-                                        &mut peer_names,
-                                        &mut contact_devices,
-                                        &peers,
-                                        &sessions,
-                                        &events,
-                                    )?;
-                                    send_group_chats(&history.group_chats()?, &events);
-                                    send_devices(&known_devices, &online_devices, &events);
-                                    connect_synced_peers(&history, &known_devices, local_peer_id, &mut SyncConnections { swarm: &mut swarm, online_contacts: &peers, online_devices: &online_devices, dialing: &mut dialing, bootstrap_fallbacks: &mut bootstrap_fallbacks, fallback_planner: &mut fallback_planner, pending_dht: &mut pending_dht })?;
-                                    let _ = events.send(ClientEvent::DeviceSynchronized {
-                                        peer_id: peer.to_string(),
-                                        applied: applied.applied,
-                                        paired: true,
-                                    });
-                                    // Ri-annuncia la presence firmata ai contatti
-                                    // raggiungibili: è così che imparano il legame
-                                    // fra la persona e il suo account.
-                                    for contact_peer in peers.iter().copied().collect::<Vec<_>>() {
-                                        send_event(&mut swarm, &mut sessions, &contact_devices, contact_peer, local_peer_id, &mut sent_numbers, ChatEvent::Presence(presence_update(&display_name, &presence_status, true, &account_proof)));
-                                    }
-                                    devices::seal(&key, &payload)?
-                                }
-                                Ok(DeviceRequest::Sync { device, after_seq, records })
-                                    if pairing_key.is_none() && device.peer_id == peer.to_string() =>
-                                {
-                                    let applied = history.apply_sync_records(&records)?;
-                                    let entry = device_entry(&device, now_ms());
-                                    history.save_device(&entry)?;
-                                    known_devices.insert(peer, entry);
-                                    online_devices.insert(peer);
-                                    let outgoing = history.sync_records_since(
-                                        after_seq,
-                                        devices::MAX_SYNC_RECORDS,
-                                    )?;
-                                    let payload = DeviceResponse::Synced {
-                                        records: outgoing,
-                                        latest_seq: history.latest_sync_seq()?,
-                                        accepted_through: records.last().map_or(0, |record| record.seq),
-                                    };
-                                    refresh_synced_state(
-                                        &history,
-                                        &mut known_contacts,
-                                        &mut ignored_contacts,
-                                        &mut peer_names,
-                                        &mut contact_devices,
-                                        &peers,
-                                        &sessions,
-                                        &events,
-                                    )?;
-                                    send_group_chats(&history.group_chats()?, &events);
-                                    send_devices(&known_devices, &online_devices, &events);
-                                    connect_synced_peers(&history, &known_devices, local_peer_id, &mut SyncConnections { swarm: &mut swarm, online_contacts: &peers, online_devices: &online_devices, dialing: &mut dialing, bootstrap_fallbacks: &mut bootstrap_fallbacks, fallback_planner: &mut fallback_planner, pending_dht: &mut pending_dht })?;
-                                    let _ = events.send(ClientEvent::DeviceSynchronized {
-                                        peer_id: peer.to_string(),
-                                        applied: applied.applied,
-                                        paired: false,
-                                    });
-                                    devices::seal(&key, &payload)?
-                                }
-                                Ok(DeviceRequest::RelayText { target, id, text, emoticons, offers })
-                                    if pairing_key.is_none() && known_devices.contains_key(&peer) =>
-                                {
-                                    // Un dispositivo collegato ci chiede di consegnare un
-                                    // messaggio a un suo contatto che non riesce a raggiungere.
-                                    // Consegniamo solo verso contatti noti (mai sconosciuti).
-                                    let parsed = target.parse::<PeerId>().ok();
-                                    log::info!(
+            }
+        }
+        Ok(LoopFlow::Continue)
+    }
+
+    fn on_device_message(
+        &mut self,
+        peer: PeerId,
+        message: request_response::Message<SealedDeviceMessage, SealedDeviceMessage>,
+    ) -> Result<LoopFlow, Box<dyn Error>> {
+        let Node {
+            account_key,
+            history,
+            ignored_contacts,
+            local_peer_id,
+            account_identity,
+            account_proof,
+            swarm,
+            display_name,
+            peers,
+            dialing,
+            bootstrap_fallbacks,
+            known_contacts,
+            contact_devices,
+            fallback_planner,
+            pending_dht,
+            triggers,
+            sent_numbers,
+            pending_handshakes,
+            outbox,
+            pending_messages,
+            presence_status,
+            sessions,
+            shared_emoticons,
+            peer_names,
+            pending_pairings,
+            pending_pair_targets,
+            pending_device_requests,
+            online_devices,
+            known_devices,
+            args,
+            events,
+            ..
+        } = self;
+        let local_peer_id = *local_peer_id;
+        match message {
+            request_response::Message::Request {
+                request, channel, ..
+            } => {
+                pending_pairings.retain(|_, pairing| pairing.expires_at_ms >= now_ms());
+                let pairing_key = pending_pairings
+                    .get(&request.key_id)
+                    .map(|pairing| pairing.secret);
+                let selected_key = if request.key_id == devices::key_id(account_key) {
+                    Some(*account_key)
+                } else {
+                    pairing_key
+                };
+                let response = match selected_key {
+                    Some(key) => match devices::open::<DeviceRequest>(&key, &request) {
+                        Ok(DeviceRequest::Pair { device, records })
+                            if pairing_key.is_some() && device.peer_id == peer.to_string() =>
+                        {
+                            let applied = history.apply_sync_records(&records)?;
+                            let entry = device_entry(&device, now_ms());
+                            history.save_device(&entry)?;
+                            known_devices.insert(peer, entry);
+                            peers.remove(&peer);
+                            sessions.remove(&peer);
+                            known_contacts.remove(&peer);
+                            peer_names.remove(&peer);
+                            if history
+                                .contacts()?
+                                .iter()
+                                .any(|contact| contact.peer == peer.to_string())
+                            {
+                                history.delete_contact(&peer.to_string())?;
+                            }
+                            online_devices.insert(peer);
+                            pending_pairings.remove(&request.key_id);
+                            let mut linked = known_devices
+                                .values()
+                                .map(device_descriptor)
+                                .collect::<Vec<_>>();
+                            linked.push(local_device_descriptor(
+                                local_peer_id,
+                                display_name,
+                                contact_addresses(swarm, &args.relays, local_peer_id),
+                            ));
+                            let outgoing =
+                                history.sync_records_since(0, devices::MAX_SYNC_RECORDS)?;
+                            let accepted_through = records.last().map_or(0, |record| record.seq);
+                            let payload = DeviceResponse::Paired {
+                                account_key: *account_key,
+                                devices: linked,
+                                records: outgoing,
+                                latest_seq: history.latest_sync_seq()?,
+                                accepted_through,
+                            };
+                            refresh_synced_state(
+                                history,
+                                known_contacts,
+                                ignored_contacts,
+                                peer_names,
+                                contact_devices,
+                                peers,
+                                sessions,
+                                events,
+                            )?;
+                            send_group_chats(&history.group_chats()?, events);
+                            send_devices(known_devices, online_devices, events);
+                            connect_synced_peers(
+                                history,
+                                known_devices,
+                                local_peer_id,
+                                &mut SyncConnections {
+                                    swarm,
+                                    online_contacts: peers,
+                                    online_devices,
+                                    dialing,
+                                    bootstrap_fallbacks,
+                                    fallback_planner,
+                                    pending_dht,
+                                },
+                            )?;
+                            let _ = events.send(ClientEvent::DeviceSynchronized {
+                                peer_id: peer.to_string(),
+                                applied: applied.applied,
+                                paired: true,
+                            });
+                            // Ri-annuncia la presence firmata ai contatti
+                            // raggiungibili: è così che imparano il legame
+                            // fra la persona e il suo account.
+                            for contact_peer in peers.iter().copied().collect::<Vec<_>>() {
+                                send_event(
+                                    swarm,
+                                    sessions,
+                                    contact_devices,
+                                    contact_peer,
+                                    local_peer_id,
+                                    sent_numbers,
+                                    ChatEvent::Presence(presence_update(
+                                        display_name,
+                                        presence_status,
+                                        true,
+                                        account_proof,
+                                    )),
+                                );
+                            }
+                            devices::seal(&key, &payload)?
+                        }
+                        Ok(DeviceRequest::Sync {
+                            device,
+                            after_seq,
+                            records,
+                        }) if pairing_key.is_none() && device.peer_id == peer.to_string() => {
+                            let applied = history.apply_sync_records(&records)?;
+                            let entry = device_entry(&device, now_ms());
+                            history.save_device(&entry)?;
+                            known_devices.insert(peer, entry);
+                            online_devices.insert(peer);
+                            let outgoing =
+                                history.sync_records_since(after_seq, devices::MAX_SYNC_RECORDS)?;
+                            let payload = DeviceResponse::Synced {
+                                records: outgoing,
+                                latest_seq: history.latest_sync_seq()?,
+                                accepted_through: records.last().map_or(0, |record| record.seq),
+                            };
+                            refresh_synced_state(
+                                history,
+                                known_contacts,
+                                ignored_contacts,
+                                peer_names,
+                                contact_devices,
+                                peers,
+                                sessions,
+                                events,
+                            )?;
+                            send_group_chats(&history.group_chats()?, events);
+                            send_devices(known_devices, online_devices, events);
+                            connect_synced_peers(
+                                history,
+                                known_devices,
+                                local_peer_id,
+                                &mut SyncConnections {
+                                    swarm,
+                                    online_contacts: peers,
+                                    online_devices,
+                                    dialing,
+                                    bootstrap_fallbacks,
+                                    fallback_planner,
+                                    pending_dht,
+                                },
+                            )?;
+                            let _ = events.send(ClientEvent::DeviceSynchronized {
+                                peer_id: peer.to_string(),
+                                applied: applied.applied,
+                                paired: false,
+                            });
+                            devices::seal(&key, &payload)?
+                        }
+                        Ok(DeviceRequest::RelayText {
+                            target,
+                            id,
+                            text,
+                            emoticons,
+                            offers,
+                        }) if pairing_key.is_none() && known_devices.contains_key(&peer) => {
+                            // Un dispositivo collegato ci chiede di consegnare un
+                            // messaggio a un suo contatto che non riesce a raggiungere.
+                            // Consegniamo solo verso contatti noti (mai sconosciuti).
+                            let parsed = target.parse::<PeerId>().ok();
+                            log::info!(
                                         "relay: RelayText da {peer} per {target}; known_contact={}, session={}",
                                         parsed.map(|p| known_contacts.contains(&p)).unwrap_or(false),
                                         parsed.map(|p| sessions.contains_key(&p)).unwrap_or(false)
                                     );
-                                    // Le emoticon arrivano dal dispositivo mittente insieme
-                                    // al testo: le sue emoticon personalizzate qui potrebbero
-                                    // non esistere. Un mittente vecchio non le manda, e si
-                                    // usano i trigger locali come prima.
-                                    let emoticons = if emoticons.is_empty() {
-                                        resolve_emoticons(&text, &triggers).unwrap_or_default()
-                                    } else {
-                                        emoticons
-                                    };
-                                    let message = TextMessage { text: text.clone(), emoticons, id };
-                                    let delivered = match parsed {
-                                        Some(target_peer)
-                                            if known_contacts.contains(&target_peer)
-                                                && validate_text_message(&message).is_ok() =>
-                                        {
-                                            for offer in offers {
-                                                let asset_id = offer.metadata.asset_id;
-                                                if message.emoticons.iter().any(|span| span.asset_id == asset_id)
-                                                    && shared_emoticons.insert((target_peer, asset_id))
-                                                {
-                                                    deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, target_peer, ChatEvent::EmoticonOffer(offer));
-                                                }
-                                            }
-                                            for offer in new_emoticon_offers(&message.emoticons, target_peer, &mut shared_emoticons, &triggers, &args.emotes, &events) {
-                                                deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, target_peer, ChatEvent::EmoticonOffer(offer));
-                                            }
-                                            deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, target_peer, ChatEvent::Text(message.clone()));
-                                            record_text(&history, &target_peer, "out", &message);
-                                            let _ = events.send(ClientEvent::Message {
-                                                message: ClientMessage {
-                                                    peer_id: target_peer.to_string(),
-                                                    direction: "out".into(),
-                                                    kind: "text".into(),
-                                                    body: text,
-                                                    timestamp_ms: now_ms(),
-                                                    emoticons: client_emoticon_spans(&message),
-                                                    attachment_id: None,
-                                                    attachment_mime: None,
-                                                    event_id: Some(hex_group_id(&id)),
-                                                    relayed: false,
-                                                },
-                                            });
-                                            true
-                                        }
-                                        _ => false,
-                                    };
-                                    log::info!("relay: consegna a {target} delivered={delivered}");
-                                    devices::seal(&key, &DeviceResponse::RelayResult { id, delivered })?
-                                }
-                                _ => devices::seal(&key, &DeviceResponse::Rejected("richiesta dispositivo non valida".into()))?,
-                            },
-                            None => devices::seal(&[0u8; 32], &DeviceResponse::Rejected("codice non riconosciuto".into()))?,
-                        };
-                        swarm.behaviour_mut().devices.send_response(channel, response).ok();
-                    }
-                    request_response::Message::Response { request_id, response } => {
-                        let Some(pending) = pending_device_requests.remove(&request_id) else {
-                            return Ok(LoopFlow::Continue);
-                        };
-                        // Il messaggio è già mostrato e verrà sincronizzato dal
-                        // dispositivo che l'ha inoltrato. Se invece il dispositivo non
-                        // ha potuto consegnarlo torna nella coda diretta: parte appena
-                        // abbiamo una sessione col contatto.
-                        if let PendingDeviceRequest::Relay { peer: relay_peer, target, message } = pending {
-                            let delivered = relay_peer == peer
-                                && match devices::open::<DeviceResponse>(&account_key, &response) {
-                                    Ok(DeviceResponse::RelayResult { delivered, .. }) => delivered,
-                                    other => {
-                                        log::warn!("relay: risposta inattesa da {peer}: {other:?}");
-                                        false
-                                    }
-                                };
-                            log::info!("relay: risposta da {peer} delivered={delivered}");
-                            if !delivered {
-                                for offer in new_emoticon_offers(&message.emoticons, target, &mut shared_emoticons, &triggers, &args.emotes, &events) {
-                                    deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, target, ChatEvent::EmoticonOffer(offer));
-                                }
-                                deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, target, ChatEvent::Text(message));
-                            }
-                            return Ok(LoopFlow::Continue);
-                        }
-                        let (expected_peer, key, pairing) = match pending {
-                            PendingDeviceRequest::Pair { peer, key } => (peer, key, true),
-                            PendingDeviceRequest::Sync { peer } => (peer, account_key, false),
-                            PendingDeviceRequest::Relay { .. } => return Ok(LoopFlow::Continue),
-                        };
-                        if expected_peer != peer {
-                            return Ok(LoopFlow::Continue);
-                        }
-                        match devices::open::<DeviceResponse>(&key, &response) {
-                            Ok(DeviceResponse::Paired { account_key: linked_key, devices: linked, records, latest_seq, accepted_through }) if pairing => {
-                                if let Some(store) = &args.account_key_store {
-                                    store(linked_key).map_err(|error| format!("account collegato ma non salvabile: {error}"))?;
-                                }
-                                account_key = linked_key;
-                                // Adottato l'account del dispositivo che ci ha
-                                // collegati: da ora firmiamo le presence con la
-                                // sua identità, così i suoi contatti ci
-                                // riconoscono senza approvarci di nuovo.
-                                account_identity = AccountIdentity::from_account_key(&account_key)?;
-                                account_proof = account_identity.proof(local_peer_id).ok();
-                                pending_pair_targets.remove(&peer);
-                                if history.contacts()?.iter().any(|contact| contact.peer == local_peer_id.to_string()) {
-                                    history.delete_contact(&local_peer_id.to_string())?;
-                                }
-                                for device in linked {
-                                    if device.peer_id == local_peer_id.to_string() {
-                                        continue;
-                                    }
-                                    if let Ok(device_peer) = device.peer_id.parse::<PeerId>() {
-                                        let entry = device_entry(&device, now_ms());
-                                        history.save_device(&entry)?;
-                                        known_devices.insert(device_peer, entry);
-                                        peers.remove(&device_peer);
-                                        sessions.remove(&device_peer);
-                                        known_contacts.remove(&device_peer);
-                                        peer_names.remove(&device_peer);
-                                        if history.contacts()?.iter().any(|contact| contact.peer == device_peer.to_string()) {
-                                            history.delete_contact(&device_peer.to_string())?;
-                                        }
-                                    }
-                                }
-                                online_devices.insert(peer);
-                                let applied = history.apply_sync_records(&records)?;
-                                let received_through = records.last().map_or(0, |record| record.seq);
-                                history.update_sync_cursors(&peer.to_string(), received_through, accepted_through)?;
-                                refresh_synced_state(&history, &mut known_contacts, &mut ignored_contacts, &mut peer_names, &mut contact_devices, &peers, &sessions, &events)?;
-                                send_group_chats(&history.group_chats()?, &events);
-                                send_devices(&known_devices, &online_devices, &events);
-                                connect_synced_peers(&history, &known_devices, local_peer_id, &mut SyncConnections { swarm: &mut swarm, online_contacts: &peers, online_devices: &online_devices, dialing: &mut dialing, bootstrap_fallbacks: &mut bootstrap_fallbacks, fallback_planner: &mut fallback_planner, pending_dht: &mut pending_dht })?;
-                                let _ = events.send(ClientEvent::DeviceSynchronized { peer_id: peer.to_string(), applied: applied.applied, paired: true });
-                                // Ri-annuncia la presence firmata ai contatti
-                                // raggiungibili: è così che imparano il legame
-                                // fra la persona e il suo account.
-                                for contact_peer in peers.iter().copied().collect::<Vec<_>>() {
-                                    send_event(&mut swarm, &mut sessions, &contact_devices, contact_peer, local_peer_id, &mut sent_numbers, ChatEvent::Presence(presence_update(&display_name, &presence_status, true, &account_proof)));
-                                }
-                                if received_through < latest_seq || accepted_through < history.latest_sync_seq()? {
-                                    let descriptor = local_device_descriptor(local_peer_id, &display_name, contact_addresses(&swarm, &args.relays, local_peer_id));
-                                    send_device_sync(&mut swarm, &history, &account_key, &mut pending_device_requests, peer, descriptor)?;
-                                }
-                            }
-                            Ok(DeviceResponse::Synced { records, latest_seq, accepted_through }) if !pairing => {
-                                let applied = history.apply_sync_records(&records)?;
-                                let received_through = records.last().map_or_else(
-                                    || history.sync_cursors(&peer.to_string()).map(|cursor| cursor.0).unwrap_or_default(),
-                                    |record| record.seq,
-                                );
-                                history.update_sync_cursors(&peer.to_string(), received_through, accepted_through)?;
-                                refresh_synced_state(&history, &mut known_contacts, &mut ignored_contacts, &mut peer_names, &mut contact_devices, &peers, &sessions, &events)?;
-                                send_group_chats(&history.group_chats()?, &events);
-                                connect_synced_peers(&history, &known_devices, local_peer_id, &mut SyncConnections { swarm: &mut swarm, online_contacts: &peers, online_devices: &online_devices, dialing: &mut dialing, bootstrap_fallbacks: &mut bootstrap_fallbacks, fallback_planner: &mut fallback_planner, pending_dht: &mut pending_dht })?;
-                                let _ = events.send(ClientEvent::DeviceSynchronized { peer_id: peer.to_string(), applied: applied.applied, paired: false });
-                                if received_through < latest_seq || accepted_through < history.latest_sync_seq()? {
-                                    let descriptor = local_device_descriptor(local_peer_id, &display_name, contact_addresses(&swarm, &args.relays, local_peer_id));
-                                    send_device_sync(&mut swarm, &history, &account_key, &mut pending_device_requests, peer, descriptor)?;
-                                }
-                            }
-                            Ok(DeviceResponse::Rejected(message)) => {
-                                let _ = events.send(ClientEvent::Error { message });
-                            }
-                            _ => {
-                                let _ = events.send(ClientEvent::Error { message: "risposta dispositivo non valida".into() });
-                            }
-                        }
-                    }
-                },
-                SwarmEvent::Behaviour(BehaviourEvent::Devices(request_response::Event::OutboundFailure { peer, request_id, error, .. })) => {
-                    if let Some(PendingDeviceRequest::Relay { target, message, .. }) = pending_device_requests.remove(&request_id) {
-                        // Relay non riuscito: il messaggio torna nella coda diretta.
-                        log::warn!("relay tramite {peer} fallito: {error}");
-                        for offer in new_emoticon_offers(&message.emoticons, target, &mut shared_emoticons, &triggers, &args.emotes, &events) {
-                            deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, target, ChatEvent::EmoticonOffer(offer));
-                        }
-                        deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, target, ChatEvent::Text(message));
-                        return Ok(LoopFlow::Continue);
-                    }
-                    let _ = events.send(ClientEvent::Error { message: format!("sincronizzazione con {peer} fallita: {error}") });
-                }
-                SwarmEvent::Behaviour(BehaviourEvent::Devices(request_response::Event::InboundFailure { peer, error, .. })) => {
-                    log::warn!("sincronizzazione non ricevibile da {peer}: {error}");
-                }
-                SwarmEvent::Behaviour(BehaviourEvent::Devices(request_response::Event::ResponseSent { .. })) => {}
-                SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
-                    for address in info.listen_addrs {
-                        let address = match split_peer_address(&address) {
-                            Ok((address_peer, base)) if address_peer == peer_id => base,
-                            Ok(_) => continue,
-                            Err(_) => address,
-                        };
-                        swarm.behaviour_mut().kad.add_address(&peer_id, address);
-                    }
-                    swarm.add_external_address(info.observed_addr);
-                }
-                SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { id, step, .. })) if step.last => {
-                    if let Some(peer) = pending_dht.remove(&id) {
-                        let recovery = fallback_planner.after_dht(peer);
-                        execute_recovery(&mut swarm, &mut pending_dht, &mut fallback_planner, peer, recovery);
-                    }
-                }
-                SwarmEvent::Behaviour(BehaviourEvent::Autonat(autonat::Event::StatusChanged { new, .. })) => {
-                    log::info!("raggiungibilità: {new:?}");
-                    log::info!("raggiungibilità (autonat): {new:?}");
-                }
-                SwarmEvent::Behaviour(BehaviourEvent::RelayClient(event)) => {
-                    log::info!("relay client: {event:?}");
-                    log::info!("relay client: {event:?}");
-                }
-                SwarmEvent::Behaviour(BehaviourEvent::RelayServer(event)) => {
-                    log::info!("relay server: {event:?}");
-                }
-                SwarmEvent::Behaviour(BehaviourEvent::Dcutr(event)) => {
-                    log::info!("hole punching: {event:?}");
-                }
-                SwarmEvent::Behaviour(BehaviourEvent::Ping(_)) => {}
-                SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(discovered))) => {
-                    for (peer_id, address) in discovered {
-                        let base = split_peer_address(&address)
-                            .map(|(_, base)| base)
-                            .unwrap_or(address);
-                        swarm.behaviour_mut().kad.add_address(&peer_id, base.clone());
-                        let is_device = known_devices.contains_key(&peer_id)
-                            || pending_pair_targets.contains_key(&peer_id);
-                        // Privacy: sulla LAN ci si connette solo ai device in
-                        // pairing e ai contatti GIÀ noti. Mai auto-aggiungere o
-                        // dialare uno sconosciuto trovato via mDNS: la presence
-                        // scambiata lo trasformerebbe in contatto senza consenso.
-                        if !args.relay_server
-                            && peer_id != local_peer_id
-                            && !infrastructure_peers.contains(&peer_id)
-                            && (is_device || known_contacts.contains(&peer_id))
-                            && if is_device {
-                                !online_devices.contains(&peer_id)
+                            // Le emoticon arrivano dal dispositivo mittente insieme
+                            // al testo: le sue emoticon personalizzate qui potrebbero
+                            // non esistere. Un mittente vecchio non le manda, e si
+                            // usano i trigger locali come prima.
+                            let emoticons = if emoticons.is_empty() {
+                                resolve_emoticons(&text, triggers).unwrap_or_default()
                             } else {
-                                !peers.contains(&peer_id)
+                                emoticons
+                            };
+                            let message = TextMessage {
+                                text: text.clone(),
+                                emoticons,
+                                id,
+                            };
+                            let delivered = match parsed {
+                                Some(target_peer)
+                                    if known_contacts.contains(&target_peer)
+                                        && validate_text_message(&message).is_ok() =>
+                                {
+                                    for offer in offers {
+                                        let asset_id = offer.metadata.asset_id;
+                                        if message
+                                            .emoticons
+                                            .iter()
+                                            .any(|span| span.asset_id == asset_id)
+                                            && shared_emoticons.insert((target_peer, asset_id))
+                                        {
+                                            deliver_event(
+                                                swarm,
+                                                sessions,
+                                                contact_devices,
+                                                sent_numbers,
+                                                pending_messages,
+                                                outbox,
+                                                pending_handshakes,
+                                                local_peer_id,
+                                                target_peer,
+                                                ChatEvent::EmoticonOffer(offer),
+                                            );
+                                        }
+                                    }
+                                    for offer in new_emoticon_offers(
+                                        &message.emoticons,
+                                        target_peer,
+                                        shared_emoticons,
+                                        triggers,
+                                        &args.emotes,
+                                        events,
+                                    ) {
+                                        deliver_event(
+                                            swarm,
+                                            sessions,
+                                            contact_devices,
+                                            sent_numbers,
+                                            pending_messages,
+                                            outbox,
+                                            pending_handshakes,
+                                            local_peer_id,
+                                            target_peer,
+                                            ChatEvent::EmoticonOffer(offer),
+                                        );
+                                    }
+                                    deliver_event(
+                                        swarm,
+                                        sessions,
+                                        contact_devices,
+                                        sent_numbers,
+                                        pending_messages,
+                                        outbox,
+                                        pending_handshakes,
+                                        local_peer_id,
+                                        target_peer,
+                                        ChatEvent::Text(message.clone()),
+                                    );
+                                    record_text(history, &target_peer, "out", &message);
+                                    let _ = events.send(ClientEvent::Message {
+                                        message: ClientMessage {
+                                            peer_id: target_peer.to_string(),
+                                            direction: "out".into(),
+                                            kind: "text".into(),
+                                            body: text,
+                                            timestamp_ms: now_ms(),
+                                            emoticons: client_emoticon_spans(&message),
+                                            attachment_id: None,
+                                            attachment_mime: None,
+                                            event_id: Some(hex_group_id(&id)),
+                                            relayed: false,
+                                        },
+                                    });
+                                    true
+                                }
+                                _ => false,
+                            };
+                            log::info!("relay: consegna a {target} delivered={delivered}");
+                            devices::seal(&key, &DeviceResponse::RelayResult { id, delivered })?
+                        }
+                        _ => devices::seal(
+                            &key,
+                            &DeviceResponse::Rejected("richiesta dispositivo non valida".into()),
+                        )?,
+                    },
+                    None => devices::seal(
+                        &[0u8; 32],
+                        &DeviceResponse::Rejected("codice non riconosciuto".into()),
+                    )?,
+                };
+                swarm
+                    .behaviour_mut()
+                    .devices
+                    .send_response(channel, response)
+                    .ok();
+            }
+            request_response::Message::Response {
+                request_id,
+                response,
+            } => {
+                let Some(pending) = pending_device_requests.remove(&request_id) else {
+                    return Ok(LoopFlow::Continue);
+                };
+                // Il messaggio è già mostrato e verrà sincronizzato dal
+                // dispositivo che l'ha inoltrato. Se invece il dispositivo non
+                // ha potuto consegnarlo torna nella coda diretta: parte appena
+                // abbiamo una sessione col contatto.
+                if let PendingDeviceRequest::Relay {
+                    peer: relay_peer,
+                    target,
+                    message,
+                } = pending
+                {
+                    let delivered = relay_peer == peer
+                        && match devices::open::<DeviceResponse>(account_key, &response) {
+                            Ok(DeviceResponse::RelayResult { delivered, .. }) => delivered,
+                            other => {
+                                log::warn!("relay: risposta inattesa da {peer}: {other:?}");
+                                false
                             }
-                            && mdns_dialing.insert(peer_id)
+                        };
+                    log::info!("relay: risposta da {peer} delivered={delivered}");
+                    if !delivered {
+                        for offer in new_emoticon_offers(
+                            &message.emoticons,
+                            target,
+                            shared_emoticons,
+                            triggers,
+                            &args.emotes,
+                            events,
+                        ) {
+                            deliver_event(
+                                swarm,
+                                sessions,
+                                contact_devices,
+                                sent_numbers,
+                                pending_messages,
+                                outbox,
+                                pending_handshakes,
+                                local_peer_id,
+                                target,
+                                ChatEvent::EmoticonOffer(offer),
+                            );
+                        }
+                        deliver_event(
+                            swarm,
+                            sessions,
+                            contact_devices,
+                            sent_numbers,
+                            pending_messages,
+                            outbox,
+                            pending_handshakes,
+                            local_peer_id,
+                            target,
+                            ChatEvent::Text(message),
+                        );
+                    }
+                    return Ok(LoopFlow::Continue);
+                }
+                let (expected_peer, key, pairing) = match pending {
+                    PendingDeviceRequest::Pair { peer, key } => (peer, key, true),
+                    PendingDeviceRequest::Sync { peer } => (peer, *account_key, false),
+                    PendingDeviceRequest::Relay { .. } => return Ok(LoopFlow::Continue),
+                };
+                if expected_peer != peer {
+                    return Ok(LoopFlow::Continue);
+                }
+                match devices::open::<DeviceResponse>(&key, &response) {
+                    Ok(DeviceResponse::Paired {
+                        account_key: linked_key,
+                        devices: linked,
+                        records,
+                        latest_seq,
+                        accepted_through,
+                    }) if pairing => {
+                        if let Some(store) = &args.account_key_store {
+                            store(linked_key).map_err(|error| {
+                                format!("account collegato ma non salvabile: {error}")
+                            })?;
+                        }
+                        *account_key = linked_key;
+                        // Adottato l'account del dispositivo che ci ha
+                        // collegati: da ora firmiamo le presence con la
+                        // sua identità, così i suoi contatti ci
+                        // riconoscono senza approvarci di nuovo.
+                        *account_identity = AccountIdentity::from_account_key(account_key)?;
+                        *account_proof = account_identity.proof(local_peer_id).ok();
+                        pending_pair_targets.remove(&peer);
+                        if history
+                            .contacts()?
+                            .iter()
+                            .any(|contact| contact.peer == local_peer_id.to_string())
                         {
-                            dialing.insert(peer_id);
-                            log::info!("peer LAN trovato: {peer_id}");
-                            let address = base.with(Protocol::P2p(peer_id));
-                            let options = DialOpts::peer_id(peer_id)
-                                .condition(PeerCondition::Always)
-                                .addresses(vec![address])
-                                .build();
-                            if let Err(error) = swarm.dial(options) {
-                                log::warn!("dial mDNS fallito: {error}");
+                            history.delete_contact(&local_peer_id.to_string())?;
+                        }
+                        for device in linked {
+                            if device.peer_id == local_peer_id.to_string() {
+                                continue;
                             }
+                            if let Ok(device_peer) = device.peer_id.parse::<PeerId>() {
+                                let entry = device_entry(&device, now_ms());
+                                history.save_device(&entry)?;
+                                known_devices.insert(device_peer, entry);
+                                peers.remove(&device_peer);
+                                sessions.remove(&device_peer);
+                                known_contacts.remove(&device_peer);
+                                peer_names.remove(&device_peer);
+                                if history
+                                    .contacts()?
+                                    .iter()
+                                    .any(|contact| contact.peer == device_peer.to_string())
+                                {
+                                    history.delete_contact(&device_peer.to_string())?;
+                                }
+                            }
+                        }
+                        online_devices.insert(peer);
+                        let applied = history.apply_sync_records(&records)?;
+                        let received_through = records.last().map_or(0, |record| record.seq);
+                        history.update_sync_cursors(
+                            &peer.to_string(),
+                            received_through,
+                            accepted_through,
+                        )?;
+                        refresh_synced_state(
+                            history,
+                            known_contacts,
+                            ignored_contacts,
+                            peer_names,
+                            contact_devices,
+                            peers,
+                            sessions,
+                            events,
+                        )?;
+                        send_group_chats(&history.group_chats()?, events);
+                        send_devices(known_devices, online_devices, events);
+                        connect_synced_peers(
+                            history,
+                            known_devices,
+                            local_peer_id,
+                            &mut SyncConnections {
+                                swarm,
+                                online_contacts: peers,
+                                online_devices,
+                                dialing,
+                                bootstrap_fallbacks,
+                                fallback_planner,
+                                pending_dht,
+                            },
+                        )?;
+                        let _ = events.send(ClientEvent::DeviceSynchronized {
+                            peer_id: peer.to_string(),
+                            applied: applied.applied,
+                            paired: true,
+                        });
+                        // Ri-annuncia la presence firmata ai contatti
+                        // raggiungibili: è così che imparano il legame
+                        // fra la persona e il suo account.
+                        for contact_peer in peers.iter().copied().collect::<Vec<_>>() {
+                            send_event(
+                                swarm,
+                                sessions,
+                                contact_devices,
+                                contact_peer,
+                                local_peer_id,
+                                sent_numbers,
+                                ChatEvent::Presence(presence_update(
+                                    display_name,
+                                    presence_status,
+                                    true,
+                                    account_proof,
+                                )),
+                            );
+                        }
+                        if received_through < latest_seq
+                            || accepted_through < history.latest_sync_seq()?
+                        {
+                            let descriptor = local_device_descriptor(
+                                local_peer_id,
+                                display_name,
+                                contact_addresses(swarm, &args.relays, local_peer_id),
+                            );
+                            send_device_sync(
+                                swarm,
+                                history,
+                                account_key,
+                                pending_device_requests,
+                                peer,
+                                descriptor,
+                            )?;
                         }
                     }
-                }
-                SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Expired(_))) => {}
-                SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                    if let Some(peer_id) = peer_id {
-                        mdns_dialing.remove(&peer_id);
-                        if peers.contains(&peer_id) || online_devices.contains(&peer_id) {
-                            log::warn!("dial duplicato ignorato per peer già connesso: {peer_id}");
-                        } else if let Some(address) = bootstrap_fallbacks.get_mut(&peer_id).and_then(VecDeque::pop_front) {
-                            log::warn!("bootstrap fallito, provo il prossimo indirizzo: {error}");
-                            if let Err(next_error) = swarm.dial(address) { log::warn!("indirizzo non raggiungibile: {next_error}"); }
-                        } else {
-                            dialing.remove(&peer_id);
-                            log::warn!("connessione fallita: {error}");
-                            log::warn!("connessione fallita: {error}");
-                            if pending_pair_targets.contains_key(&peer_id) {
-                                let _ = events.send(ClientEvent::Error {
-                                    message: "l'altro dispositivo non è raggiungibile; verifica che sia online e che il codice non sia scaduto".into(),
-                                });
-                            }
-                            if known_contacts.contains(&peer_id) || known_devices.contains_key(&peer_id) {
-                                let recovery = fallback_planner.after_failure(peer_id);
-                                execute_recovery(&mut swarm, &mut pending_dht, &mut fallback_planner, peer_id, recovery);
-                                schedule_reconnect(
-                                    peer_id,
-                                    &mut reconnect_at,
-                                    &mut reconnect_attempts,
-                                );
-                            }
+                    Ok(DeviceResponse::Synced {
+                        records,
+                        latest_seq,
+                        accepted_through,
+                    }) if !pairing => {
+                        let applied = history.apply_sync_records(&records)?;
+                        let received_through = records.last().map_or_else(
+                            || {
+                                history
+                                    .sync_cursors(&peer.to_string())
+                                    .map(|cursor| cursor.0)
+                                    .unwrap_or_default()
+                            },
+                            |record| record.seq,
+                        );
+                        history.update_sync_cursors(
+                            &peer.to_string(),
+                            received_through,
+                            accepted_through,
+                        )?;
+                        refresh_synced_state(
+                            history,
+                            known_contacts,
+                            ignored_contacts,
+                            peer_names,
+                            contact_devices,
+                            peers,
+                            sessions,
+                            events,
+                        )?;
+                        send_group_chats(&history.group_chats()?, events);
+                        connect_synced_peers(
+                            history,
+                            known_devices,
+                            local_peer_id,
+                            &mut SyncConnections {
+                                swarm,
+                                online_contacts: peers,
+                                online_devices,
+                                dialing,
+                                bootstrap_fallbacks,
+                                fallback_planner,
+                                pending_dht,
+                            },
+                        )?;
+                        let _ = events.send(ClientEvent::DeviceSynchronized {
+                            peer_id: peer.to_string(),
+                            applied: applied.applied,
+                            paired: false,
+                        });
+                        if received_through < latest_seq
+                            || accepted_through < history.latest_sync_seq()?
+                        {
+                            let descriptor = local_device_descriptor(
+                                local_peer_id,
+                                display_name,
+                                contact_addresses(swarm, &args.relays, local_peer_id),
+                            );
+                            send_device_sync(
+                                swarm,
+                                history,
+                                account_key,
+                                pending_device_requests,
+                                peer,
+                                descriptor,
+                            )?;
                         }
-                    } else { log::warn!("connessione fallita: {error}"); }
+                    }
+                    Ok(DeviceResponse::Rejected(message)) => {
+                        let _ = events.send(ClientEvent::Error { message });
+                    }
+                    _ => {
+                        let _ = events.send(ClientEvent::Error {
+                            message: "risposta dispositivo non valida".into(),
+                        });
+                    }
                 }
-                _ => {}
             }
         }
         Ok(LoopFlow::Continue)
-        }
-        .await;
-        match step {
-            Ok(LoopFlow::Continue) => {}
-            Ok(LoopFlow::Stop) => break,
-            Err(error) => report_loop_error(&events, error.as_ref()),
-        }
     }
-    Ok(())
+
+    fn on_link_command(&mut self, command: ClientCommand) -> Result<LoopFlow, Box<dyn Error>> {
+        let Node {
+            ml_dsa_identity,
+            contact_identity,
+            history,
+            ignored_contacts,
+            local_peer_id,
+            swarm,
+            display_name,
+            dialing,
+            bootstrap_fallbacks,
+            known_contacts,
+            fallback_planner,
+            pending_dht,
+            peer_names,
+            contact_link_requested,
+            device_link_requested,
+            pending_pairings,
+            pending_pair_targets,
+            pending_device_requests,
+            args,
+            events,
+            ..
+        } = self;
+        let local_peer_id = *local_peer_id;
+        match command {
+            ClientCommand::RequestContactLink => {
+                *contact_link_requested = true;
+                let addresses = contact_addresses(swarm, &args.relays, local_peer_id);
+                if !addresses.is_empty() {
+                    let links = contacts::share_links(
+                        display_name,
+                        local_peer_id,
+                        contact_identity,
+                        ml_dsa_identity,
+                        addresses,
+                    );
+                    match links {
+                        Ok((link, qr_link)) => {
+                            *contact_link_requested = false;
+                            let _ = events.send(ClientEvent::ContactLink { link, qr_link });
+                        }
+                        Err(error) => {
+                            let _ = events.send(ClientEvent::Error {
+                                message: error.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            ClientCommand::RequestDeviceLink => {
+                *device_link_requested = true;
+                let addresses = contact_addresses(swarm, &args.relays, local_peer_id);
+                if !addresses.is_empty() {
+                    let descriptor =
+                        local_device_descriptor(local_peer_id, display_name, addresses);
+                    match devices::create_pairing_link(descriptor, now_ms()) {
+                        Ok((link, pairing)) => {
+                            *device_link_requested = false;
+                            pending_pairings.insert(
+                                devices::key_id(&pairing.secret),
+                                PendingPairing {
+                                    secret: pairing.secret,
+                                    expires_at_ms: pairing.expires_at_ms,
+                                },
+                            );
+                            let _ = events.send(ClientEvent::DeviceLink {
+                                qr_link: link.clone(),
+                                link,
+                                expires_at_ms: pairing.expires_at_ms,
+                            });
+                        }
+                        Err(error) => {
+                            let _ = events.send(ClientEvent::Error {
+                                message: error.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            ClientCommand::ImportDeviceLink { link } => {
+                match devices::parse_pairing_link(&link, now_ms()) {
+                    Ok(pairing) => {
+                        let peer = pairing.inviter.peer_id.parse::<PeerId>()?;
+                        if peer == local_peer_id {
+                            let _ = events.send(ClientEvent::Error {
+                                message: "non puoi collegare il dispositivo a se stesso".into(),
+                            });
+                            return Ok(LoopFlow::Continue);
+                        }
+                        let addresses = pairing
+                            .inviter
+                            .addresses
+                            .iter()
+                            .map(|address| address.parse::<Multiaddr>())
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let secret = pairing.secret;
+                        pending_pair_targets.insert(peer, pairing);
+                        if swarm.is_connected(&peer) {
+                            let descriptor = local_device_descriptor(
+                                local_peer_id,
+                                display_name,
+                                contact_addresses(swarm, &args.relays, local_peer_id),
+                            );
+                            let records =
+                                history.sync_records_since(0, devices::MAX_SYNC_RECORDS)?;
+                            let request = DeviceRequest::Pair {
+                                device: descriptor,
+                                records,
+                            };
+                            let sealed = devices::seal(&secret, &request)?;
+                            let request_id =
+                                swarm.behaviour_mut().devices.send_request(&peer, sealed);
+                            pending_device_requests.insert(
+                                request_id,
+                                PendingDeviceRequest::Pair { peer, key: secret },
+                            );
+                        } else {
+                            connect_contact(
+                                swarm,
+                                peer,
+                                addresses,
+                                dialing,
+                                bootstrap_fallbacks,
+                                fallback_planner,
+                                pending_dht,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        let _ = events.send(ClientEvent::Error {
+                            message: error.to_string(),
+                        });
+                    }
+                }
+            }
+            ClientCommand::ImportContactLink { link } => match contacts::import_link(&link) {
+                Ok((name, peer_id, addresses)) => {
+                    history.allow_contact(&peer_id.to_string())?;
+                    ignored_contacts.remove(&peer_id);
+                    history.save_contact(&peer_id.to_string(), &name, &link, now_ms())?;
+                    peer_names.insert(peer_id, name.clone());
+                    known_contacts.insert(peer_id);
+                    let _ = events.send(ClientEvent::ContactUpdated {
+                        contact: ClientContact {
+                            peer_id: peer_id.to_string(),
+                            name,
+                            online: false,
+                            secure: false,
+                            fingerprint: peer_fingerprint(peer_id),
+                        },
+                    });
+                    connect_contact(
+                        swarm,
+                        peer_id,
+                        addresses,
+                        dialing,
+                        bootstrap_fallbacks,
+                        fallback_planner,
+                        pending_dht,
+                    );
+                }
+                Err(error) => {
+                    let _ = events.send(ClientEvent::Error {
+                        message: error.to_string(),
+                    });
+                }
+            },
+            _ => {}
+        }
+        Ok(LoopFlow::Continue)
+    }
+
+    fn on_message_command(&mut self, command: ClientCommand) -> Result<LoopFlow, Box<dyn Error>> {
+        let Node {
+            account_key,
+            history,
+            local_peer_id,
+            swarm,
+            peers,
+            contact_devices,
+            triggers,
+            nudge_limits,
+            sent_numbers,
+            pending_handshakes,
+            outbox,
+            pending_messages,
+            sessions,
+            shared_emoticons,
+            prepared_files_tx,
+            nudge_counter,
+            pending_device_requests,
+            online_devices,
+            args,
+            events,
+            ..
+        } = self;
+        let local_peer_id = *local_peer_id;
+        let account_key = *account_key;
+        match command {
+            ClientCommand::SendText { peer, text } => {
+                if let Err(message) = check_outgoing_text(&text) {
+                    let _ = events.send(ClientEvent::Error { message });
+                    return Ok(LoopFlow::Continue);
+                }
+                let emoticons = resolve_emoticons(&text, triggers)
+                    .map_err(|error| format!("trigger emoticon non valido: {error:?}"))?;
+                let mut message_id = [0u8; 16];
+                OsRng.fill_bytes(&mut message_id);
+                let message = TextMessage {
+                    text: text.clone(),
+                    emoticons,
+                    id: message_id,
+                };
+                let client_emoticons = client_emoticon_spans(&message);
+                // Contatto non connesso ma un mio dispositivo collegato è online:
+                // gli chiedo di consegnare il messaggio (relay). Uno solo, così il
+                // contatto non riceve doppioni; se il relay fallisce il messaggio
+                // torna nella coda diretta. Con il contatto connesso e l'handshake
+                // ancora in corso si aspetta la sessione diretta, che arriva a breve.
+                let relay_device = if contact_devices.online(peer, peers) {
+                    None
+                } else {
+                    online_devices.iter().min().copied()
+                };
+                let relayed = relay_device.is_some_and(|device| {
+                    log::info!("relay: chiedo a {device} di consegnare a {peer}");
+                    let offers = relay_emoticon_offers(&message.emoticons, triggers, &args.emotes);
+                    send_relay_text(
+                        swarm,
+                        &account_key,
+                        pending_device_requests,
+                        device,
+                        peer,
+                        message.clone(),
+                        offers,
+                    )
+                    .inspect_err(|error| log::warn!("relay verso dispositivo fallito: {error}"))
+                    .is_ok()
+                });
+                if !relayed {
+                    // Le emoticon partono prima del testo e con la stessa
+                    // consegna affidabile: il destinatario le ha quando lo legge.
+                    for offer in new_emoticon_offers(
+                        &message.emoticons,
+                        peer,
+                        shared_emoticons,
+                        triggers,
+                        &args.emotes,
+                        events,
+                    ) {
+                        deliver_event(
+                            swarm,
+                            sessions,
+                            contact_devices,
+                            sent_numbers,
+                            pending_messages,
+                            outbox,
+                            pending_handshakes,
+                            local_peer_id,
+                            peer,
+                            ChatEvent::EmoticonOffer(offer),
+                        );
+                    }
+                    deliver_event(
+                        swarm,
+                        sessions,
+                        contact_devices,
+                        sent_numbers,
+                        pending_messages,
+                        outbox,
+                        pending_handshakes,
+                        local_peer_id,
+                        peer,
+                        ChatEvent::Text(message.clone()),
+                    );
+                }
+                record_text(history, &peer, "out", &message);
+                let _ = events.send(ClientEvent::Message {
+                    message: ClientMessage {
+                        peer_id: peer.to_string(),
+                        direction: "out".into(),
+                        kind: "text".into(),
+                        body: text,
+                        timestamp_ms: now_ms(),
+                        emoticons: client_emoticons,
+                        attachment_id: None,
+                        attachment_mime: None,
+                        event_id: Some(hex_group_id(&message_id)),
+                        relayed,
+                    },
+                });
+            }
+            ClientCommand::SendNudge { peer } => {
+                // Prima la connessione, poi il limite: un trillo che non può
+                // partire non deve consumare il rate limit.
+                if !contact_devices.online(peer, peers) {
+                    let _ = events.send(ClientEvent::Error {
+                        message: "contatto non collegato".into(),
+                    });
+                    return Ok(LoopFlow::Continue);
+                }
+                let timestamp_ms = now_ms();
+                if let Err(wait_ms) = nudge_limits
+                    .entry(peer)
+                    .or_default()
+                    .try_acquire(timestamp_ms)
+                {
+                    let _ = events.send(ClientEvent::Error {
+                        message: format!(
+                            "trillo limitato: riprova tra {}s",
+                            wait_ms.div_ceil(1_000)
+                        ),
+                    });
+                    return Ok(LoopFlow::Continue);
+                }
+                *nudge_counter += 1;
+                let mut id = [0; 16];
+                id[..8].copy_from_slice(&timestamp_ms.to_be_bytes());
+                id[8..].copy_from_slice(&nudge_counter.to_be_bytes());
+                deliver_event(
+                    swarm,
+                    sessions,
+                    contact_devices,
+                    sent_numbers,
+                    pending_messages,
+                    outbox,
+                    pending_handshakes,
+                    local_peer_id,
+                    peer,
+                    ChatEvent::Nudge(Nudge {
+                        id,
+                        intensity: 1,
+                        timestamp_ms,
+                    }),
+                );
+                record(history, &peer, "out", "nudge", "trillo");
+                let _ = events.send(ClientEvent::Message {
+                    message: ClientMessage {
+                        peer_id: peer.to_string(),
+                        direction: "out".into(),
+                        kind: "nudge".into(),
+                        body: "trillo".into(),
+                        timestamp_ms,
+                        emoticons: Vec::new(),
+                        attachment_id: None,
+                        attachment_mime: None,
+                        event_id: None,
+                        relayed: false,
+                    },
+                });
+            }
+            ClientCommand::SendFile { peer, path } => {
+                if !contact_devices.online(peer, peers) {
+                    let _ = events.send(ClientEvent::Error {
+                        message: "contatto non collegato".into(),
+                    });
+                    return Ok(LoopFlow::Continue);
+                }
+                // L'hash di un file fino a 5 GB richiede minuti: lo calcola un
+                // thread a parte e l'offerta parte quando è pronto. Intanto il
+                // loop continua a gestire messaggi, ping e handshake.
+                prepare_file(prepared_files_tx, FileTarget::Peer(peer), path);
+            }
+            ClientCommand::DeleteMessageForMe { event_id } => {
+                if let Err(error) = history.delete_event(&event_id, now_ms()) {
+                    let _ = events.send(ClientEvent::Error {
+                        message: error.to_string(),
+                    });
+                }
+            }
+            ClientCommand::DeleteMessageForEveryone { peer, event_id } => {
+                const DELETE_WINDOW_MS: u64 = 15 * 60 * 1000;
+                // Solo un mio messaggio (direction "out") verso questo peer e
+                // dentro la finestra può essere cancellato per tutti.
+                match history.event_meta(&event_id) {
+                    Ok(Some((stored_peer, direction, timestamp_ms))) => {
+                        if stored_peer != peer.to_string() || direction != "out" {
+                            let _ = events.send(ClientEvent::Error {
+                                message: "puoi cancellare per tutti solo i tuoi messaggi".into(),
+                            });
+                        } else if now_ms().saturating_sub(timestamp_ms) > DELETE_WINDOW_MS {
+                            let _ = events.send(ClientEvent::Error {
+                                message: "tempo scaduto per la cancellazione per tutti".into(),
+                            });
+                        } else if let Some(id) = parse_message_id(&event_id) {
+                            // Come i messaggi: in coda se il contatto è offline,
+                            // con retry e avviso se non arriva.
+                            deliver_event(
+                                swarm,
+                                sessions,
+                                contact_devices,
+                                sent_numbers,
+                                pending_messages,
+                                outbox,
+                                pending_handshakes,
+                                local_peer_id,
+                                peer,
+                                ChatEvent::DeleteMessage(DeleteRequest { id, group_id: None }),
+                            );
+                            if let Err(error) = history.tombstone_event(&event_id, now_ms()) {
+                                let _ = events.send(ClientEvent::Error {
+                                    message: error.to_string(),
+                                });
+                            } else {
+                                let _ = events.send(ClientEvent::MessageDeleted {
+                                    peer_id: peer.to_string(),
+                                    event_id,
+                                });
+                            }
+                        } else {
+                            let _ = events.send(ClientEvent::Error {
+                                message: "id messaggio non valido".into(),
+                            });
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = events.send(ClientEvent::Error {
+                            message: "messaggio non trovato".into(),
+                        });
+                    }
+                    Err(error) => {
+                        let _ = events.send(ClientEvent::Error {
+                            message: error.to_string(),
+                        });
+                    }
+                }
+            }
+            ClientCommand::LoadOlderMessages {
+                peer,
+                before_event_id,
+            } => {
+                let messages =
+                    conversation_page(history, &peer.to_string(), Some(&before_event_id))?;
+                let _ = events.send(ClientEvent::OlderMessagesLoaded {
+                    peer_id: peer.to_string(),
+                    has_more: messages.len() == HISTORY_PAGE,
+                    messages,
+                });
+            }
+            _ => {}
+        }
+        Ok(LoopFlow::Continue)
+    }
+
+    fn on_emoticon_command(&mut self, command: ClientCommand) -> Result<LoopFlow, Box<dyn Error>> {
+        let Node {
+            triggers,
+            pending_emoticons,
+            args,
+            events,
+            ..
+        } = self;
+        match command {
+            ClientCommand::CreateEmoticon { path, trigger } => {
+                match create_emoticon(&path, &trigger, &args.emotes, triggers) {
+                    Ok(offer) => {
+                        let trigger = offer
+                            .metadata
+                            .suggested_triggers
+                            .first()
+                            .cloned()
+                            .unwrap_or_default();
+                        let _ = events.send(ClientEvent::EmoticonCatalog {
+                            emoticons: vec![client_emoticon(&offer, &trigger, true)],
+                        });
+                    }
+                    Err(error) => {
+                        let _ = events.send(ClientEvent::Error {
+                            message: format!("emoticon non creata: {error}"),
+                        });
+                    }
+                }
+            }
+            ClientCommand::SaveEmoticon { asset_id, trigger } => {
+                let parsed = blake3::Hash::from_hex(&asset_id)
+                    .map(|hash| *hash.as_bytes())
+                    .map_err(|error| format!("id emoticon non valido: {error}"));
+                match parsed.and_then(|asset_id| {
+                    pending_emoticons
+                        .get(&asset_id)
+                        .cloned()
+                        .ok_or_else(|| "emoticon ricevuta non disponibile".to_owned())
+                        .map(|offer| (asset_id, offer))
+                }) {
+                    Ok((asset_id, mut offer)) => {
+                        offer.metadata.suggested_triggers = vec![trigger.trim().to_owned()];
+                        match save_offer(&args.emotes, &offer, triggers) {
+                            Ok(_) => {
+                                pending_emoticons.remove(&asset_id);
+                                let _ = events.send(ClientEvent::EmoticonCatalog {
+                                    emoticons: vec![client_emoticon(&offer, trigger.trim(), true)],
+                                });
+                            }
+                            Err(error) => {
+                                let _ = events.send(ClientEvent::Error {
+                                    message: format!("emoticon non salvata: {error}"),
+                                });
+                            }
+                        }
+                    }
+                    Err(message) => {
+                        let _ = events.send(ClientEvent::Error { message });
+                    }
+                }
+            }
+            ClientCommand::UpdateEmoticon { asset_id, trigger } => {
+                match parse_asset_id(&asset_id).and_then(|asset_id| {
+                    let current = triggers
+                        .iter()
+                        .find(|item| item.asset_id == asset_id)
+                        .cloned()
+                        .ok_or_else(|| "emoticon non trovata".to_owned())?;
+                    let mut offer = load_emoticon_offer(&args.emotes, &current)
+                        .map_err(|error| error.to_string())?;
+                    offer.metadata.suggested_triggers = vec![trigger.trim().to_owned()];
+                    save_offer(&args.emotes, &offer, triggers)
+                        .map_err(|error| error.to_string())?;
+                    Ok((offer, trigger.trim().to_owned()))
+                }) {
+                    Ok((offer, trigger)) => {
+                        let _ = events.send(ClientEvent::EmoticonCatalog {
+                            emoticons: vec![client_emoticon(&offer, &trigger, true)],
+                        });
+                    }
+                    Err(message) => {
+                        let _ = events.send(ClientEvent::Error { message });
+                    }
+                }
+            }
+            ClientCommand::DeleteEmoticon { asset_id } => {
+                match parse_asset_id(&asset_id).and_then(|asset_id| {
+                    delete_emoticon(&args.emotes, asset_id, triggers)
+                        .map_err(|error| error.to_string())
+                }) {
+                    Ok(()) => {
+                        let _ = events.send(ClientEvent::EmoticonRemoved { asset_id });
+                    }
+                    Err(message) => {
+                        let _ = events.send(ClientEvent::Error { message });
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(LoopFlow::Continue)
+    }
+
+    fn on_contact_command(&mut self, command: ClientCommand) -> Result<LoopFlow, Box<dyn Error>> {
+        let Node {
+            history,
+            ignored_contacts,
+            local_peer_id,
+            account_proof,
+            swarm,
+            display_name,
+            peers,
+            pending_contact_requests,
+            pending_accounts,
+            reconnect_at,
+            reconnect_attempts,
+            known_contacts,
+            contact_devices,
+            sent_numbers,
+            pending_handshakes,
+            presence_status,
+            sessions,
+            peer_names,
+            events,
+            ..
+        } = self;
+        let local_peer_id = *local_peer_id;
+        match command {
+            ClientCommand::RenameContact { peer, name } => {
+                match history.rename_contact(&peer.to_string(), &name) {
+                    Ok(()) => {
+                        let name = name.trim().to_owned();
+                        peer_names.insert(peer, name.clone());
+                        let _ = events.send(ClientEvent::ContactUpdated {
+                            contact: ClientContact {
+                                peer_id: peer.to_string(),
+                                name,
+                                online: contact_devices.online(peer, peers),
+                                secure: contact_devices.secure(peer, sessions),
+                                fingerprint: peer_fingerprint(peer),
+                            },
+                        });
+                    }
+                    Err(error) => {
+                        let _ = events.send(ClientEvent::Error {
+                            message: error.to_string(),
+                        });
+                    }
+                }
+            }
+            ClientCommand::ClearConversation { peer } => {
+                match history.clear_conversation(&peer.to_string()) {
+                    Ok(()) => {
+                        let _ = events.send(ClientEvent::ConversationCleared {
+                            peer_id: peer.to_string(),
+                        });
+                    }
+                    Err(error) => {
+                        let _ = events.send(ClientEvent::Error {
+                            message: error.to_string(),
+                        });
+                    }
+                }
+            }
+            ClientCommand::DeleteContact { peer } => {
+                match history.delete_contact(&peer.to_string()) {
+                    Ok(()) => {
+                        // Bloccare una persona blocca tutti i suoi dispositivi.
+                        for device in contact_devices.forget(peer) {
+                            history.delete_contact(&device.to_string())?;
+                            ignored_contacts.insert(device);
+                            known_contacts.remove(&device);
+                            peer_names.remove(&device);
+                            peers.remove(&device);
+                            sessions.remove(&device);
+                            reconnect_at.remove(&device);
+                            reconnect_attempts.remove(&device);
+                            let _ = swarm.disconnect_peer_id(device);
+                        }
+                        ignored_contacts.insert(peer);
+                        known_contacts.remove(&peer);
+                        peer_names.remove(&peer);
+                        peers.remove(&peer);
+                        sessions.remove(&peer);
+                        reconnect_at.remove(&peer);
+                        reconnect_attempts.remove(&peer);
+                        let _ = swarm.disconnect_peer_id(peer);
+                        let _ = events.send(ClientEvent::ContactRemoved {
+                            peer_id: peer.to_string(),
+                            reason: "deleted".into(),
+                        });
+                    }
+                    Err(error) => {
+                        let _ = events.send(ClientEvent::Error {
+                            message: error.to_string(),
+                        });
+                    }
+                }
+            }
+            ClientCommand::AcceptContactRequest { peer } => {
+                if let Some(name) = pending_contact_requests.remove(&peer) {
+                    ignored_contacts.remove(&peer);
+                    history.allow_contact(&peer.to_string())?;
+                    history.ensure_contact(&peer.to_string(), &name, now_ms())?;
+                    // Approvata la persona, i suoi altri dispositivi non
+                    // dovranno più chiedere.
+                    if let Some(account) = pending_accounts.remove(&peer) {
+                        if contact_devices.bind(peer, account.clone()) {
+                            history.bind_contact_account(&peer.to_string(), &account, now_ms())?;
+                        }
+                    }
+                    known_contacts.insert(peer);
+                    peer_names.entry(peer).or_insert_with(|| name.clone());
+                    peers.insert(peer);
+                    let _ = events.send(ClientEvent::ContactUpdated {
+                        contact: ClientContact {
+                            peer_id: peer.to_string(),
+                            name: peer_names.get(&peer).cloned().unwrap_or(name),
+                            online: true,
+                            secure: contact_devices.secure(peer, sessions),
+                            fingerprint: peer_fingerprint(peer),
+                        },
+                    });
+                    // Ricambia la presence e avvia il canale cifrato.
+                    send_event(
+                        swarm,
+                        sessions,
+                        contact_devices,
+                        peer,
+                        local_peer_id,
+                        sent_numbers,
+                        ChatEvent::Presence(presence_update(
+                            display_name,
+                            presence_status,
+                            true,
+                            account_proof,
+                        )),
+                    );
+                    maybe_start_hybrid_handshake(
+                        swarm,
+                        pending_handshakes,
+                        sessions,
+                        local_peer_id,
+                        peer,
+                    );
+                }
+            }
+            ClientCommand::RejectContactRequest { peer } => {
+                pending_contact_requests.remove(&peer);
+                pending_accounts.remove(&peer);
+                // Il rifiuto resta dopo un riavvio e arriva agli altri
+                // dispositivi: lo stesso sconosciuto non può richiedere di nuovo.
+                history.delete_contact(&peer.to_string())?;
+                ignored_contacts.insert(peer);
+                known_contacts.remove(&peer);
+                peers.remove(&peer);
+                sessions.remove(&peer);
+                let _ = swarm.disconnect_peer_id(peer);
+                let _ = events.send(ClientEvent::ContactRemoved {
+                    peer_id: peer.to_string(),
+                    reason: "rejected".into(),
+                });
+            }
+            ClientCommand::RequestPendingContactRequests => {
+                // Gli eventi UI non vengono conservati da Tauri. Su mobile la
+                // WebView può essere sospesa o ricreata mentre il nodo continua
+                // a girare: ripubblica quindi le richieste ancora in attesa.
+                for (peer, name) in pending_contact_requests.iter() {
+                    let _ = events.send(ClientEvent::ContactRequest {
+                        peer_id: peer.to_string(),
+                        name: name.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+        Ok(LoopFlow::Continue)
+    }
+
+    fn on_group_command(&mut self, command: ClientCommand) -> Result<LoopFlow, Box<dyn Error>> {
+        let Node {
+            history,
+            local_peer_id,
+            swarm,
+            known_contacts,
+            contact_devices,
+            triggers,
+            sent_numbers,
+            pending_handshakes,
+            outbox,
+            pending_messages,
+            sessions,
+            shared_emoticons,
+            prepared_files_tx,
+            args,
+            events,
+            ..
+        } = self;
+        let local_peer_id = *local_peer_id;
+        match command {
+            ClientCommand::CreateChatGroup { name, members } => {
+                let name = name.trim();
+                let mut members = members
+                    .into_iter()
+                    .filter(|peer| *peer != local_peer_id)
+                    .collect::<HashSet<_>>();
+                if name.is_empty() || name.len() > 64 {
+                    let _ = events.send(ClientEvent::Error {
+                        message: "nome della chat non valido".into(),
+                    });
+                    return Ok(LoopFlow::Continue);
+                }
+                if members.len() < 2
+                    || members.len() > 31
+                    || members.iter().any(|peer| !known_contacts.contains(peer))
+                {
+                    let _ = events.send(ClientEvent::Error {
+                        message: "scegli da 2 a 31 contatti validi".into(),
+                    });
+                    return Ok(LoopFlow::Continue);
+                }
+                let mut group_id = [0_u8; 16];
+                OsRng.fill_bytes(&mut group_id);
+                let mut member_ids = members
+                    .drain()
+                    .map(|peer| peer.to_string())
+                    .collect::<Vec<_>>();
+                member_ids.push(local_peer_id.to_string());
+                member_ids.sort();
+                let group = GroupChatEntry {
+                    id: hex_group_id(&group_id),
+                    name: name.to_owned(),
+                    owner_peer: local_peer_id.to_string(),
+                    members: member_ids,
+                    admins: Vec::new(),
+                    silenced: Vec::new(),
+                    bans: Vec::new(),
+                    revision: 1,
+                };
+                history.save_group_chat(&group)?;
+                let definition = group_definition(&group)?;
+                for member in group
+                    .members
+                    .iter()
+                    .filter_map(|value| value.parse::<PeerId>().ok())
+                    .filter(|peer| *peer != local_peer_id)
+                {
+                    send_event(
+                        swarm,
+                        sessions,
+                        contact_devices,
+                        member,
+                        local_peer_id,
+                        sent_numbers,
+                        ChatEvent::GroupDefinition(definition.clone()),
+                    );
+                }
+                send_group_chats(&history.group_chats()?, events);
+                let _ = events.send(ClientEvent::GroupConversationLoaded {
+                    group_id: group.id,
+                    messages: Vec::new(),
+                });
+            }
+            ClientCommand::ModerateGroup {
+                group_id,
+                peer,
+                action,
+            } => {
+                if let Err(message) = parse_group_id(&group_id) {
+                    let _ = events.send(ClientEvent::Error { message });
+                    return Ok(LoopFlow::Continue);
+                }
+                let Some(mut group) = history.group_chat(&group_id)? else {
+                    let _ = events.send(ClientEvent::Error {
+                        message: "chat di gruppo non trovata".into(),
+                    });
+                    return Ok(LoopFlow::Continue);
+                };
+                if let Err(message) =
+                    apply_group_moderation(&mut group, local_peer_id, peer, action, now_ms())
+                {
+                    let _ = events.send(ClientEvent::Error {
+                        message: message.into(),
+                    });
+                    return Ok(LoopFlow::Continue);
+                }
+                history.save_group_chat(&group)?;
+                let definition = group_definition(&group)?;
+                let recipients = group
+                    .members
+                    .iter()
+                    .filter_map(|value| value.parse::<PeerId>().ok())
+                    .filter(|member| *member != local_peer_id && sessions.contains_key(member))
+                    .collect::<Vec<_>>();
+                for member in recipients {
+                    send_event(
+                        swarm,
+                        sessions,
+                        contact_devices,
+                        member,
+                        local_peer_id,
+                        sent_numbers,
+                        ChatEvent::GroupDefinition(definition.clone()),
+                    );
+                }
+                send_group_chats(&history.group_chats()?, events);
+            }
+            ClientCommand::SendGroupText { group_id, text } => {
+                if let Err(message) = check_outgoing_text(&text) {
+                    let _ = events.send(ClientEvent::Error { message });
+                    return Ok(LoopFlow::Continue);
+                }
+                let parsed_id = match parse_group_id(&group_id) {
+                    Ok(id) => id,
+                    Err(message) => {
+                        let _ = events.send(ClientEvent::Error { message });
+                        return Ok(LoopFlow::Continue);
+                    }
+                };
+                let Some(group) = history.group_chat(&group_id)? else {
+                    let _ = events.send(ClientEvent::Error {
+                        message: "chat di gruppo non trovata".into(),
+                    });
+                    return Ok(LoopFlow::Continue);
+                };
+                let timestamp_ms = now_ms();
+                if !group_member_can_send(&group, &local_peer_id.to_string(), timestamp_ms) {
+                    let _ = events.send(ClientEvent::Error {
+                        message: "non puoi scrivere: sei silenziato o bannato".into(),
+                    });
+                    return Ok(LoopFlow::Continue);
+                }
+                let emoticons = match resolve_emoticons(&text, triggers) {
+                    Ok(emoticons) => emoticons,
+                    Err(error) => {
+                        let _ = events.send(ClientEvent::Error {
+                            message: format!("trigger emoticon non valido: {error:?}"),
+                        });
+                        return Ok(LoopFlow::Continue);
+                    }
+                };
+                let mut group_message_id = [0u8; 16];
+                OsRng.fill_bytes(&mut group_message_id);
+                let message = TextMessage {
+                    text: text.clone(),
+                    emoticons: emoticons.clone(),
+                    id: group_message_id,
+                };
+                let group_event = ChatEvent::GroupText(GroupTextMessage {
+                    group_id: parsed_id,
+                    message: message.clone(),
+                    timestamp_ms,
+                });
+                let recipients = group
+                    .members
+                    .iter()
+                    .filter_map(|value| value.parse::<PeerId>().ok())
+                    .filter(|peer| {
+                        *peer != local_peer_id
+                            && sessions.contains_key(peer)
+                            && !active_group_ban(&group, &peer.to_string(), timestamp_ms)
+                    })
+                    .collect::<Vec<_>>();
+                if recipients.is_empty() {
+                    let _ = events.send(ClientEvent::Error {
+                        message: "nessun partecipante è online con una sessione protetta".into(),
+                    });
+                    return Ok(LoopFlow::Continue);
+                }
+                for recipient in recipients {
+                    for offer in new_emoticon_offers(
+                        &emoticons,
+                        recipient,
+                        shared_emoticons,
+                        triggers,
+                        &args.emotes,
+                        events,
+                    ) {
+                        deliver_event(
+                            swarm,
+                            sessions,
+                            contact_devices,
+                            sent_numbers,
+                            pending_messages,
+                            outbox,
+                            pending_handshakes,
+                            local_peer_id,
+                            recipient,
+                            ChatEvent::EmoticonOffer(offer),
+                        );
+                    }
+                    deliver_event(
+                        swarm,
+                        sessions,
+                        contact_devices,
+                        sent_numbers,
+                        pending_messages,
+                        outbox,
+                        pending_handshakes,
+                        local_peer_id,
+                        recipient,
+                        group_event.clone(),
+                    );
+                }
+                history.record(
+                    &group_history_key(&group_id),
+                    "out",
+                    &format!("group-text:{local_peer_id}"),
+                    &encode_text_history(&message)?,
+                    timestamp_ms,
+                )?;
+                let _ = events.send(ClientEvent::GroupMessage {
+                    message: ClientGroupMessage {
+                        group_id,
+                        sender_peer_id: local_peer_id.to_string(),
+                        direction: "out".into(),
+                        kind: "text".into(),
+                        body: text,
+                        timestamp_ms,
+                        emoticons: emoticons
+                            .iter()
+                            .map(|span| ClientEmoticonSpan {
+                                start: span.start,
+                                end: span.end,
+                                asset_id: hex_asset_id(&span.asset_id),
+                            })
+                            .collect(),
+                        attachment_id: None,
+                        attachment_mime: None,
+                        event_id: None,
+                    },
+                });
+            }
+            ClientCommand::SendGroupFile { group_id, path } => {
+                let parsed_id = match parse_group_id(&group_id) {
+                    Ok(id) => id,
+                    Err(message) => {
+                        let _ = events.send(ClientEvent::Error { message });
+                        return Ok(LoopFlow::Continue);
+                    }
+                };
+                let Some(group) = history.group_chat(&group_id)? else {
+                    let _ = events.send(ClientEvent::Error {
+                        message: "chat di gruppo non trovata".into(),
+                    });
+                    return Ok(LoopFlow::Continue);
+                };
+                if let Err(message) =
+                    group_file_recipients(&group, local_peer_id, sessions, now_ms())
+                {
+                    let _ = events.send(ClientEvent::Error {
+                        message: message.into(),
+                    });
+                    return Ok(LoopFlow::Continue);
+                }
+                prepare_file(
+                    prepared_files_tx,
+                    FileTarget::Group {
+                        group_id,
+                        parsed_id,
+                    },
+                    path,
+                );
+            }
+            ClientCommand::LoadOlderGroupMessages {
+                group_id,
+                before_event_id,
+            } => {
+                let messages =
+                    group_conversation_messages(history, &group_id, Some(&before_event_id))?;
+                let _ = events.send(ClientEvent::OlderGroupMessagesLoaded {
+                    group_id,
+                    has_more: messages.len() == HISTORY_PAGE,
+                    messages,
+                });
+            }
+            ClientCommand::ClearGroupConversation { group_id } => {
+                match parse_group_id(&group_id).and_then(|_| {
+                    history
+                        .clear_conversation(&group_history_key(&group_id))
+                        .map_err(|error| error.to_string())
+                }) {
+                    Ok(()) => {
+                        let _ = events.send(ClientEvent::GroupConversationCleared { group_id });
+                    }
+                    Err(message) => {
+                        let _ = events.send(ClientEvent::Error { message });
+                    }
+                }
+            }
+            ClientCommand::DeleteChatGroup { group_id } => {
+                match parse_group_id(&group_id).and_then(|_| {
+                    history
+                        .delete_group_chat(&group_id)
+                        .map_err(|error| error.to_string())
+                }) {
+                    Ok(()) => send_group_chats(&history.group_chats()?, events),
+                    Err(message) => {
+                        let _ = events.send(ClientEvent::Error { message });
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(LoopFlow::Continue)
+    }
+
+    fn on_attachment_command(
+        &mut self,
+        command: ClientCommand,
+    ) -> Result<LoopFlow, Box<dyn Error>> {
+        let Node {
+            history,
+            local_peer_id,
+            swarm,
+            contact_devices,
+            incoming_nudge_limits,
+            notification_mutes,
+            sent_numbers,
+            pending_offers,
+            pending_transfers,
+            sessions,
+            waiting_offers,
+            pending_emoticons,
+            attachment_receiver,
+            vault_jobs_tx,
+            incoming_attachments,
+            pending_inbound_offers,
+            peer_names,
+            args,
+            events,
+            ..
+        } = self;
+        let local_peer_id = *local_peer_id;
+        match command {
+            ClientCommand::ReadAttachment {
+                id,
+                mime,
+                thumbnail,
+            } => match parse_asset_id(&id) {
+                Ok(id_bytes) => open_attachment(
+                    attachment_receiver.vault(),
+                    events,
+                    id,
+                    id_bytes,
+                    mime,
+                    thumbnail,
+                ),
+                Err(message) => {
+                    let _ = events.send(ClientEvent::Error { message });
+                }
+            },
+            ClientCommand::ExportAttachment { id, path } => {
+                match parse_asset_id(&id).and_then(|id_bytes| {
+                    attachment_receiver
+                        .export(&id_bytes, &path)
+                        .map_err(|error| error.to_string())
+                }) {
+                    Ok(()) => {
+                        let _ = events.send(ClientEvent::AttachmentExported {
+                            path: path.to_string_lossy().into_owned(),
+                        });
+                    }
+                    Err(message) => {
+                        let _ = events.send(ClientEvent::Error { message });
+                    }
+                }
+            }
+            ClientCommand::CancelFileTransfers { conversation } => {
+                // Solo gli invii della conversazione aperta, e il destinatario
+                // lo viene a sapere invece di restare con un file a metà.
+                let in_scope = |peer: PeerId, group_id: Option<[u8; 16]>| match conversation
+                    .as_deref()
+                {
+                    None => true,
+                    Some(key) => match key.strip_prefix("group:") {
+                        Some(group) => group_id.is_some_and(|id| hex_group_id(&id) == group),
+                        None => {
+                            group_id.is_none() && contact_devices.canonical(peer).to_string() == key
+                        }
+                    },
+                };
+                let mut cancelled = Vec::new();
+                pending_offers.retain(|_, offer| {
+                    let keep = !in_scope(offer.peer, offer.group_id);
+                    if !keep {
+                        cancelled.push((offer.peer, offer.manifest.attachment_id));
+                    }
+                    keep
+                });
+                pending_transfers.retain(|_, transfer| {
+                    let keep = !in_scope(transfer.peer, transfer.group_id);
+                    if !keep {
+                        cancelled.push((transfer.peer, transfer.manifest.attachment_id));
+                    }
+                    keep
+                });
+                waiting_offers.retain(|_, offers| {
+                    offers.retain(|offer| !in_scope(offer.peer, offer.group_id));
+                    !offers.is_empty()
+                });
+                for (peer, attachment_id) in cancelled {
+                    // Avviso senza retry: se non arriva, il destinatario scarta
+                    // comunque le parti quando l'offerta scade.
+                    send_event(
+                        swarm,
+                        sessions,
+                        contact_devices,
+                        peer,
+                        local_peer_id,
+                        sent_numbers,
+                        ChatEvent::AttachmentCancelled(AttachmentCancel { attachment_id }),
+                    );
+                }
+                let _ = events.send(ClientEvent::AttachmentTransfersCancelled);
+            }
+            ClientCommand::AcceptAttachment { offer_id } => {
+                let Some(pending) = pending_inbound_offers.remove(&offer_id) else {
+                    let _ = events.send(ClientEvent::Error {
+                        message: "offerta file scaduta".into(),
+                    });
+                    return Ok(LoopFlow::Continue);
+                };
+                let client_event = client_event_from_chat(
+                    pending.peer,
+                    &pending.event,
+                    "in",
+                    true,
+                    peer_names.get(&pending.peer).map(String::as_str),
+                );
+                let response = receive_event(
+                    pending.peer,
+                    &pending.event,
+                    &mut Incoming {
+                        pending_emoticons,
+                        events,
+                        nudge_limits: incoming_nudge_limits,
+                        attachments: attachment_receiver,
+                        history,
+                        notifications: args.notifications,
+                        notification_mutes,
+                        peer_names,
+                        local_peer_id,
+                        incoming_attachments,
+                        vault_jobs: vault_jobs_tx,
+                    },
+                );
+                if !matches!(&response, ProtocolResponse::Rejected(_)) {
+                    if let Some(event) = client_event {
+                        let _ = events.send(event);
+                    }
+                }
+                swarm
+                    .behaviour_mut()
+                    .secure_chat
+                    .send_response(pending.channel, response)
+                    .ok();
+            }
+            ClientCommand::RejectAttachment { offer_id } => {
+                let Some(pending) = pending_inbound_offers.remove(&offer_id) else {
+                    return Ok(LoopFlow::Continue);
+                };
+                swarm
+                    .behaviour_mut()
+                    .secure_chat
+                    .send_response(
+                        pending.channel,
+                        ProtocolResponse::Rejected("file rifiutato dall'utente".into()),
+                    )
+                    .ok();
+            }
+            _ => {}
+        }
+        Ok(LoopFlow::Continue)
+    }
 }
 
 /// Un testo oltre il limite del protocollo verrebbe rifiutato dal destinatario
