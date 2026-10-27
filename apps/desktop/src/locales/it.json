@@ -427,5 +427,9 @@
   "subtitle.protected": "Conversazione protetta",
   "subtitle.connecting": "Connessione…",
   "subtitle.offline": "Non in linea",
-  "confirm.permaBan": "Bannare definitivamente {name}?"
+  "confirm.permaBan": "Bannare definitivamente {name}?",
+  "settings.devices.revoke": "Revoca",
+  "settings.devices.revokeConfirm": "Revocare {name}? Non potrà più sincronizzarsi né presentarsi come te ai tuoi contatti. Agli altri tuoi dispositivi verrà chiesto di confermare.",
+  "devices.rotation.prompt": "{from} ha revocato: {revoked}.\n\nOK se sei stato tu. Annulla se non lo riconosci: in quel caso verrà revocato {from}.",
+  "toast.deviceRevoked": "Dispositivo revocato"
 }
