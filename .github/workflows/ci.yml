@@ -32,6 +32,11 @@ jobs:
 
       - name: Cache Rust dependencies and build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Solo main salva la cache: le PR la leggono da main. Se ogni branch
+          # salvasse la sua, il limite di 10 GB di GitHub eliminerebbe quella
+          # di main e la build della release ripartirebbe da zero.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Linux dependencies
         run: |
