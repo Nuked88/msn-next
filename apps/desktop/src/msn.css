@@ -39,6 +39,13 @@
   --radius: 12px;
   --radius-lg: 16px;
   --radius-pill: 999px;
+  /* Colore per azioni distruttive (menu, pulsanti, avvisi): uno solo in tutta l'app. */
+  --danger: #b42318;
+  --danger-strong: #8f1d14;
+  --danger-soft: color-mix(in srgb, var(--danger) 8%, var(--surface));
+  --busy: #d64545;
+  /* Altezza unica per pulsanti e campi standard (primario, secondario, danger). */
+  --control-h: 32px;
 }
 
 :root[data-font-scale="100"] { font-size: 100%; }
@@ -79,6 +86,8 @@
   --scrim: rgba(4, 17, 30, 0.64);
   --shadow: 0 20px 60px rgba(3, 15, 28, 0.42);
   --shadow-small: 0 6px 22px rgba(3, 15, 28, 0.28);
+  --danger: #ff8e80;
+  --danger-strong: #ffb3a8;
 }
 
 /* ===== Tema "Aurora": moderno, accento indigo/violetto, superfici neutre =====
@@ -292,6 +301,13 @@ select {
 
 button {
   color: inherit;
+}
+
+/* Il default del browser è `bolder`: dentro label/pulsanti già a 700 diventava
+   900 e i titoli risultavano più pesanti degli altri. */
+strong,
+b {
+  font-weight: 700;
 }
 
 /* Select uniformi e moderni (niente chrome nativo, freccia custom). */
@@ -702,7 +718,7 @@ button:disabled {
   background: var(--green);
 }
 
-.avatar-shell > i[data-status="busy"] { background: #d64545; }
+.avatar-shell > i[data-status="busy"] { background: var(--busy); }
 .avatar-shell > i[data-status="away"] { background: #e0a83e; }
 
 /* L'avatar è il trigger del menu stato: cliccalo per cambiare presenza. */
@@ -730,37 +746,10 @@ button:disabled {
 
 .status-menu {
   position: absolute;
-  z-index: 40;
+  z-index: 91;
   left: 13px;
   top: 78px;
-  min-width: 190px;
-  display: flex;
-  flex-direction: column;
-  padding: 5px;
-  border: 1px solid var(--selected-border);
-  border-radius: 12px;
-  background: var(--surface-raised);
-  box-shadow: var(--shadow);
-  animation: panel-in 150ms ease-out both;
 }
-
-.status-menu button {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 9px;
-  border: 0;
-  border-radius: 9px;
-  background: none;
-  color: var(--text-strong);
-  font-size: 0.6875rem;
-  text-align: left;
-  cursor: pointer;
-}
-
-.status-menu button:hover { background: var(--selected); }
-.status-menu .danger-item { color: #d64545; }
-.status-sep { height: 1px; margin: 4px 2px; background: var(--line); }
 
 .status-dot {
   width: 9px;
@@ -770,7 +759,7 @@ button:disabled {
   background: var(--faint);
 }
 .status-dot[data-status="online"] { background: var(--green); }
-.status-dot[data-status="busy"] { background: #d64545; }
+.status-dot[data-status="busy"] { background: var(--busy); }
 .status-dot[data-status="away"] { background: #e0a83e; }
 
 .avatar-shell.me {
@@ -1494,12 +1483,12 @@ button:disabled {
 }
 
 .primary-button {
-  min-height: 35px;
+  min-height: var(--control-h);
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 6px;
-  padding: 0 17px;
+  padding: 0 16px;
   border: 1px solid var(--blue-strong);
   border-radius: 9px;
   color: #ffffff;
@@ -1611,7 +1600,7 @@ button:disabled {
   display: inline-flex;
   align-items: center;
   gap: 3px;
-  color: #c0392b;
+  color: var(--danger);
   font-size: 0.85em;
   cursor: help;
 }
@@ -1922,9 +1911,17 @@ button:disabled {
   white-space: nowrap;
 }
 
+.identity-detail > small {
+  display: block;
+  margin-bottom: 9px;
+  color: var(--muted);
+  font-size: 0.5625rem;
+  line-height: 1.45;
+}
+
 .identity-detail button {
   width: 100%;
-  min-height: 30px;
+  min-height: var(--control-h);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2005,6 +2002,12 @@ button:disabled {
 .chat-toolbar .nudge-tool:hover:not(:disabled) {
   color: var(--yellow);
   background: var(--yellow-soft);
+}
+
+.chat-toolbar .danger-item { color: var(--danger); }
+.chat-toolbar .danger-item:hover:not(:disabled) {
+  color: var(--danger-strong);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
 }
 
 .transfer-progress {
@@ -2351,8 +2354,8 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
 }
 
 .group-member-copy .ban-status {
-  color: #b42318;
-  background: color-mix(in srgb, #b42318 10%, var(--surface));
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 10%, var(--surface));
 }
 
 .group-member-row select {
@@ -2366,15 +2369,17 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
 }
 
 .group-management button {
-  min-height: 34px;
+  min-height: var(--control-h);
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 6px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
   color: var(--text);
   background: var(--surface);
+  font-size: 0.625rem;
+  font-weight: 700;
   cursor: pointer;
 }
 
@@ -2403,16 +2408,18 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
 
 .contact-management button,
 .danger-button {
-  min-height: 34px;
+  min-height: var(--control-h);
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 6px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
+  padding: 0 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
   color: var(--text);
   background: var(--surface);
   font-size: 0.625rem;
+  font-weight: 700;
   cursor: pointer;
 }
 
@@ -2444,13 +2451,18 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
 .contact-danger-zone button strong,
 .contact-danger-zone button small { display: block; }
 .contact-danger-zone button small { margin-top: 2px; color: var(--muted); font-size: 0.72em; font-weight: 400; }
-.contact-danger-zone .danger-button { background: color-mix(in srgb, #b42318 5%, var(--surface)); }
+.contact-danger-zone .danger-button { background: color-mix(in srgb, var(--danger) 5%, var(--surface)); }
 .contact-management button:hover { border-color: var(--selected-border); background: var(--blue-soft); }
-.contact-danger-zone .danger-button:hover { color: #8f1d14; background: color-mix(in srgb, #b42318 11%, var(--surface)); }
+.contact-danger-zone .danger-button:hover { color: var(--danger-strong); background: color-mix(in srgb, var(--danger) 11%, var(--surface)); }
 
 .danger-button {
-  color: #b42318;
-  border-color: color-mix(in srgb, #b42318 30%, var(--line));
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 30%, var(--line));
+}
+
+.danger-button:hover:not(:disabled) {
+  color: var(--danger-strong);
+  background: color-mix(in srgb, var(--danger) 9%, var(--surface));
 }
 
 .danger-button.wide {
@@ -2782,7 +2794,7 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
 .settings-subsection-heading > span,
 .settings-subsection-heading strong,
 .settings-subsection-heading small { display: block; }
-.settings-subsection-heading strong { color: var(--text-strong); font-size: 0.78rem; }
+.settings-subsection-heading strong { color: var(--text-strong); font-size: 0.76rem; }
 .settings-subsection-heading small { max-width: 450px; margin-top: 3px; color: var(--muted); font-size: 0.64rem; line-height: 1.4; }
 .settings-subsection-heading > svg { color: var(--blue-strong); }
 .settings-subsection-heading button { flex: 0 0 auto; margin: 0; }
@@ -2819,7 +2831,7 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
 }
 
 .update-status-panel.available > span { color: #267814; background: var(--green-soft); }
-.update-status-panel.error > span { color: #a33a2d; background: color-mix(in srgb, #b42318 9%, var(--surface)); }
+.update-status-panel.error > span { color: var(--danger); background: color-mix(in srgb, var(--danger) 9%, var(--surface)); }
 .update-status-panel strong,
 .update-status-panel small { display: block; }
 .update-status-panel strong { color: var(--text-strong); font-size: 0.8rem; }
@@ -2942,7 +2954,7 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
   font-weight: 700;
 }
 
-.group-member-picker label {
+.modal .group-member-picker label {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -2970,49 +2982,71 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
   background: transparent;
 }
 
-.contact-context-menu {
-  position: fixed;
-  z-index: 91;
-  width: 210px;
+/* Menu a comparsa: stato, contatto/gruppo e messaggio condividono lo stesso
+   aspetto (font, righe, separatori, colore "pericolo"). Le classi specifiche
+   (.status-menu, .contact-context-menu) decidono solo posizione e larghezza. */
+.popup-menu {
+  min-width: 190px;
+  display: flex;
+  flex-direction: column;
   padding: 5px;
   border: 1px solid var(--line-strong);
   border-radius: 11px;
   background: var(--surface-raised);
-  box-shadow: 0 10px 28px color-mix(in srgb, var(--text-strong) 22%, transparent);
+  box-shadow: var(--shadow);
+  animation: panel-in 150ms ease-out both;
 }
 
-.contact-context-menu button {
+.popup-menu button {
   width: 100%;
-  min-height: 30px;
-  padding: 5px 9px;
+  min-height: 29px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 9px;
   border: 0;
   border-radius: 7px;
-  color: var(--text);
+  color: var(--text-strong);
   background: transparent;
+  font-size: 0.625rem;
+  font-weight: 600;
   text-align: left;
   cursor: pointer;
 }
 
-.contact-context-menu button:hover {
+.popup-menu button:hover,
+.popup-menu button:focus-visible {
   background: var(--selected);
 }
 
-.contact-context-menu small {
+.popup-menu .menu-label {
   display: block;
   padding: 6px 9px 3px;
   color: var(--muted);
   font-size: 0.5rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 
-.contact-context-menu .danger-item {
-  color: #b42318;
+.popup-menu .danger-item {
+  color: var(--danger);
 }
 
-.context-separator {
+.popup-menu .danger-item:hover {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+
+.menu-separator {
   height: 1px;
-  margin: 4px;
+  margin: 4px 3px;
   background: var(--line);
+}
+
+.contact-context-menu {
+  position: fixed;
+  z-index: 91;
+  width: 210px;
 }
 
 .file-drop-overlay {
@@ -3335,6 +3369,23 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
   object-fit: contain;
 }
 
+/* Paragrafi "nudi" nei dialoghi (es. file in arrivo): stesso testo secondario
+   degli altri dialoghi invece della dimensione di base ereditata. */
+:where(.modal) > p:where(:not([class])) {
+  margin: 0 0 18px;
+  color: var(--muted);
+  font-size: 0.625rem;
+  line-height: 1.5;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.modal-actions button { margin: 0; min-width: 96px; }
+
 .modal-heading {
   display: flex;
   align-items: center;
@@ -3502,19 +3553,26 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
 .copy-link,
 .secondary-button,
 .scan-button {
-  min-height: 31px;
+  min-height: var(--control-h);
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 5px;
-  padding: 0 11px;
-  border: 1px solid var(--line);
+  gap: 6px;
+  padding: 0 14px;
+  border: 1px solid var(--line-strong);
   border-radius: 9px;
   color: var(--blue-strong);
   background: var(--surface-raised);
-  font-size: 0.5625rem;
+  font-size: 0.625rem;
   font-weight: 700;
   cursor: pointer;
+}
+
+.copy-link:disabled,
+.secondary-button:disabled,
+.scan-button:disabled,
+.danger-button:disabled {
+  opacity: 0.48;
 }
 
 .copy-link:hover,
@@ -3524,7 +3582,7 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
   background: var(--blue-soft);
 }
 
-.secondary-button {
+.share-section > .secondary-button {
   margin-top: 13px;
 }
 
@@ -3616,7 +3674,7 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
 }
 
 .contact-request-copy strong { font-size: 0.6875rem; color: var(--text-strong); }
-.contact-request-copy small { font-size: 0.625rem; color: var(--text-soft); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.contact-request-copy small { font-size: 0.625rem; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .contact-request-actions {
   display: flex;
@@ -3625,8 +3683,8 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
 }
 
 .contact-request-actions button {
-  padding: 5px 10px;
-  font-size: 0.625rem;
+  margin: 0;
+  padding: 0 12px;
 }
 
 .contact-request-backdrop {
@@ -3678,7 +3736,7 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
   align-items: center;
   gap: 6px;
   font-style: italic;
-  color: var(--text-soft);
+  color: var(--muted);
   opacity: 0.85;
 }
 
