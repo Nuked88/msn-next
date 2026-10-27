@@ -25,7 +25,9 @@ use devices::{
 use futures::StreamExt;
 use history::{ContactEntry, DeviceEntry, GroupChatEntry, History};
 use libp2p::{
-    autonat, dcutr, identify,
+    autonat,
+    core::transport::ListenerId,
+    dcutr, identify,
     identity::Keypair,
     kad, mdns,
     multiaddr::Protocol,
@@ -1028,7 +1030,7 @@ async fn run_node(
     let accept_unclassified_manual = args.connect.is_some() && manual_peer.is_none();
     let mut fallback_planner = FallbackPlanner::new(args.relays.clone());
     let mut pending_dht = HashMap::<kad::QueryId, PeerId>::new();
-    let requested_relay_reservations = HashSet::<PeerId>::new();
+    let requested_relay_reservations = HashMap::<PeerId, ListenerId>::new();
     let triggers = load_triggers(&args.emotes)?;
     let nudge_limits = HashMap::<PeerId, NudgeRateLimit>::new();
     let incoming_nudge_limits = HashMap::<PeerId, NudgeRateLimit>::new();
@@ -1349,7 +1351,9 @@ struct Node {
     accept_unclassified_manual: bool,
     fallback_planner: FallbackPlanner,
     pending_dht: HashMap<kad::QueryId, PeerId>,
-    requested_relay_reservations: HashSet<PeerId>,
+    /// Ascolto `/p2p-circuit` aperto su ciascun relay: se si chiude (rete
+    /// caduta, app in background) va richiesto di nuovo.
+    requested_relay_reservations: HashMap<PeerId, ListenerId>,
     triggers: Vec<Trigger>,
     nudge_limits: HashMap<PeerId, NudgeRateLimit>,
     incoming_nudge_limits: HashMap<PeerId, NudgeRateLimit>,
@@ -1807,18 +1811,38 @@ impl Node {
             known_contacts,
             online_devices,
             known_devices,
+            relay_addresses,
+            requested_relay_reservations,
+            args,
             ..
         } = self;
         let Some((peer, _)) = next_reconnect else {
             return Ok(LoopFlow::Continue);
         };
         reconnect_at.remove(&peer);
+        if let Some(address) = relay_addresses.get(&peer) {
+            // L'ascolto sul relay si era chiuso: senza prenotazione nessun
+            // contatto dietro NAT ci raggiunge più finché l'app non riparte.
+            if !request_relay_reservation(swarm, requested_relay_reservations, peer, address) {
+                schedule_reconnect(peer, reconnect_at, reconnect_attempts);
+            }
+            return Ok(LoopFlow::Continue);
+        }
         if (known_contacts.contains(&peer) || known_devices.contains_key(&peer))
             && !peers.contains(&peer)
             && !online_devices.contains(&peer)
             && dialing.insert(peer)
         {
-            if let Err(error) = swarm.dial(DialOpts::peer_id(peer).build()) {
+            // Kademlia scarta gli indirizzi che falliscono: se il contatto
+            // era giù quando abbiamo provato il circuito relay (es. entrambi
+            // riavviati dopo un aggiornamento), quella strada spariva e i
+            // tentativi successivi non avevano più indirizzi. Il relay si
+            // riprova quindi a ogni riconnessione.
+            let dial = DialOpts::peer_id(peer)
+                .addresses(relay_routes(&args.relays, peer))
+                .extend_addresses_through_behaviour()
+                .build();
+            if let Err(error) = swarm.dial(dial) {
                 dialing.remove(&peer);
                 log::warn!("riconnessione fallita per {peer}: {error}");
                 schedule_reconnect(peer, reconnect_at, reconnect_attempts);
@@ -2247,12 +2271,28 @@ impl Node {
             pending_device_requests,
             online_devices,
             known_devices,
+            requested_relay_reservations,
             args,
             events,
             ..
         } = self;
         let local_peer_id = *local_peer_id;
         match event {
+            SwarmEvent::ListenerClosed {
+                listener_id,
+                reason,
+                ..
+            } => {
+                let relay = requested_relay_reservations
+                    .iter()
+                    .find(|(_, id)| **id == listener_id)
+                    .map(|(relay, _)| *relay);
+                if let Some(relay) = relay {
+                    log::warn!("prenotazione relay {relay} chiusa: {reason:?}");
+                    requested_relay_reservations.remove(&relay);
+                    schedule_reconnect(relay, reconnect_at, reconnect_attempts);
+                }
+            }
             SwarmEvent::NewListenAddr { address, .. } => {
                 let address = if split_peer_address(&address).is_ok() {
                     address
@@ -2866,12 +2906,7 @@ impl Node {
             }
         }
         if let Some(address) = relay_addresses.get(&peer_id) {
-            if requested_relay_reservations.insert(peer_id) {
-                if let Err(error) = swarm.listen_on(address.clone().with(Protocol::P2pCircuit)) {
-                    log::warn!("prenotazione relay fallita: {error}");
-                    log::warn!("prenotazione relay fallita: {error}");
-                }
-            }
+            request_relay_reservation(swarm, requested_relay_reservations, peer_id, address);
         }
         let device_request_pending =
             pending_device_requests
@@ -7202,6 +7237,37 @@ fn should_classify_application_peer(
     already_connected: bool,
 ) -> bool {
     valid_message && !infrastructure && !already_connected
+}
+
+/// Chiede al relay di tenerci un posto (`/p2p-circuit`), se non c'è già.
+/// Restituisce `false` se la richiesta non è partita.
+fn request_relay_reservation(
+    swarm: &mut Swarm<Behaviour>,
+    reservations: &mut HashMap<PeerId, ListenerId>,
+    relay: PeerId,
+    address: &Multiaddr,
+) -> bool {
+    if reservations.contains_key(&relay) {
+        return true;
+    }
+    match swarm.listen_on(address.clone().with(Protocol::P2pCircuit)) {
+        Ok(listener) => {
+            reservations.insert(relay, listener);
+            true
+        }
+        Err(error) => {
+            log::warn!("prenotazione relay fallita: {error}");
+            false
+        }
+    }
+}
+
+/// Circuiti relay verso `peer`, uno per relay configurato.
+fn relay_routes(relays: &[Multiaddr], peer: PeerId) -> Vec<Multiaddr> {
+    relays
+        .iter()
+        .filter_map(|relay| relay_route(relay, peer).ok())
+        .collect()
 }
 
 fn should_reconnect_closed_peer(known_contact: bool, num_established: u32) -> bool {
@@ -11656,6 +11722,24 @@ mod tests {
         assert_eq!(reconnect_delay(1), Duration::from_secs(2));
         assert_eq!(reconnect_delay(5), Duration::from_secs(30));
         assert_eq!(reconnect_delay(20), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn reconnects_always_retry_every_relay() {
+        let relay_peer = PeerId::from(Keypair::generate_ed25519().public());
+        let contact = PeerId::from(Keypair::generate_ed25519().public());
+        let relays: Vec<Multiaddr> = vec![
+            format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay_peer}")
+                .parse()
+                .unwrap(),
+            // Senza Peer ID finale: non è un relay utilizzabile.
+            "/ip4/127.0.0.1/tcp/4002".parse().unwrap(),
+        ];
+
+        let routes = relay_routes(&relays, contact);
+
+        assert_eq!(routes, vec![relay_route(&relays[0], contact).unwrap()]);
+        assert!(relay_routes(&[], contact).is_empty());
     }
 
     #[test]
