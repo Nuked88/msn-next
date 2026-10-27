@@ -16,7 +16,7 @@ use chacha20poly1305::{
     aead::{rand_core::RngCore, Aead, OsRng},
     KeyInit, XChaCha20Poly1305, XNonce,
 };
-use msnnext_core::{ClientCommand, ClientConfig, ClientEvent, GroupModeration};
+use msnnext_core::{ClientCommand, ClientConfig, ClientEvent, GroupModeration, MAX_TEXT_BYTES};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 #[cfg(desktop)]
@@ -732,6 +732,7 @@ async fn node_start(
                             message: error.to_string(),
                         },
                     );
+                    let _ = app.emit("client-event", ClientEvent::Stopped);
                 }
                 if let Ok(mut commands) = state_slot.lock() {
                     if commands
@@ -748,22 +749,10 @@ async fn node_start(
                 return;
             }
         };
-        let result = runtime.block_on(msnnext_core::run(client_config, command_rx, event_tx));
+        // Su errore il core emette già Error e poi Stopped sul canale eventi:
+        // la UI torna offline senza bisogno di altro qui.
+        let _ = runtime.block_on(msnnext_core::run(client_config, command_rx, event_tx));
         runtime.shutdown_background();
-        if let Err(error) = result {
-            let current_generation = state_slot
-                .lock()
-                .ok()
-                .and_then(|slot| slot.as_ref().map(|(current, _)| *current));
-            if worker_is_current(current_generation, generation) {
-                let _ = app.emit(
-                    "client-event",
-                    ClientEvent::Error {
-                        message: error.to_string(),
-                    },
-                );
-            }
-        }
         if let Ok(mut commands) = state_slot.lock() {
             if commands
                 .as_ref()
@@ -780,15 +769,26 @@ async fn node_start(
     Ok(())
 }
 
+fn validate_outgoing_text(text: &str) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Err("the message is empty".into());
+    }
+    if text.len() > MAX_TEXT_BYTES {
+        return Err(format!(
+            "the message is too long ({} KB at most)",
+            MAX_TEXT_BYTES / 1024
+        ));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn node_send_text(
     state: State<'_, NodeState>,
     peer_id: String,
     text: String,
 ) -> Result<(), String> {
-    if text.trim().is_empty() {
-        return Err("the message is empty".into());
-    }
+    validate_outgoing_text(&text)?;
     send_command(
         &state,
         ClientCommand::SendText {
@@ -1044,9 +1044,7 @@ fn node_send_group_text(
     group_id: String,
     text: String,
 ) -> Result<(), String> {
-    if text.trim().is_empty() {
-        return Err("the message is empty".into());
-    }
+    validate_outgoing_text(&text)?;
     send_command(&state, ClientCommand::SendGroupText { group_id, text })
 }
 

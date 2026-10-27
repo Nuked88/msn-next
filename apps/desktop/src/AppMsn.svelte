@@ -198,6 +198,9 @@
     startMinimized: boolean
   }
 
+  /** Limite del protocollo per un messaggio di testo (crates/protocol MAX_TEXT_BYTES). */
+  const MAX_TEXT_BYTES = 16_384
+
   const emoticons: Emoticon[] = [
     { glyph: '🙂', shortcut: ':)', label: 'Sorriso' },
     { glyph: '😄', shortcut: ':D', label: 'Risata' },
@@ -1429,6 +1432,12 @@
   async function sendMessage() {
     const text = messageText.trim().replace(/\s*\n+\s*/g, ' ')
     if (!text || !canSend || (!selectedPeerId && !selectedGroupId)) return
+    // Stesso limite del protocollo (MAX_TEXT_BYTES): il testo resta nel
+    // composer così l'utente può accorciarlo.
+    if (new TextEncoder().encode(text).length > MAX_TEXT_BYTES) {
+      showToast($t('toast.messageTooLong', { max: MAX_TEXT_BYTES / 1024 }))
+      return
+    }
     try {
       if (selectedGroupId) await invoke('node_send_group_text', { groupId: selectedGroupId, text })
       else await invoke('node_send_text', { peerId: selectedPeerId, text })

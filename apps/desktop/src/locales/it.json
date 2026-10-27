@@ -385,6 +385,7 @@
   "toast.fileReceivedGroup": "File ricevuto nel gruppo: {filename}",
   "toast.groupHistoryDeleted": "Cronologia del gruppo eliminata",
   "toast.fileExported": "File esportato: {path}",
+  "toast.messageTooLong": "Messaggio troppo lungo: massimo {max} KB",
   "toast.oldFileNoArchive": "Questo file appartiene a una vecchia cronologia e non ha un riferimento in archivio",
   "toast.settingsSaved": "Impostazioni salvate",
   "toast.avatarUpdated": "Avatar aggiornato",

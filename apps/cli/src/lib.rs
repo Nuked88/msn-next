@@ -38,6 +38,7 @@ use msnnext_protocol::{
     GroupDefinition, GroupTextMessage, Mime, Nudge, NudgeRateLimit, PresenceUpdate,
     ProtocolResponse, TextMessage, Trigger, PROTOCOL_VERSION,
 };
+pub use msnnext_protocol::MAX_TEXT_BYTES;
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -638,7 +639,25 @@ pub async fn run_cli() -> Result<(), Box<dyn Error>> {
     run(args, command_rx, event_tx).await
 }
 
+/// Avvia il nodo e lo fa girare finché non riceve `Shutdown`. Qualunque sia
+/// l'esito, l'ultimo evento emesso è `Stopped`: la UI non deve mai restare
+/// "online" con un nodo che non gira più.
 pub async fn run(
+    args: ClientConfig,
+    commands: mpsc::UnboundedReceiver<ClientCommand>,
+    events: mpsc::UnboundedSender<ClientEvent>,
+) -> Result<(), Box<dyn Error>> {
+    let result = run_node(args, commands, events.clone()).await;
+    if let Err(error) = &result {
+        let _ = events.send(ClientEvent::Error {
+            message: format!("il nodo di rete si è arrestato: {error}"),
+        });
+    }
+    let _ = events.send(ClientEvent::Stopped);
+    result
+}
+
+async fn run_node(
     args: ClientConfig,
     mut commands: mpsc::UnboundedReceiver<ClientCommand>,
     events: mpsc::UnboundedSender<ClientEvent>,
@@ -948,6 +967,10 @@ pub async fn run(
             .iter()
             .min_by_key(|(_, deadline)| **deadline)
             .map(|(peer, deadline)| (*peer, *deadline));
+        // Ogni evento è gestito in un blocco a sé: un errore (SQLite, link
+        // malformato, dati di sync non validi...) diventa un ClientEvent::Error
+        // e il nodo continua a girare invece di spegnersi.
+        let step: Result<LoopFlow, Box<dyn Error>> = async {
         tokio::select! {
             _ = device_sync_tick.tick(), if !online_devices.is_empty() => {
                 let latest_seq = history.latest_sync_seq()?;
@@ -1001,7 +1024,7 @@ pub async fn run(
             }
             _ = wait_for_reconnect(next_reconnect.map(|(_, deadline)| deadline)) => {
                 let Some((peer, _)) = next_reconnect else {
-                    continue;
+                    return Ok(LoopFlow::Continue);
                 };
                 reconnect_at.remove(&peer);
                 if (known_contacts.contains(&peer) || known_devices.contains_key(&peer))
@@ -1021,7 +1044,7 @@ pub async fn run(
                 }
             }
             line = lines.next_line(), if stdin_open => match line? {
-                Some(line) if line == "quit" => break,
+                Some(line) if line == "quit" => return Ok(LoopFlow::Stop),
                 Some(line) if line == "history" => match history.latest(20) {
                     Ok(entries) => for entry in entries.iter().rev() {
                         println!("{} {} {} {}: {}", entry.timestamp_ms, entry.direction, entry.peer, entry.kind, entry.body);
@@ -1147,7 +1170,7 @@ pub async fn run(
                 None => stdin_open = false,
             },
             command = commands.recv(), if commands_open => match command {
-                Some(ClientCommand::Shutdown) => break,
+                Some(ClientCommand::Shutdown) => return Ok(LoopFlow::Stop),
                 Some(ClientCommand::RequestContactLink) => {
                     contact_link_requested = true;
                     let addresses = contact_addresses(&swarm, &args.relays, local_peer_id);
@@ -1207,7 +1230,7 @@ pub async fn run(
                             let peer = pairing.inviter.peer_id.parse::<PeerId>()?;
                             if peer == local_peer_id {
                                 let _ = events.send(ClientEvent::Error { message: "non puoi collegare il dispositivo a se stesso".into() });
-                                continue;
+                                return Ok(LoopFlow::Continue);
                             }
                             let addresses = pairing
                                 .inviter
@@ -1317,6 +1340,10 @@ pub async fn run(
                     }
                 }
                 Some(ClientCommand::SendText { peer, text }) => {
+                    if let Err(message) = check_outgoing_text(&text) {
+                        let _ = events.send(ClientEvent::Error { message });
+                        return Ok(LoopFlow::Continue);
+                    }
                     // Nessun canale cifrato diretto col contatto (offline, oppure
                     // connesso ma handshake non ancora completo): se ho un dispositivo
                     // collegato online gli chiedo di consegnare il messaggio (relay).
@@ -1352,7 +1379,7 @@ pub async fn run(
                                 log::warn!("relay verso dispositivo fallito: {error}");
                             }
                         }
-                        continue;
+                        return Ok(LoopFlow::Continue);
                     }
                     let emoticons = resolve_emoticons(&text, &triggers)
                         .map_err(|error| format!("trigger emoticon non valido: {error:?}"))?;
@@ -1486,7 +1513,7 @@ pub async fn run(
                         let _ = events.send(ClientEvent::Error {
                             message: "contatto non collegato".into(),
                         });
-                        continue;
+                        return Ok(LoopFlow::Continue);
                     }
                     match build_manifest(&path) {
                         Ok(manifest) => {
@@ -1765,11 +1792,11 @@ pub async fn run(
                     let mut members = members.into_iter().filter(|peer| *peer != local_peer_id).collect::<HashSet<_>>();
                     if name.is_empty() || name.len() > 64 {
                         let _ = events.send(ClientEvent::Error { message: "nome della chat non valido".into() });
-                        continue;
+                        return Ok(LoopFlow::Continue);
                     }
                     if members.len() < 2 || members.len() > 31 || members.iter().any(|peer| !known_contacts.contains(peer)) {
                         let _ = events.send(ClientEvent::Error { message: "scegli da 2 a 31 contatti validi".into() });
-                        continue;
+                        return Ok(LoopFlow::Continue);
                     }
                     let mut group_id = [0_u8; 16];
                     OsRng.fill_bytes(&mut group_id);
@@ -1797,11 +1824,11 @@ pub async fn run(
                 Some(ClientCommand::ModerateGroup { group_id, peer, action }) => {
                     if let Err(message) = parse_group_id(&group_id) {
                         let _ = events.send(ClientEvent::Error { message });
-                        continue;
+                        return Ok(LoopFlow::Continue);
                     }
                     let Some(mut group) = history.group_chat(&group_id)? else {
                         let _ = events.send(ClientEvent::Error { message: "chat di gruppo non trovata".into() });
-                        continue;
+                        return Ok(LoopFlow::Continue);
                     };
                     if let Err(message) = apply_group_moderation(
                         &mut group,
@@ -1811,7 +1838,7 @@ pub async fn run(
                         now_ms(),
                     ) {
                         let _ = events.send(ClientEvent::Error { message: message.into() });
-                        continue;
+                        return Ok(LoopFlow::Continue);
                     }
                     history.save_group_chat(&group)?;
                     let definition = group_definition(&group)?;
@@ -1835,22 +1862,26 @@ pub async fn run(
                     send_group_chats(&history.group_chats()?, &events);
                 }
                 Some(ClientCommand::SendGroupText { group_id, text }) => {
+                    if let Err(message) = check_outgoing_text(&text) {
+                        let _ = events.send(ClientEvent::Error { message });
+                        return Ok(LoopFlow::Continue);
+                    }
                     let parsed_id = match parse_group_id(&group_id) {
                         Ok(id) => id,
-                        Err(message) => { let _ = events.send(ClientEvent::Error { message }); continue; }
+                        Err(message) => { let _ = events.send(ClientEvent::Error { message }); return Ok(LoopFlow::Continue); }
                     };
                     let Some(group) = history.group_chat(&group_id)? else {
                         let _ = events.send(ClientEvent::Error { message: "chat di gruppo non trovata".into() });
-                        continue;
+                        return Ok(LoopFlow::Continue);
                     };
                     let timestamp_ms = now_ms();
                     if !group_member_can_send(&group, &local_peer_id.to_string(), timestamp_ms) {
                         let _ = events.send(ClientEvent::Error { message: "non puoi scrivere: sei silenziato o bannato".into() });
-                        continue;
+                        return Ok(LoopFlow::Continue);
                     }
                     let emoticons = match resolve_emoticons(&text, &triggers) {
                         Ok(emoticons) => emoticons,
-                        Err(error) => { let _ = events.send(ClientEvent::Error { message: format!("trigger emoticon non valido: {error:?}") }); continue; }
+                        Err(error) => { let _ = events.send(ClientEvent::Error { message: format!("trigger emoticon non valido: {error:?}") }); return Ok(LoopFlow::Continue); }
                     };
                     let mut group_message_id = [0u8; 16];
                     OsRng.fill_bytes(&mut group_message_id);
@@ -1870,7 +1901,7 @@ pub async fn run(
                         .collect::<Vec<_>>();
                     if recipients.is_empty() {
                         let _ = events.send(ClientEvent::Error { message: "nessun partecipante è online con una sessione protetta".into() });
-                        continue;
+                        return Ok(LoopFlow::Continue);
                     }
                     for recipient in &recipients {
                         for asset_id in emoticons.iter().map(|span| span.asset_id).collect::<HashSet<_>>() {
@@ -1900,16 +1931,16 @@ pub async fn run(
                 Some(ClientCommand::SendGroupFile { group_id, path }) => {
                     let parsed_id = match parse_group_id(&group_id) {
                         Ok(id) => id,
-                        Err(message) => { let _ = events.send(ClientEvent::Error { message }); continue; }
+                        Err(message) => { let _ = events.send(ClientEvent::Error { message }); return Ok(LoopFlow::Continue); }
                     };
                     let Some(group) = history.group_chat(&group_id)? else {
                         let _ = events.send(ClientEvent::Error { message: "chat di gruppo non trovata".into() });
-                        continue;
+                        return Ok(LoopFlow::Continue);
                     };
                     let timestamp_ms = now_ms();
                     if !group_member_can_send(&group, &local_peer_id.to_string(), timestamp_ms) {
                         let _ = events.send(ClientEvent::Error { message: "non puoi inviare file: sei silenziato o bannato".into() });
-                        continue;
+                        return Ok(LoopFlow::Continue);
                     }
                     let recipients = group.members.iter()
                         .filter_map(|value| value.parse::<PeerId>().ok())
@@ -1921,7 +1952,7 @@ pub async fn run(
                         .collect::<Vec<_>>();
                     if recipients.is_empty() {
                         let _ = events.send(ClientEvent::Error { message: "nessun partecipante è online con una sessione protetta".into() });
-                        continue;
+                        return Ok(LoopFlow::Continue);
                     }
                     match build_manifest(&path) {
                         Ok(manifest) => {
@@ -2009,7 +2040,7 @@ pub async fn run(
                 Some(ClientCommand::AcceptAttachment { offer_id }) => {
                     let Some(pending) = pending_inbound_offers.remove(&offer_id) else {
                         let _ = events.send(ClientEvent::Error { message: "offerta file scaduta".into() });
-                        continue;
+                        return Ok(LoopFlow::Continue);
                     };
                     let client_event = client_event_from_chat(
                         pending.peer,
@@ -2039,7 +2070,7 @@ pub async fn run(
                 }
                 Some(ClientCommand::RejectAttachment { offer_id }) => {
                     let Some(pending) = pending_inbound_offers.remove(&offer_id) else {
-                        continue;
+                        return Ok(LoopFlow::Continue);
                     };
                     swarm.behaviour_mut().secure_chat.send_response(
                         pending.channel,
@@ -2449,14 +2480,14 @@ pub async fn run(
                                                     }
                                                 }
                                                 swarm.behaviour_mut().secure_chat.send_response(channel, resp).ok();
-                                                continue;
+                                                return Ok(LoopFlow::Continue);
                                             }
                                             if pending_inbound_offers.len() >= MAX_PENDING_INBOUND_OFFERS {
                                                 swarm.behaviour_mut().secure_chat.send_response(
                                                     channel,
                                                     ProtocolResponse::Rejected("troppe offerte file in attesa".into()),
                                                 ).ok();
-                                                continue;
+                                                return Ok(LoopFlow::Continue);
                                             }
                                             inbound_offer_counter = inbound_offer_counter
                                                 .checked_add(1)
@@ -2479,7 +2510,7 @@ pub async fn run(
                                                 event: envelope.event,
                                                 channel,
                                             });
-                                            continue;
+                                            return Ok(LoopFlow::Continue);
                                         }
                                         Ok(None) => {}
                                         Err(error) => {
@@ -2487,7 +2518,7 @@ pub async fn run(
                                                 channel,
                                                 ProtocolResponse::Rejected(error),
                                             ).ok();
-                                            continue;
+                                            return Ok(LoopFlow::Continue);
                                         }
                                     }
                                     let client_event = client_event_from_chat(
@@ -2736,11 +2767,11 @@ pub async fn run(
                     }
                     request_response::Message::Response { request_id, response } => {
                         let Some((expected_peer, initiator)) = pending_handshakes.remove(&request_id) else {
-                            continue;
+                            return Ok(LoopFlow::Continue);
                         };
                         if expected_peer != peer {
                             eprintln!("risposta handshake ricevuta dal peer errato");
-                            continue;
+                            return Ok(LoopFlow::Continue);
                         }
                         match response {
                             HybridResponse::Accepted(hello) => match initiator.finish(&hello) {
@@ -3001,7 +3032,7 @@ pub async fn run(
                     }
                     request_response::Message::Response { request_id, response } => {
                         let Some(pending) = pending_device_requests.remove(&request_id) else {
-                            continue;
+                            return Ok(LoopFlow::Continue);
                         };
                         // La risposta a un RelayText conferma solo la consegna: nessuno
                         // stato da aggiornare qui (il messaggio è già mostrato e verrà
@@ -3020,15 +3051,15 @@ pub async fn run(
                                     other => log::warn!("relay: risposta inattesa da {peer}: {other:?}"),
                                 }
                             }
-                            continue;
+                            return Ok(LoopFlow::Continue);
                         }
                         let (expected_peer, key, pairing) = match pending {
                             PendingDeviceRequest::Pair { peer, key } => (peer, key, true),
                             PendingDeviceRequest::Sync { peer } => (peer, account_key, false),
-                            PendingDeviceRequest::Relay { .. } => continue,
+                            PendingDeviceRequest::Relay { .. } => return Ok(LoopFlow::Continue),
                         };
                         if expected_peer != peer {
-                            continue;
+                            return Ok(LoopFlow::Continue);
                         }
                         match devices::open::<DeviceResponse>(&key, &response) {
                             Ok(DeviceResponse::Paired { account_key: linked_key, devices: linked, records, latest_seq, accepted_through }) if pairing => {
@@ -3217,9 +3248,48 @@ pub async fn run(
                 _ => {}
             }
         }
+        Ok(LoopFlow::Continue)
+        }
+        .await;
+        match step {
+            Ok(LoopFlow::Continue) => {}
+            Ok(LoopFlow::Stop) => break,
+            Err(error) => report_loop_error(&events, error.as_ref()),
+        }
     }
-    let _ = events.send(ClientEvent::Stopped);
     Ok(())
+}
+
+/// Un testo oltre il limite del protocollo verrebbe rifiutato dal destinatario
+/// (e prima di questo controllo spegneva il nodo): lo fermiamo subito con un
+/// errore leggibile.
+fn check_outgoing_text(text: &str) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Err("il messaggio è vuoto".into());
+    }
+    if text.len() > MAX_TEXT_BYTES {
+        return Err(format!(
+            "messaggio troppo lungo: massimo {} KB",
+            MAX_TEXT_BYTES / 1024
+        ));
+    }
+    Ok(())
+}
+
+/// Esito della gestione di un singolo evento del loop principale.
+enum LoopFlow {
+    Continue,
+    Stop,
+}
+
+/// Un errore durante la gestione di un evento non deve spegnere il nodo:
+/// viene mostrato all'utente e il loop prosegue con l'evento successivo.
+fn report_loop_error(events: &mpsc::UnboundedSender<ClientEvent>, error: &dyn Error) {
+    eprintln!("errore gestito nel loop: {error}");
+    log::warn!("errore gestito nel loop: {error}");
+    let _ = events.send(ClientEvent::Error {
+        message: error.to_string(),
+    });
 }
 
 /// Ultimi messaggi di una conversazione nel formato atteso dalla UI.
@@ -6417,6 +6487,92 @@ mod tests {
                 bob.shutdown().await;
             })
             .await;
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Audit #1: un testo oltre 16 KB spegneva il nodo. Ora il mittente
+    /// riceve un errore e la conversazione continua.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(windows, ignore = "il teardown libp2p può bloccare l'harness Windows")]
+    async fn oversized_text_reports_error_and_node_keeps_running() {
+        let root = test_root("long-text");
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut alice = TestNode::start(loopback_config("Alice", &root.join("alice"), None)).await;
+                let mut bob = TestNode::start(loopback_config("Bob", &root.join("bob"), None)).await;
+                connect_pair(&mut alice, &mut bob).await;
+
+                bob.send(ClientCommand::SendText {
+                    peer: alice.peer,
+                    text: "x".repeat(20 * 1024),
+                });
+                let ClientEvent::Error { message } =
+                    bob.until(|event| matches!(event, ClientEvent::Error { .. })).await
+                else {
+                    unreachable!()
+                };
+                assert!(message.contains("troppo lungo"), "{message}");
+
+                bob.send(ClientCommand::SendText {
+                    peer: alice.peer,
+                    text: "ancora vivo".into(),
+                });
+                alice.until_text("ancora vivo").await;
+                alice.shutdown().await;
+                bob.shutdown().await;
+            })
+            .await;
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Audit #1: anche un errore interno a metà gestione di un evento non deve
+    /// fermare il loop.
+    #[tokio::test(flavor = "current_thread")]
+    async fn internal_error_in_event_is_reported_and_loop_continues() {
+        let root = test_root("loop-error");
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut node = TestNode::start(loopback_config("Solo", &root, None)).await;
+                // Link di pairing valido ma con un Peer ID non valido: prima il
+                // `?` sul parse terminava `run()`.
+                let link = devices::create_pairing_link(
+                    DeviceDescriptor {
+                        peer_id: "non-un-peer".into(),
+                        name: "x".into(),
+                        addresses: Vec::new(),
+                    },
+                    now_ms(),
+                )
+                .unwrap()
+                .0;
+                node.send(ClientCommand::ImportDeviceLink { link });
+                node.until(|event| matches!(event, ClientEvent::Error { .. })).await;
+                node.send(ClientCommand::RequestContactLink);
+                node.until(|event| matches!(event, ClientEvent::ContactLink { .. })).await;
+                node.shutdown().await;
+            })
+            .await;
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Audit #2: se il nodo termina con un errore la UI deve ricevere
+    /// `Stopped`, altrimenti i contatti restano verdi.
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_node_emits_error_then_stopped() {
+        let root = test_root("stopped");
+        fs::create_dir_all(root.join("history.db")).unwrap();
+        let config = loopback_config("Rotto", &root, None);
+        let (_commands, command_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        assert!(run(config, command_rx, event_tx).await.is_err());
+        let mut received = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            received.push(event);
+        }
+        assert!(matches!(received.last(), Some(ClientEvent::Stopped)), "{received:?}");
+        assert!(received.iter().any(|event| matches!(event, ClientEvent::Error { .. })));
         fs::remove_dir_all(root).ok();
     }
 
