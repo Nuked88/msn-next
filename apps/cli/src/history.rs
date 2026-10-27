@@ -116,6 +116,8 @@ impl History {
             fs::create_dir_all(parent)?;
         }
         let connection = Connection::open(path)?;
+        // Le righe cancellate vengono azzerate su disco, non solo scollegate.
+        connection.pragma_update(None, "secure_delete", true)?;
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY,
@@ -148,7 +150,9 @@ impl History {
         CREATE TABLE IF NOT EXISTS sync_log (
             seq INTEGER PRIMARY KEY AUTOINCREMENT,
             op_id TEXT NOT NULL UNIQUE,
-            payload BLOB NOT NULL
+            payload BLOB NOT NULL,
+            event_id TEXT,
+            peer TEXT
         );
         CREATE TABLE IF NOT EXISTS sync_versions (
             entity TEXT PRIMARY KEY,
@@ -183,10 +187,24 @@ impl History {
             "CREATE UNIQUE INDEX IF NOT EXISTS events_event_id ON events(event_id)",
             [],
         )?;
+        // Il sync_log ricorda a quale messaggio e conversazione si riferisce
+        // ogni RecordEvent, così una cancellazione può toglierne il contenuto.
+        let index_sync_log = !column_exists(&connection, "sync_log", "event_id")?;
+        if index_sync_log {
+            connection.execute("ALTER TABLE sync_log ADD COLUMN event_id TEXT", [])?;
+            connection.execute("ALTER TABLE sync_log ADD COLUMN peer TEXT", [])?;
+        }
+        connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS sync_log_event_id ON sync_log(event_id);
+             CREATE INDEX IF NOT EXISTS sync_log_peer ON sync_log(peer);",
+        )?;
         let history = Self {
             connection,
             cipher: XChaCha20Poly1305::new((&key).into()),
         };
+        if index_sync_log {
+            history.compact_sync_log()?;
+        }
         history.seed_sync_log()?;
         Ok(history)
     }
@@ -645,9 +663,16 @@ impl History {
     pub fn latest_sync_seq(&self) -> Result<u64, Box<dyn Error>> {
         Ok(self
             .connection
-            .query_row("SELECT coalesce(max(seq), 0) FROM sync_log", [], |row| {
-                row.get(0)
-            })?)
+            // Dal contatore e non da max(seq): le righe compattate lasciano
+            // buchi, anche in fondo al log.
+            .query_row(
+                "SELECT max(
+                    coalesce((SELECT max(seq) FROM sync_log), 0),
+                    coalesce((SELECT seq FROM sqlite_sequence WHERE name = 'sync_log'), 0)
+                 )",
+                [],
+                |row| row.get(0),
+            )?)
     }
 
     pub fn sync_records_since(
@@ -731,11 +756,122 @@ impl History {
         op_id: &str,
         operation: &SyncOperation,
     ) -> Result<(), Box<dyn Error>> {
+        // Un messaggio già cancellato non entra nel log con il suo testo,
+        // nemmeno se arriva da un altro dispositivo dopo la cancellazione.
+        let redacted = self.redacted(operation)?;
+        let operation = redacted.as_ref().unwrap_or(operation);
+        let (event_id, peer) = sync_subject(operation);
         let payload = cbor4ii::serde::to_vec(Vec::new(), operation)?;
         self.connection.execute(
-            "INSERT OR IGNORE INTO sync_log (op_id, payload) VALUES (?1, ?2)",
-            params![op_id, self.seal(&payload)?],
+            "INSERT OR IGNORE INTO sync_log (op_id, payload, event_id, peer) VALUES (?1, ?2, ?3, ?4)",
+            params![op_id, self.seal(&payload)?, event_id, peer],
         )?;
+        Ok(())
+    }
+
+    /// La versione di un'operazione da conservare nel sync_log, se diversa:
+    /// un RecordEvent di un messaggio cancellato perde il contenuto. Il log
+    /// viene reinviato a ogni nuovo dispositivo collegato, quindi senza
+    /// questo i messaggi "cancellati" restavano su disco e si propagavano.
+    fn redacted(&self, operation: &SyncOperation) -> Result<Option<SyncOperation>, Box<dyn Error>> {
+        let SyncOperation::RecordEvent(event) = operation else {
+            return Ok(None);
+        };
+        let deleted: Option<(i64, u64)> = self
+            .connection
+            .query_row(
+                "SELECT tombstone, changed_at_ms FROM deleted_events WHERE event_id = ?1",
+                [&event.event_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let removed_at = match deleted {
+            Some((0, changed_at_ms)) => Some(changed_at_ms),
+            Some(_) if event.kind == "deleted" && event.body.is_empty() => return Ok(None),
+            Some(_) => {
+                return Ok(Some(SyncOperation::RecordEvent(Entry {
+                    kind: "deleted".into(),
+                    body: String::new(),
+                    ..event.clone()
+                })))
+            }
+            None => {
+                // Conversazione svuotata (o contatto/gruppo eliminato) dopo
+                // questo messaggio. Non un DeleteEvent: con una fusione di
+                // contatti lo stesso id vive ancora sotto il contatto superstite.
+                let cleared_at = self
+                    .entity_version(&format!("conversation:{}", event.peer))?
+                    .map(|(cleared_at, _)| cleared_at)
+                    .filter(|cleared_at| *cleared_at >= event.timestamp_ms);
+                return Ok(cleared_at.map(|changed_at_ms| SyncOperation::ClearConversation {
+                    peer: event.peer.clone(),
+                    changed_at_ms,
+                }));
+            }
+        };
+        Ok(removed_at.map(|changed_at_ms| SyncOperation::DeleteEvent {
+            event_id: event.event_id.clone(),
+            changed_at_ms,
+        }))
+    }
+
+    /// Riscrive le righe del sync_log di un messaggio (`event_id`) o di una
+    /// conversazione (`peer`) dopo una cancellazione.
+    fn redact_sync_log(&self, column: &str, value: &str) -> Result<(), Box<dyn Error>> {
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT seq, payload FROM sync_log WHERE {column} = ?1"
+        ))?;
+        let rows = statement
+            .query_map([value], |row| Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (seq, payload) in rows {
+            let operation: SyncOperation = cbor4ii::serde::from_slice(&self.unseal(&payload)?)?;
+            if let Some(redacted) = self.redacted(&operation)? {
+                self.replace_sync_row(seq, &redacted)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Un messaggio eliminato per tutti resta come segnaposto; per il resto la
+    /// riga sparisce: l'operazione di cancellazione è già nel log e basta ai
+    /// nuovi dispositivi.
+    fn replace_sync_row(&self, seq: u64, redacted: &SyncOperation) -> Result<(), Box<dyn Error>> {
+        if matches!(redacted, SyncOperation::RecordEvent(_)) {
+            self.rewrite_sync_row(seq, redacted)
+        } else {
+            self.connection.execute("DELETE FROM sync_log WHERE seq = ?1", [seq])?;
+            Ok(())
+        }
+    }
+
+    fn rewrite_sync_row(&self, seq: u64, operation: &SyncOperation) -> Result<(), Box<dyn Error>> {
+        let (event_id, peer) = sync_subject(operation);
+        let payload = cbor4ii::serde::to_vec(Vec::new(), operation)?;
+        self.connection.execute(
+            "UPDATE sync_log SET payload = ?2, event_id = ?3, peer = ?4 WHERE seq = ?1",
+            params![seq, self.seal(&payload)?, event_id, peer],
+        )?;
+        Ok(())
+    }
+
+    /// Una tantum, sui database creati prima dell'indice: annota ogni riga e
+    /// toglie il contenuto dei messaggi già cancellati.
+    fn compact_sync_log(&self) -> Result<(), Box<dyn Error>> {
+        let rows = {
+            let mut statement = self.connection.prepare("SELECT seq, payload FROM sync_log")?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        for (seq, payload) in rows {
+            let operation: SyncOperation = cbor4ii::serde::from_slice(&self.unseal(&payload)?)?;
+            match self.redacted(&operation)? {
+                Some(redacted) => self.replace_sync_row(seq, &redacted)?,
+                None => self.rewrite_sync_row(seq, &operation)?,
+            }
+        }
         Ok(())
     }
 
@@ -797,6 +933,7 @@ impl History {
                      ON CONFLICT(event_id) DO UPDATE SET tombstone = 0, changed_at_ms = ?2",
                     params![event_id, changed_at_ms],
                 )?;
+                self.redact_sync_log("event_id", event_id)?;
                 true
             }
             SyncOperation::TombstoneEvent {
@@ -812,6 +949,7 @@ impl History {
                      ON CONFLICT(event_id) DO UPDATE SET tombstone = 1, changed_at_ms = ?2",
                     params![event_id, changed_at_ms],
                 )?;
+                self.redact_sync_log("event_id", event_id)?;
                 true
             }
             SyncOperation::UpsertContact {
@@ -862,6 +1000,7 @@ impl History {
                     [peer],
                 )?;
                 self.set_version(&format!("conversation:{peer}"), *changed_at_ms, op_id)?;
+                self.redact_sync_log("peer", peer)?;
                 true
             }
             SyncOperation::ClearConversation {
@@ -876,6 +1015,7 @@ impl History {
                     "DELETE FROM events WHERE peer = ?1 AND timestamp_ms <= ?2",
                     params![peer, changed_at_ms],
                 )?;
+                self.redact_sync_log("peer", peer)?;
                 true
             }
             SyncOperation::UpsertGroup {
@@ -909,6 +1049,7 @@ impl History {
                     *changed_at_ms,
                     op_id,
                 )?;
+                self.redact_sync_log("peer", &conversation)?;
                 true
             }
         };
@@ -1011,6 +1152,14 @@ impl History {
         self.cipher
             .decrypt(XNonce::from_slice(&encrypted[..24]), &encrypted[24..])
             .map_err(|_| "dato non decifrabile".into())
+    }
+}
+
+/// Messaggio e conversazione a cui si riferisce una riga del sync_log.
+fn sync_subject(operation: &SyncOperation) -> (Option<&str>, Option<&str>) {
+    match operation {
+        SyncOperation::RecordEvent(event) => (Some(&event.event_id), Some(&event.peer)),
+        _ => (None, None),
     }
 }
 
@@ -1167,6 +1316,86 @@ mod tests {
         assert_eq!(seen.len(), 250);
         assert_eq!(seen.first().map(String::as_str), Some("m249"));
         assert_eq!(seen.last().map(String::as_str), Some("m0"));
+        fs::remove_file(path).ok();
+    }
+
+    fn logged_bodies(history: &History) -> Vec<String> {
+        history
+            .sync_records_since(0, usize::MAX >> 1)
+            .unwrap()
+            .into_iter()
+            .filter_map(|record| match record.operation {
+                SyncOperation::RecordEvent(event) => Some(event.body),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Audit #17: un messaggio cancellato spariva da `events` ma la copia
+    /// restava nel sync_log, reinviato a ogni nuovo dispositivo.
+    #[test]
+    fn deleted_messages_leave_the_sync_log() {
+        let path = std::env::temp_dir().join(format!("msnnext-redact-{}.db", std::process::id()));
+        fs::remove_file(&path).ok();
+        let history = History::open(&path, [6; 32]).unwrap();
+        history.record_with_id("a1", "alice", "in", "text", "per me", 10).unwrap();
+        history.record_with_id("a2", "alice", "out", "text", "per tutti", 11).unwrap();
+        history.record_with_id("b1", "bob", "in", "text", "svuotato", 12).unwrap();
+        history.record_with_id("c1", "carol", "in", "text", "contatto eliminato", 13).unwrap();
+        history.record_with_id("a3", "alice", "in", "text", "resta", 14).unwrap();
+
+        history.delete_event("a1", 20).unwrap();
+        history.tombstone_event("a2", 21).unwrap();
+        history.clear_conversation("bob").unwrap();
+        history.delete_contact("carol").unwrap();
+        assert_eq!(logged_bodies(&history), vec!["".to_owned(), "resta".to_owned()]);
+
+        // Lo stesso messaggio che arriva dopo da un altro dispositivo non
+        // rientra nel log con il testo.
+        let late = SyncRecord {
+            seq: 1,
+            op_id: "remoto".into(),
+            operation: SyncOperation::RecordEvent(Entry {
+                event_id: "a1".into(),
+                peer: "alice".into(),
+                direction: "in".into(),
+                kind: "text".into(),
+                body: "per me".into(),
+                timestamp_ms: 10,
+            }),
+        };
+        history.apply_sync_records(&[late]).unwrap();
+        assert!(!logged_bodies(&history).contains(&"per me".to_owned()));
+        assert!(history.latest_sync_seq().unwrap() >= 9);
+        fs::remove_file(path).ok();
+    }
+
+    /// I database precedenti all'indice vengono compattati una volta
+    /// all'apertura.
+    #[test]
+    fn old_sync_log_is_compacted_on_open() {
+        let path = std::env::temp_dir().join(format!("msnnext-compact-{}.db", std::process::id()));
+        fs::remove_file(&path).ok();
+        {
+            let history = History::open(&path, [4; 32]).unwrap();
+            history.record_with_id("x1", "alice", "in", "text", "segreto", 10).unwrap();
+            history.record_with_id("x2", "alice", "in", "text", "resta", 11).unwrap();
+            // Come una cancellazione fatta da una versione precedente: il
+            // testo resta nel log e il log non ha le colonne nuove.
+            history
+                .connection
+                .execute_batch(
+                    "DELETE FROM events WHERE event_id = 'x1';
+                     INSERT INTO deleted_events (event_id, tombstone, changed_at_ms) VALUES ('x1', 0, 20);
+                     DROP INDEX sync_log_event_id;
+                     DROP INDEX sync_log_peer;
+                     ALTER TABLE sync_log DROP COLUMN event_id;
+                     ALTER TABLE sync_log DROP COLUMN peer;",
+                )
+                .unwrap();
+        }
+        let history = History::open(&path, [4; 32]).unwrap();
+        assert_eq!(logged_bodies(&history), vec!["resta".to_owned()]);
         fs::remove_file(path).ok();
     }
 
