@@ -173,6 +173,15 @@ impl History {
             event_id TEXT PRIMARY KEY,
             tombstone INTEGER NOT NULL,
             changed_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS revoked_devices (
+            peer TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            revoked_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS retired_account_keys (
+            key_id BLOB PRIMARY KEY,
+            account_key BLOB NOT NULL
         );",
         )?;
         if !column_exists(&connection, "contacts", "account_id")? {
@@ -609,6 +618,75 @@ impl History {
             ],
         )?;
         Ok(())
+    }
+
+    /// Esclude un dispositivo dall'account: niente più sync né relay con lui,
+    /// anche dopo un riavvio. Un nuovo pairing lo riammette.
+    pub fn revoke_device(&self, peer: &str, name: &str) -> Result<(), Box<dyn Error>> {
+        self.connection
+            .execute("DELETE FROM linked_devices WHERE peer = ?1", [peer])?;
+        self.connection
+            .execute("DELETE FROM sync_cursors WHERE peer = ?1", [peer])?;
+        self.connection.execute(
+            "INSERT OR REPLACE INTO revoked_devices (peer, name, revoked_at_ms) VALUES (?1, ?2, ?3)",
+            params![peer, name, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn readmit_device(&self, peer: &str) -> Result<(), Box<dyn Error>> {
+        self.connection
+            .execute("DELETE FROM revoked_devices WHERE peer = ?1", [peer])?;
+        Ok(())
+    }
+
+    /// Dispositivi revocati: `(peer, nome)`.
+    pub fn revoked_devices(&self) -> Result<Vec<(String, String)>, Box<dyn Error>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT peer, name FROM revoked_devices ORDER BY peer")?;
+        let peers = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(peers)
+    }
+
+    /// Conserva una chiave di account sostituita: serve a riconoscere i
+    /// dispositivi rimasti offline durante la rotazione e passare loro la
+    /// chiave nuova.
+    pub fn retire_account_key(
+        &self,
+        key_id: &[u8; 16],
+        key: &[u8; 32],
+    ) -> Result<(), Box<dyn Error>> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO retired_account_keys (key_id, account_key) VALUES (?1, ?2)",
+            params![key_id.as_slice(), self.seal(key)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn retired_account_key(
+        &self,
+        key_id: &[u8; 16],
+    ) -> Result<Option<[u8; 32]>, Box<dyn Error>> {
+        let sealed: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT account_key FROM retired_account_keys WHERE key_id = ?1",
+                [key_id.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        sealed
+            .map(|sealed| {
+                let key: [u8; 32] = self
+                    .unseal(&sealed)?
+                    .try_into()
+                    .map_err(|_| "chiave di account ritirata non valida")?;
+                Ok(key)
+            })
+            .transpose()
     }
 
     pub fn devices(&self) -> Result<Vec<DeviceEntry>, Box<dyn Error>> {
