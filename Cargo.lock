@@ -3672,7 +3672,7 @@ dependencies = [
 
 [[package]]
 name = "msnnext"
-version = "0.1.0"
+version = "0.8.6"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -3695,7 +3695,7 @@ dependencies = [
 
 [[package]]
 name = "msnnext-desktop"
-version = "0.2.0"
+version = "0.8.6"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -3724,7 +3724,7 @@ dependencies = [
 
 [[package]]
 name = "msnnext-protocol"
-version = "0.1.0"
+version = "0.8.6"
 dependencies = [
  "serde",
 ]
