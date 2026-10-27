@@ -1585,6 +1585,15 @@ button:disabled {
   font-weight: 750;
 }
 
+.failed-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: #c0392b;
+  font-size: 0.85em;
+  cursor: help;
+}
+
 .relayed-badge {
   display: inline-flex;
   align-items: center;

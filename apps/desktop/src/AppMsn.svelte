@@ -50,6 +50,7 @@
     Square,
     Sun,
     Trash2,
+    TriangleAlert,
     Upload,
     UserRound,
     UserRoundPlus,
@@ -113,6 +114,7 @@
     deleted?: boolean
     timestampMs?: number
     relayed?: boolean
+    failed?: boolean
   }
 
   type GroupChat = {
@@ -179,6 +181,7 @@
     | { type: 'attachmentOpened'; id: string; dataUrl: string }
     | { type: 'attachmentExported'; path: string }
     | { type: 'error'; message: string }
+    | { type: 'messageFailed'; peerId: string; eventId: string; reason: string }
     | { type: 'ready' }
     | { type: 'stopped' }
 
@@ -802,6 +805,11 @@
     }
     if (event.type === 'messageDeleted') {
       markMessageDeleted(event.eventId)
+      return
+    }
+    if (event.type === 'messageFailed') {
+      markMessageFailed(event.eventId)
+      showToast($t('toast.messageNotDelivered', { reason: event.reason }))
       return
     }
     if (event.type === 'contactStatus') {
@@ -1987,6 +1995,14 @@
       && (message.timestampMs === undefined || Date.now() - message.timestampMs < deleteEveryoneWindowMs)
   }
 
+  function markMessageFailed(eventId: string) {
+    const next: Record<string, ChatMessage[]> = {}
+    for (const [key, list] of Object.entries(conversations)) {
+      next[key] = list.map((message) => message.eventId === eventId ? { ...message, failed: true } : message)
+    }
+    conversations = next
+  }
+
   function markMessageDeleted(eventId: string) {
     const next: Record<string, ChatMessage[]> = {}
     for (const [key, list] of Object.entries(conversations)) {
@@ -2249,6 +2265,7 @@
                     {#if !sameSender}<strong>{senderName(message)}</strong>{/if}
                     <time>{message.time}</time>
                     {#if message.relayed}<span class="relayed-badge" title={$t('msg.relayedHint')}><Share2 size={11} /></span>{/if}
+                    {#if message.failed}<span class="failed-badge" title={$t('msg.notDeliveredHint')}><TriangleAlert size={11} /> {$t('msg.notDelivered')}</span>{/if}
                   </header>
                   {#if message.deleted}
                     <p class="deleted-message"><Trash2 size={13} /> {message.mine ? $t('msg.deletedByYou') : $t('msg.deletedMessage')}</p>
