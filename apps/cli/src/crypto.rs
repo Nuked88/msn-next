@@ -13,11 +13,17 @@ use libp2p::{identity::ed25519, PeerId};
 use msnnext_protocol::AccountProof;
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};
-use zeroize::{ZeroizeOnDrop, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const HYBRID_HANDSHAKE_VERSION: u16 = 1;
 const RATCHET_VERSION: u16 = 1;
+/// Chiavi di messaggi saltati conservate per la consegna fuori ordine. Oltre
+/// questo numero si scartano le più vecchie: quei messaggi, se arrivano,
+/// vengono rifiutati, ma la sessione continua ad avanzare.
 const MAX_SKIPPED_MESSAGE_KEYS: u64 = 64;
+/// Buco massimo accettato in un singolo salto in avanti. Un salto più grande
+/// viene rifiutato e il mittente rifà l'handshake.
+const MAX_MESSAGE_GAP: u64 = 4096;
 
 pub(crate) struct MlDsaIdentity(PqdsaKeyPair);
 
@@ -55,7 +61,8 @@ pub(crate) struct AccountIdentity {
 impl AccountIdentity {
     pub(crate) fn from_account_key(account_key: &[u8; 32]) -> Result<Self, Box<dyn Error>> {
         let mut classic_seed = blake3::derive_key("msnnext account identity v1", account_key);
-        let classic = ed25519::Keypair::from(ed25519::SecretKey::try_from_bytes(&mut classic_seed)?);
+        let classic =
+            ed25519::Keypair::from(ed25519::SecretKey::try_from_bytes(&mut classic_seed)?);
         let ml_dsa = MlDsaIdentity::from_seed(&blake3::derive_key(
             "msnnext account ml-dsa v1",
             account_key,
@@ -86,11 +93,8 @@ impl AccountIdentity {
 /// dell'account. Il peer id firmato impedisce di riusare la prova di un altro
 /// dispositivo: chi la rigioca da un peer diverso fallisce la verifica.
 pub(crate) fn verify_account_proof(proof: &AccountProof, device: PeerId) -> Option<String> {
-    let payload = account_proof_payload(
-        &proof.classic_public_key,
-        &proof.ml_dsa_public_key,
-        device,
-    );
+    let payload =
+        account_proof_payload(&proof.classic_public_key, &proof.ml_dsa_public_key, device);
     let classic = ed25519::PublicKey::try_from_bytes(&proof.classic_public_key).ok()?;
     if !classic.verify(&payload, &proof.classic_signature) {
         return None;
@@ -126,6 +130,13 @@ pub(crate) struct HybridClientHello {
     pub(crate) version: u16,
     pub(crate) ml_kem_public_key: Vec<u8>,
     pub(crate) x25519_public_key: [u8; 32],
+    /// Firma ML-DSA dell'hello. `default`: i client più vecchi non la inviano.
+    #[serde(default)]
+    pub(crate) auth: Option<HandshakeAuth>,
+    /// Rinnovo di una sessione già attiva: il responder tiene la vecchia
+    /// finché non riceve il primo messaggio cifrato con la nuova.
+    #[serde(default)]
+    pub(crate) rekey: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +144,26 @@ pub(crate) struct HybridServerHello {
     pub(crate) version: u16,
     pub(crate) ml_kem_ciphertext: Vec<u8>,
     pub(crate) x25519_public_key: [u8; 32],
+    #[serde(default)]
+    pub(crate) auth: Option<HandshakeAuth>,
+}
+
+/// Autenticazione post-quantum dell'handshake: la chiave ML-DSA del
+/// dispositivo firma le chiavi effimere e i due peer id. Senza questa firma
+/// l'identità del peer veniva solo da Noise/Ed25519, che un attaccante
+/// quantistico può falsificare.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HandshakeAuth {
+    pub(crate) ml_dsa_public_key: Vec<u8>,
+    pub(crate) signature: Vec<u8>,
+}
+
+/// Esito di un handshake: la chiave di sessione e, se il peer ha firmato,
+/// la sua chiave pubblica ML-DSA già verificata (da confrontare con quella
+/// fissata per quel peer).
+pub(crate) struct Handshaked {
+    pub(crate) key: SessionKey,
+    pub(crate) peer_ml_dsa_key: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +184,13 @@ pub(crate) struct HybridInitiator {
 pub(crate) struct SessionKey([u8; 32]);
 
 impl SessionKey {
+    #[cfg(test)]
+    pub(crate) fn random_for_test() -> Self {
+        let mut key = [0; 32];
+        OsRng.fill_bytes(&mut key);
+        Self(key)
+    }
+
     #[cfg(test)]
     pub(crate) fn as_bytes(&self) -> &[u8; 32] {
         &self.0
@@ -222,6 +260,12 @@ impl RatchetSession {
         }
     }
 
+    /// Messaggi cifrati o decifrati con questa sessione: oltre una soglia la
+    /// sessione va rinnovata con un nuovo handshake.
+    pub(crate) fn messages(&self) -> u64 {
+        self.send_number.saturating_add(self.receive_number)
+    }
+
     pub(crate) fn encrypt(
         &mut self,
         plaintext: &[u8],
@@ -270,29 +314,55 @@ impl RatchetSession {
                 .ok_or(RatchetError::OutOfOrder)?;
             let message_key = Zeroizing::new(self.skipped_message_keys[position].1);
             let plaintext = decrypt_ratchet_message(message, associated_data, &message_key)?;
-            self.skipped_message_keys.swap_remove(position);
+            // `remove` (non `swap_remove`) mantiene l'ordine: le chiavi più
+            // vecchie restano in testa e sono le prime a essere scartate.
+            let (_, mut used) = self.skipped_message_keys.remove(position);
+            used.zeroize();
             return Ok(plaintext);
         }
 
         let gap = message.number - self.receive_number;
-        let skipped_count = gap.saturating_sub(1);
-        if self.skipped_message_keys.len() as u64 + skipped_count > MAX_SKIPPED_MESSAGE_KEYS {
+        if gap > MAX_MESSAGE_GAP {
             return Err(RatchetError::OutOfOrder);
         }
 
+        // Dei messaggi saltati servono solo le chiavi degli ultimi
+        // MAX_SKIPPED_MESSAGE_KEYS: quelli più vecchi si considerano persi.
+        // Prima un buco oltre il limite bloccava la sessione per sempre.
+        let first_kept = message
+            .number
+            .saturating_sub(MAX_SKIPPED_MESSAGE_KEYS)
+            .max(self.receive_number + 1);
         let mut next_chain = self.receive_chain;
-        let mut skipped = Vec::with_capacity(skipped_count as usize);
+        let mut skipped = Vec::new();
         for number in self.receive_number + 1..message.number {
-            skipped.push((number, ratchet_message_key(&next_chain, number)));
+            if number >= first_kept {
+                skipped.push((number, ratchet_message_key(&next_chain, number)));
+            }
             next_chain = advance_chain(&next_chain);
         }
         let message_key = Zeroizing::new(ratchet_message_key(&next_chain, message.number));
-        let plaintext = decrypt_ratchet_message(message, associated_data, &message_key)?;
+        let plaintext = match decrypt_ratchet_message(message, associated_data, &message_key) {
+            Ok(plaintext) => plaintext,
+            Err(error) => {
+                for (_, key) in &mut skipped {
+                    key.zeroize();
+                }
+                return Err(error);
+            }
+        };
         next_chain = advance_chain(&next_chain);
 
         self.receive_chain = next_chain;
         self.receive_number = message.number;
         self.skipped_message_keys.extend(skipped);
+        let excess = self
+            .skipped_message_keys
+            .len()
+            .saturating_sub(MAX_SKIPPED_MESSAGE_KEYS as usize);
+        for (_, mut expired) in self.skipped_message_keys.drain(..excess) {
+            expired.zeroize();
+        }
         Ok(plaintext)
     }
 }
@@ -337,6 +407,7 @@ fn ratchet_associated_data(number: u64, associated_data: &[u8]) -> Vec<u8> {
 pub(crate) enum HybridError {
     UnsupportedVersion,
     CryptoOperation,
+    Authentication,
 }
 
 impl fmt::Display for HybridError {
@@ -344,6 +415,7 @@ impl fmt::Display for HybridError {
         match self {
             Self::UnsupportedVersion => formatter.write_str("versione handshake non supportata"),
             Self::CryptoOperation => formatter.write_str("operazione crittografica fallita"),
+            Self::Authentication => formatter.write_str("firma ML-DSA dell'handshake non valida"),
         }
     }
 }
@@ -371,6 +443,8 @@ impl HybridInitiator {
     pub(crate) fn start(
         initiator_peer: PeerId,
         responder_peer: PeerId,
+        identity: &MlDsaIdentity,
+        rekey: bool,
     ) -> Result<(Self, HybridClientHello), HybridError> {
         let ml_kem_private_key =
             DecapsulationKey::generate(&ML_KEM_768).map_err(|_| HybridError::CryptoOperation)?;
@@ -391,11 +465,17 @@ impl HybridInitiator {
             .try_into()
             .map_err(|_| HybridError::CryptoOperation)?;
 
-        let client_hello = HybridClientHello {
+        let mut client_hello = HybridClientHello {
             version: HYBRID_HANDSHAKE_VERSION,
             ml_kem_public_key,
             x25519_public_key,
+            auth: None,
+            rekey,
         };
+        client_hello.auth = Some(sign_handshake(
+            identity,
+            &client_transcript(&client_hello, initiator_peer, responder_peer),
+        )?);
         Ok((
             Self {
                 ml_kem_private_key,
@@ -408,24 +488,41 @@ impl HybridInitiator {
         ))
     }
 
+    /// Se l'handshake rinnova una sessione già attiva.
+    pub(crate) fn rekey(&self) -> bool {
+        self.client_hello.rekey
+    }
+
     pub(crate) fn finish(
         self,
         server_hello: &HybridServerHello,
-    ) -> Result<SessionKey, HybridError> {
+    ) -> Result<Handshaked, HybridError> {
         ensure_version(server_hello.version)?;
+        let peer_ml_dsa_key = verify_handshake(
+            server_hello.auth.as_ref(),
+            &server_transcript(
+                &self.client_hello,
+                server_hello,
+                self.initiator_peer,
+                self.responder_peer,
+            ),
+        )?;
         let ml_kem_secret = self
             .ml_kem_private_key
             .decapsulate(Ciphertext::from(server_hello.ml_kem_ciphertext.as_slice()))
             .map_err(|_| HybridError::CryptoOperation)?;
         let x25519_secret = agree_x25519(self.x25519_private_key, &server_hello.x25519_public_key)?;
-        Ok(derive_session_key(
-            &self.client_hello,
-            server_hello,
-            ml_kem_secret.as_ref(),
-            &x25519_secret,
-            self.initiator_peer,
-            self.responder_peer,
-        ))
+        Ok(Handshaked {
+            key: derive_session_key(
+                &self.client_hello,
+                server_hello,
+                ml_kem_secret.as_ref(),
+                &x25519_secret,
+                self.initiator_peer,
+                self.responder_peer,
+            ),
+            peer_ml_dsa_key,
+        })
     }
 }
 
@@ -433,8 +530,13 @@ pub(crate) fn respond(
     client_hello: &HybridClientHello,
     initiator_peer: PeerId,
     responder_peer: PeerId,
-) -> Result<(HybridServerHello, SessionKey), HybridError> {
+    identity: &MlDsaIdentity,
+) -> Result<(HybridServerHello, Handshaked), HybridError> {
     ensure_version(client_hello.version)?;
+    let peer_ml_dsa_key = verify_handshake(
+        client_hello.auth.as_ref(),
+        &client_transcript(client_hello, initiator_peer, responder_peer),
+    )?;
     let ml_kem_public_key = EncapsulationKey::new(&ML_KEM_768, &client_hello.ml_kem_public_key)
         .map_err(|_| HybridError::CryptoOperation)?;
     let (ml_kem_ciphertext, ml_kem_secret) = ml_kem_public_key
@@ -452,11 +554,16 @@ pub(crate) fn respond(
         .map_err(|_| HybridError::CryptoOperation)?;
     let x25519_secret = agree_x25519(x25519_private_key, &client_hello.x25519_public_key)?;
 
-    let server_hello = HybridServerHello {
+    let mut server_hello = HybridServerHello {
         version: HYBRID_HANDSHAKE_VERSION,
         ml_kem_ciphertext: ml_kem_ciphertext.as_ref().to_vec(),
         x25519_public_key,
+        auth: None,
     };
+    server_hello.auth = Some(sign_handshake(
+        identity,
+        &server_transcript(client_hello, &server_hello, initiator_peer, responder_peer),
+    )?);
     let session_key = derive_session_key(
         client_hello,
         &server_hello,
@@ -465,7 +572,74 @@ pub(crate) fn respond(
         initiator_peer,
         responder_peer,
     );
-    Ok((server_hello, session_key))
+    Ok((
+        server_hello,
+        Handshaked {
+            key: session_key,
+            peer_ml_dsa_key,
+        },
+    ))
+}
+
+fn sign_handshake(
+    identity: &MlDsaIdentity,
+    transcript: &[u8],
+) -> Result<HandshakeAuth, HybridError> {
+    Ok(HandshakeAuth {
+        ml_dsa_public_key: identity.public_key().to_vec(),
+        signature: identity
+            .sign(transcript)
+            .map_err(|_| HybridError::CryptoOperation)?,
+    })
+}
+
+/// Verifica la firma, se c'è. Una firma presente ma sbagliata fa fallire
+/// l'handshake; una assente (client vecchio) lo lascia decidere al chiamante,
+/// che conosce la chiave fissata per quel peer.
+fn verify_handshake(
+    auth: Option<&HandshakeAuth>,
+    transcript: &[u8],
+) -> Result<Option<Vec<u8>>, HybridError> {
+    let Some(auth) = auth else {
+        return Ok(None);
+    };
+    if MlDsaIdentity::verify(&auth.ml_dsa_public_key, transcript, &auth.signature) {
+        Ok(Some(auth.ml_dsa_public_key.clone()))
+    } else {
+        Err(HybridError::Authentication)
+    }
+}
+
+fn client_transcript(
+    hello: &HybridClientHello,
+    initiator_peer: PeerId,
+    responder_peer: PeerId,
+) -> Vec<u8> {
+    let mut transcript = Vec::with_capacity(hello.ml_kem_public_key.len() + 192);
+    transcript.extend_from_slice(b"msnnext hybrid client hello v1");
+    transcript.extend_from_slice(&initiator_peer.to_bytes());
+    transcript.extend_from_slice(&responder_peer.to_bytes());
+    transcript.extend_from_slice(&hello.version.to_be_bytes());
+    transcript.extend_from_slice(&hello.ml_kem_public_key);
+    transcript.extend_from_slice(&hello.x25519_public_key);
+    transcript.push(hello.rekey as u8);
+    transcript
+}
+
+/// Il responder firma anche l'hello del client: la firma vale solo per
+/// questo scambio e non si può riusare con chiavi effimere diverse.
+fn server_transcript(
+    client_hello: &HybridClientHello,
+    server_hello: &HybridServerHello,
+    initiator_peer: PeerId,
+    responder_peer: PeerId,
+) -> Vec<u8> {
+    let mut transcript = client_transcript(client_hello, initiator_peer, responder_peer);
+    transcript.extend_from_slice(b"msnnext hybrid server hello v1");
+    transcript.extend_from_slice(&server_hello.version.to_be_bytes());
+    transcript.extend_from_slice(&server_hello.ml_kem_ciphertext);
+    transcript.extend_from_slice(&server_hello.x25519_public_key);
+    transcript
 }
 
 fn ensure_version(version: u16) -> Result<(), HybridError> {
@@ -534,10 +708,7 @@ mod tests {
         let other = PeerId::from(libp2p::identity::Keypair::generate_ed25519().public());
         let proof = account.proof(device).unwrap();
 
-        assert_eq!(
-            verify_account_proof(&proof, device),
-            Some(account.id())
-        );
+        assert_eq!(verify_account_proof(&proof, device), Some(account.id()));
         // Prova rigiocata da un altro peer: rifiutata.
         assert!(verify_account_proof(&proof, other).is_none());
         // Stessa chiave di account su un altro dispositivo: stesso id.
@@ -574,6 +745,10 @@ mod tests {
         ));
     }
 
+    fn identity(seed: u8) -> MlDsaIdentity {
+        MlDsaIdentity::from_seed(&[seed; 32]).unwrap()
+    }
+
     fn peers() -> (PeerId, PeerId) {
         (
             PeerId::from(Keypair::generate_ed25519().public()),
@@ -584,21 +759,33 @@ mod tests {
     #[test]
     fn hybrid_handshake_derives_the_same_session_key() {
         let (alice, bob) = peers();
-        let (initiator, client_hello) = HybridInitiator::start(alice, bob).unwrap();
-        let (server_hello, responder_key) = respond(&client_hello, alice, bob).unwrap();
+        let (initiator, client_hello) =
+            HybridInitiator::start(alice, bob, &identity(1), false).unwrap();
+        let (server_hello, responder_key) =
+            respond(&client_hello, alice, bob, &identity(2)).unwrap();
         let initiator_key = initiator.finish(&server_hello).unwrap();
 
-        assert_eq!(initiator_key.as_bytes(), responder_key.as_bytes());
-        assert_ne!(initiator_key.as_bytes(), &[0; 32]);
+        assert_eq!(initiator_key.key.as_bytes(), responder_key.key.as_bytes());
+        assert_ne!(initiator_key.key.as_bytes(), &[0; 32]);
+        // Ciascun lato riceve la chiave ML-DSA verificata dell'altro.
+        assert_eq!(
+            initiator_key.peer_ml_dsa_key.as_deref(),
+            Some(identity(2).public_key())
+        );
+        assert_eq!(
+            responder_key.peer_ml_dsa_key.as_deref(),
+            Some(identity(1).public_key())
+        );
     }
 
     #[test]
     fn hybrid_handshake_rejects_unknown_version() {
         let (alice, bob) = peers();
-        let (_, mut client_hello) = HybridInitiator::start(alice, bob).unwrap();
+        let (_, mut client_hello) =
+            HybridInitiator::start(alice, bob, &identity(1), false).unwrap();
         client_hello.version += 1;
 
-        match respond(&client_hello, alice, bob) {
+        match respond(&client_hello, alice, bob, &identity(2)) {
             Err(error) => assert_eq!(error, HybridError::UnsupportedVersion),
             Ok(_) => panic!("una versione sconosciuta non deve essere accettata"),
         }
@@ -607,7 +794,7 @@ mod tests {
     #[test]
     fn hybrid_handshake_messages_round_trip_on_the_wire() {
         let (alice, bob) = peers();
-        let (_, client_hello) = HybridInitiator::start(alice, bob).unwrap();
+        let (_, client_hello) = HybridInitiator::start(alice, bob, &identity(1), false).unwrap();
         let encoded = cbor4ii::serde::to_vec(Vec::new(), &client_hello).unwrap();
         let decoded: HybridClientHello = cbor4ii::serde::from_slice(&encoded).unwrap();
 
@@ -618,29 +805,113 @@ mod tests {
     fn hybrid_handshake_binds_both_peer_ids() {
         let (alice, bob) = peers();
         let mallory = PeerId::from(Keypair::generate_ed25519().public());
-        let (initiator, client_hello) = HybridInitiator::start(alice, bob).unwrap();
-        let (server_hello, wrong_peer_key) = respond(&client_hello, mallory, bob).unwrap();
+        let (initiator, client_hello) =
+            HybridInitiator::start(alice, bob, &identity(1), false).unwrap();
+        // La firma ML-DSA copre i peer id: un hello girato a un altro
+        // peer non passa la verifica.
+        assert_eq!(
+            respond(&client_hello, mallory, bob, &identity(2)).err(),
+            Some(HybridError::Authentication)
+        );
+        // Anche senza firma (client vecchio) la chiave resta legata ai peer.
+        let mut legacy_hello = client_hello;
+        legacy_hello.auth = None;
+        let (mut server_hello, wrong_peer_key) =
+            respond(&legacy_hello, mallory, bob, &identity(2)).unwrap();
+        server_hello.auth = None;
         let initiator_key = initiator.finish(&server_hello).unwrap();
 
-        assert_ne!(initiator_key.as_bytes(), wrong_peer_key.as_bytes());
+        assert_ne!(initiator_key.key.as_bytes(), wrong_peer_key.key.as_bytes());
+    }
+
+    #[test]
+    fn hybrid_handshake_rejects_forged_ml_dsa_signatures() {
+        let (alice, bob) = peers();
+        // Un attaccante che falsifica Ed25519 sostituisce le chiavi effimere
+        // del client ma non può rifare la firma ML-DSA di Alice.
+        let (_, mut client_hello) =
+            HybridInitiator::start(alice, bob, &identity(1), false).unwrap();
+        let (_, attacker_hello) = HybridInitiator::start(alice, bob, &identity(9), false).unwrap();
+        client_hello.x25519_public_key = attacker_hello.x25519_public_key;
+        assert_eq!(
+            respond(&client_hello, alice, bob, &identity(2)).err(),
+            Some(HybridError::Authentication)
+        );
+
+        // Lo stesso per la risposta del server.
+        let (initiator, client_hello) =
+            HybridInitiator::start(alice, bob, &identity(1), false).unwrap();
+        let (mut server_hello, _) = respond(&client_hello, alice, bob, &identity(2)).unwrap();
+        server_hello.x25519_public_key = attacker_hello.x25519_public_key;
+        assert_eq!(
+            initiator.finish(&server_hello).err(),
+            Some(HybridError::Authentication)
+        );
+    }
+
+    #[test]
+    fn hybrid_handshake_signature_covers_the_rekey_flag() {
+        let (alice, bob) = peers();
+        let (_, mut client_hello) = HybridInitiator::start(alice, bob, &identity(1), true).unwrap();
+        client_hello.rekey = false;
+        assert_eq!(
+            respond(&client_hello, alice, bob, &identity(2)).err(),
+            Some(HybridError::Authentication)
+        );
+    }
+
+    #[test]
+    fn hybrid_handshake_accepts_unsigned_hellos_from_older_clients() {
+        let (alice, bob) = peers();
+        let (initiator, mut client_hello) =
+            HybridInitiator::start(alice, bob, &identity(1), false).unwrap();
+        client_hello.auth = None;
+        let (server_hello, responder_key) =
+            respond(&client_hello, alice, bob, &identity(2)).unwrap();
+        // Nessuna chiave verificata: la decisione passa al chiamante.
+        assert!(responder_key.peer_ml_dsa_key.is_none());
+        let initiator_key = initiator.finish(&server_hello).unwrap();
+        assert_eq!(initiator_key.key.as_bytes(), responder_key.key.as_bytes());
+
+        // Un hello serializzato da un client vecchio (senza i campi nuovi)
+        // si decodifica ancora.
+        #[derive(Serialize)]
+        struct OldHello {
+            version: u16,
+            ml_kem_public_key: Vec<u8>,
+            x25519_public_key: [u8; 32],
+        }
+        let old = cbor4ii::serde::to_vec(
+            Vec::new(),
+            &OldHello {
+                version: client_hello.version,
+                ml_kem_public_key: client_hello.ml_kem_public_key.clone(),
+                x25519_public_key: client_hello.x25519_public_key,
+            },
+        )
+        .unwrap();
+        let decoded: HybridClientHello = cbor4ii::serde::from_slice(&old).unwrap();
+        assert!(decoded.auth.is_none() && !decoded.rekey);
     }
 
     #[test]
     fn hybrid_handshake_rejects_all_zero_x25519_key() {
         let (alice, bob) = peers();
-        let (_, mut client_hello) = HybridInitiator::start(alice, bob).unwrap();
+        let (_, mut client_hello) =
+            HybridInitiator::start(alice, bob, &identity(1), false).unwrap();
         client_hello.x25519_public_key = [0; 32];
 
-        assert!(respond(&client_hello, alice, bob).is_err());
+        assert!(respond(&client_hello, alice, bob, &identity(2)).is_err());
     }
 
     #[test]
     fn hybrid_handshake_rejects_malformed_ml_kem_key() {
         let (alice, bob) = peers();
-        let (_, mut client_hello) = HybridInitiator::start(alice, bob).unwrap();
+        let (_, mut client_hello) =
+            HybridInitiator::start(alice, bob, &identity(1), false).unwrap();
         client_hello.ml_kem_public_key.truncate(32);
 
-        assert!(respond(&client_hello, alice, bob).is_err());
+        assert!(respond(&client_hello, alice, bob, &identity(2)).is_err());
     }
 
     #[test]
@@ -757,23 +1028,75 @@ mod tests {
         );
     }
 
+    /// Audit #4: dopo 64 messaggi persi la sessione rifiutava per sempre ogni
+    /// nuovo buco. Ora le chiavi più vecchie scadono e la sessione avanza.
     #[test]
-    fn symmetric_ratchet_limits_total_skipped_keys() {
+    fn symmetric_ratchet_recovers_after_many_lost_messages() {
         let (alice, bob) = peers();
         let mut alice_session = RatchetSession::new(SessionKey([15; 32]), alice, bob);
         let mut bob_session = RatchetSession::new(SessionKey([15; 32]), bob, alice);
+        let lost = (0..100)
+            .map(|_| alice_session.encrypt(b"perso", b"conversation").unwrap())
+            .collect::<Vec<_>>();
+        let after = alice_session.encrypt(b"dopo", b"conversation").unwrap();
+
+        assert_eq!(
+            bob_session.decrypt(&after, b"conversation").unwrap(),
+            b"dopo"
+        );
+        // I più recenti dei messaggi persi si possono ancora leggere...
+        assert_eq!(
+            bob_session.decrypt(&lost[99], b"conversation").unwrap(),
+            b"perso"
+        );
+        // ...quelli fuori dalla finestra sono scaduti.
+        assert_eq!(
+            bob_session.decrypt(&lost[0], b"conversation"),
+            Err(RatchetError::OutOfOrder)
+        );
+        // E la sessione continua a funzionare.
+        let next = alice_session.encrypt(b"ancora", b"conversation").unwrap();
+        assert_eq!(
+            bob_session.decrypt(&next, b"conversation").unwrap(),
+            b"ancora"
+        );
+    }
+
+    #[test]
+    fn symmetric_ratchet_keeps_advancing_with_repeated_gaps() {
+        let (alice, bob) = peers();
+        let mut alice_session = RatchetSession::new(SessionKey([16; 32]), alice, bob);
+        let mut bob_session = RatchetSession::new(SessionKey([16; 32]), bob, alice);
         let messages = (0..130)
             .map(|_| alice_session.encrypt(b"x", b"conversation").unwrap())
             .collect::<Vec<_>>();
 
-        for index in (1..128).step_by(2) {
+        for index in (1..130).step_by(2) {
             assert!(bob_session
                 .decrypt(&messages[index], b"conversation")
                 .is_ok());
         }
+        assert!(bob_session.skipped_message_keys.len() as u64 <= MAX_SKIPPED_MESSAGE_KEYS);
+        assert!(bob_session.decrypt(&messages[128], b"conversation").is_ok());
         assert_eq!(
-            bob_session.decrypt(&messages[129], b"conversation"),
+            bob_session.decrypt(&messages[0], b"conversation"),
             Err(RatchetError::OutOfOrder)
         );
+    }
+
+    #[test]
+    fn symmetric_ratchet_rejects_huge_gap_without_advancing() {
+        let (alice, bob) = peers();
+        let mut alice_session = RatchetSession::new(SessionKey([17; 32]), alice, bob);
+        let mut bob_session = RatchetSession::new(SessionKey([17; 32]), bob, alice);
+        for _ in 0..MAX_MESSAGE_GAP {
+            alice_session.encrypt(b"x", b"conversation").unwrap();
+        }
+        let far = alice_session.encrypt(b"lontano", b"conversation").unwrap();
+        assert_eq!(
+            bob_session.decrypt(&far, b"conversation"),
+            Err(RatchetError::OutOfOrder)
+        );
+        assert_eq!(bob_session.receive_number, 0);
     }
 }
