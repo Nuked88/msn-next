@@ -262,7 +262,11 @@ impl History {
     }
 
     /// Segna un messaggio come eliminato "per tutti" (segnaposto su entrambi).
-    pub fn tombstone_event(&self, event_id: &str, changed_at_ms: u64) -> Result<(), Box<dyn Error>> {
+    pub fn tombstone_event(
+        &self,
+        event_id: &str,
+        changed_at_ms: u64,
+    ) -> Result<(), Box<dyn Error>> {
         self.commit_local(SyncOperation::TombstoneEvent {
             event_id: event_id.to_owned(),
             changed_at_ms,
@@ -272,10 +276,7 @@ impl History {
 
     /// Metadati di un messaggio per validare una cancellazione in ingresso:
     /// `(peer, direction, timestamp_ms)`.
-    pub fn event_meta(
-        &self,
-        event_id: &str,
-    ) -> Result<Option<EventMeta>, Box<dyn Error>> {
+    pub fn event_meta(&self, event_id: &str) -> Result<Option<EventMeta>, Box<dyn Error>> {
         Ok(self
             .connection
             .query_row(
@@ -526,11 +527,9 @@ impl History {
     }
 
     pub fn contacts(&self) -> Result<Vec<ContactEntry>, Box<dyn Error>> {
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT peer, name, link, account_id FROM contacts ORDER BY name COLLATE NOCASE",
-            )?;
+        let mut statement = self.connection.prepare(
+            "SELECT peer, name, link, account_id FROM contacts ORDER BY name COLLATE NOCASE",
+        )?;
         let rows = statement.query_map([], |row| {
             Ok(ContactEntry {
                 peer: row.get(0)?,
@@ -803,10 +802,12 @@ impl History {
                     .entity_version(&format!("conversation:{}", event.peer))?
                     .map(|(cleared_at, _)| cleared_at)
                     .filter(|cleared_at| *cleared_at >= event.timestamp_ms);
-                return Ok(cleared_at.map(|changed_at_ms| SyncOperation::ClearConversation {
-                    peer: event.peer.clone(),
-                    changed_at_ms,
-                }));
+                return Ok(
+                    cleared_at.map(|changed_at_ms| SyncOperation::ClearConversation {
+                        peer: event.peer.clone(),
+                        changed_at_ms,
+                    }),
+                );
             }
         };
         Ok(removed_at.map(|changed_at_ms| SyncOperation::DeleteEvent {
@@ -822,7 +823,9 @@ impl History {
             "SELECT seq, payload FROM sync_log WHERE {column} = ?1"
         ))?;
         let rows = statement
-            .query_map([value], |row| Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?)))?
+            .query_map([value], |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         for (seq, payload) in rows {
             let operation: SyncOperation = cbor4ii::serde::from_slice(&self.unseal(&payload)?)?;
@@ -840,7 +843,8 @@ impl History {
         if matches!(redacted, SyncOperation::RecordEvent(_)) {
             self.rewrite_sync_row(seq, redacted)
         } else {
-            self.connection.execute("DELETE FROM sync_log WHERE seq = ?1", [seq])?;
+            self.connection
+                .execute("DELETE FROM sync_log WHERE seq = ?1", [seq])?;
             Ok(())
         }
     }
@@ -859,9 +863,13 @@ impl History {
     /// toglie il contenuto dei messaggi già cancellati.
     fn compact_sync_log(&self) -> Result<(), Box<dyn Error>> {
         let rows = {
-            let mut statement = self.connection.prepare("SELECT seq, payload FROM sync_log")?;
+            let mut statement = self
+                .connection
+                .prepare("SELECT seq, payload FROM sync_log")?;
             let rows = statement
-                .query_map([], |row| Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?)))?
+                .query_map([], |row| {
+                    Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })?
                 .collect::<Result<Vec<_>, _>>()?;
             rows
         };
@@ -1298,14 +1306,23 @@ mod tests {
         let history = History::open(&path, [5; 32]).unwrap();
         for index in 0..250u64 {
             history
-                .record_with_id(&format!("id-{index:03}"), "alice", "in", "text", &format!("m{index}"), index)
+                .record_with_id(
+                    &format!("id-{index:03}"),
+                    "alice",
+                    "in",
+                    "text",
+                    &format!("m{index}"),
+                    index,
+                )
                 .unwrap();
             history.record("bob", "in", "text", "altro", index).unwrap();
         }
         let mut before: Option<String> = None;
         let mut seen = Vec::new();
         loop {
-            let page = history.conversation_before("alice", before.as_deref(), 100).unwrap();
+            let page = history
+                .conversation_before("alice", before.as_deref(), 100)
+                .unwrap();
             if page.is_empty() {
                 break;
             }
@@ -1338,17 +1355,30 @@ mod tests {
         let path = std::env::temp_dir().join(format!("msnnext-redact-{}.db", std::process::id()));
         fs::remove_file(&path).ok();
         let history = History::open(&path, [6; 32]).unwrap();
-        history.record_with_id("a1", "alice", "in", "text", "per me", 10).unwrap();
-        history.record_with_id("a2", "alice", "out", "text", "per tutti", 11).unwrap();
-        history.record_with_id("b1", "bob", "in", "text", "svuotato", 12).unwrap();
-        history.record_with_id("c1", "carol", "in", "text", "contatto eliminato", 13).unwrap();
-        history.record_with_id("a3", "alice", "in", "text", "resta", 14).unwrap();
+        history
+            .record_with_id("a1", "alice", "in", "text", "per me", 10)
+            .unwrap();
+        history
+            .record_with_id("a2", "alice", "out", "text", "per tutti", 11)
+            .unwrap();
+        history
+            .record_with_id("b1", "bob", "in", "text", "svuotato", 12)
+            .unwrap();
+        history
+            .record_with_id("c1", "carol", "in", "text", "contatto eliminato", 13)
+            .unwrap();
+        history
+            .record_with_id("a3", "alice", "in", "text", "resta", 14)
+            .unwrap();
 
         history.delete_event("a1", 20).unwrap();
         history.tombstone_event("a2", 21).unwrap();
         history.clear_conversation("bob").unwrap();
         history.delete_contact("carol").unwrap();
-        assert_eq!(logged_bodies(&history), vec!["".to_owned(), "resta".to_owned()]);
+        assert_eq!(
+            logged_bodies(&history),
+            vec!["".to_owned(), "resta".to_owned()]
+        );
 
         // Lo stesso messaggio che arriva dopo da un altro dispositivo non
         // rientra nel log con il testo.
@@ -1378,8 +1408,12 @@ mod tests {
         fs::remove_file(&path).ok();
         {
             let history = History::open(&path, [4; 32]).unwrap();
-            history.record_with_id("x1", "alice", "in", "text", "segreto", 10).unwrap();
-            history.record_with_id("x2", "alice", "in", "text", "resta", 11).unwrap();
+            history
+                .record_with_id("x1", "alice", "in", "text", "segreto", 10)
+                .unwrap();
+            history
+                .record_with_id("x2", "alice", "in", "text", "resta", 11)
+                .unwrap();
             // Come una cancellazione fatta da una versione precedente: il
             // testo resta nel log e il log non ha le colonne nuove.
             history
@@ -1447,12 +1481,18 @@ mod tests {
             std::env::temp_dir().join(format!("msnnext-contact-merge-{}.db", std::process::id()));
         fs::remove_file(&path).ok();
         let history = History::open(&path, [11; 32]).unwrap();
-        history.save_contact("peer-a", "Phillip", "link", 1).unwrap();
+        history
+            .save_contact("peer-a", "Phillip", "link", 1)
+            .unwrap();
         history.save_contact("peer-b", "Amico", "", 2).unwrap();
         history.record("peer-a", "in", "text", "sul pc", 3).unwrap();
-        history.record("peer-b", "in", "text", "dal telefono", 4).unwrap();
+        history
+            .record("peer-b", "in", "text", "dal telefono", 4)
+            .unwrap();
 
-        history.bind_contact_account("peer-a", "account-1", 5).unwrap();
+        history
+            .bind_contact_account("peer-a", "account-1", 5)
+            .unwrap();
         // Un rename successivo non deve perdere il legame con l'account.
         history.rename_contact("peer-a", "Phil").unwrap();
         let contact = history
@@ -1479,8 +1519,10 @@ mod tests {
         assert!(history.ignored_contacts().unwrap().is_empty());
 
         // La fusione viaggia nel log di sincronizzazione.
-        let twin_path = std::env::temp_dir()
-            .join(format!("msnnext-contact-merge-twin-{}.db", std::process::id()));
+        let twin_path = std::env::temp_dir().join(format!(
+            "msnnext-contact-merge-twin-{}.db",
+            std::process::id()
+        ));
         fs::remove_file(&twin_path).ok();
         let twin = History::open(&twin_path, [11; 32]).unwrap();
         twin.apply_sync_records(&history.sync_records_since(0, 500).unwrap())

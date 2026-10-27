@@ -34,14 +34,13 @@ use libp2p::{
     },
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm,
 };
-use msnnext_protocol::{
-    resolve_emoticons, validate_text_message, validate_triggers, AccountProof, AttachmentManifest,
-    ChatEvent,
-    AttachmentCancel, DeleteRequest, Emoticon, EmoticonOffer, EmoticonSpan, Envelope, GroupAttachmentOffer, GroupBan,
-    GroupDefinition, GroupTextMessage, Mime, Nudge, NudgeRateLimit, PresenceUpdate,
-    ProtocolResponse, TextMessage, Trigger, PROTOCOL_VERSION,
-};
 pub use msnnext_protocol::MAX_TEXT_BYTES;
+use msnnext_protocol::{
+    resolve_emoticons, validate_text_message, validate_triggers, AccountProof, AttachmentCancel,
+    AttachmentManifest, ChatEvent, DeleteRequest, Emoticon, EmoticonOffer, EmoticonSpan, Envelope,
+    GroupAttachmentOffer, GroupBan, GroupDefinition, GroupTextMessage, Mime, Nudge, NudgeRateLimit,
+    PresenceUpdate, ProtocolResponse, TextMessage, Trigger, PROTOCOL_VERSION,
+};
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -613,9 +612,18 @@ struct PendingInboundOffer {
 }
 
 enum PendingDeviceRequest {
-    Pair { peer: PeerId, key: [u8; 32] },
-    Sync { peer: PeerId },
-    Relay { peer: PeerId, target: PeerId, message: TextMessage },
+    Pair {
+        peer: PeerId,
+        key: [u8; 32],
+    },
+    Sync {
+        peer: PeerId,
+    },
+    Relay {
+        peer: PeerId,
+        target: PeerId,
+        message: TextMessage,
+    },
 }
 
 struct PendingPairing {
@@ -2614,8 +2622,8 @@ async fn run_node(
                                         &history,
                                     ) {
                                         Ok(Some((manifest, group_id))) => {
-                                            if extension_auto_accepted(&manifest.filename, &auto_accept_extensions) {
-                                                // Estensione consentita: accetta senza chiedere.
+                                            if offer_auto_accepted(&manifest, &auto_accept_extensions) {
+                                                // Estensione consentita e file piccolo: accetta senza chiedere.
                                                 let client_event = client_event_from_chat(contact, &envelope.event, "in", true, peer_names.get(&contact).map(String::as_str));
                                                 let resp = receive_event(contact, &envelope.event, &mut Incoming {
                                                     pending_emoticons: &mut pending_emoticons,
@@ -3631,14 +3639,24 @@ fn offer_file(
         sent_numbers,
         offer_event(&offer),
     ) else {
-        report_file_failed(events, &offer.manifest.filename, "canale cifrato non pronto");
+        report_file_failed(
+            events,
+            &offer.manifest.filename,
+            "canale cifrato non pronto",
+        );
         return;
     };
     if offer.retries > 0 || offer.group_id.is_some() {
         pending_offers.insert(request_id, offer);
         return;
     }
-    record(history, &offer.peer, "out", "file", &encode_attachment(&offer.manifest));
+    record(
+        history,
+        &offer.peer,
+        "out",
+        "file",
+        &encode_attachment(&offer.manifest),
+    );
     let _ = events.send(ClientEvent::Message {
         message: ClientMessage {
             peer_id: offer.peer.to_string(),
@@ -3684,7 +3702,10 @@ fn take_waiting_offers(
 /// Destinazione di un file in preparazione (hash in corso).
 enum FileTarget {
     Peer(PeerId),
-    Group { group_id: String, parsed_id: [u8; 16] },
+    Group {
+        group_id: String,
+        parsed_id: [u8; 16],
+    },
     /// Comando `file` della CLI: a tutti i peer collegati.
     AllPeers,
 }
@@ -3720,15 +3741,23 @@ fn open_attachment(
 ) {
     let events = events.clone();
     tokio::task::spawn_blocking(move || {
-        let result = vault.read(&id_bytes).map_err(|error| error.to_string()).and_then(|bytes| {
-            if thumbnail && mime.starts_with("image/") {
-                thumbnail_data_url(&bytes).map_err(|error| format!("anteprima non disponibile: {error}"))
-            } else {
-                Ok(format!("data:{mime};base64,{}", BASE64.encode(bytes)))
-            }
-        });
+        let result = vault
+            .read(&id_bytes)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| {
+                if thumbnail && mime.starts_with("image/") {
+                    thumbnail_data_url(&bytes)
+                        .map_err(|error| format!("anteprima non disponibile: {error}"))
+                } else {
+                    Ok(format!("data:{mime};base64,{}", BASE64.encode(bytes)))
+                }
+            });
         let _ = events.send(match result {
-            Ok(data_url) => ClientEvent::AttachmentOpened { id, data_url, thumbnail },
+            Ok(data_url) => ClientEvent::AttachmentOpened {
+                id,
+                data_url,
+                thumbnail,
+            },
             Err(message) => ClientEvent::Error { message },
         });
     });
@@ -3745,7 +3774,10 @@ fn thumbnail_data_url(bytes: &[u8]) -> Result<String, Box<dyn Error>> {
     let image = reader.decode()?.thumbnail(THUMBNAIL_SIDE, THUMBNAIL_SIDE);
     let mut png = std::io::Cursor::new(Vec::new());
     image.write_to(&mut png, image::ImageFormat::Png)?;
-    Ok(format!("data:image/png;base64,{}", BASE64.encode(png.into_inner())))
+    Ok(format!(
+        "data:image/png;base64,{}",
+        BASE64.encode(png.into_inner())
+    ))
 }
 
 fn prepare_file(tx: &mpsc::UnboundedSender<PreparedFile>, target: FileTarget, path: PathBuf) {
@@ -3820,84 +3852,91 @@ fn group_conversation_messages(
 ) -> Result<Vec<ClientGroupMessage>, Box<dyn Error>> {
     Ok(history
         .conversation_before(&group_history_key(group_id), before, HISTORY_PAGE)?
-            .into_iter()
-            .rev()
-            .filter_map(|entry| {
-                let (kind, sender_peer_id) = entry
-                    .kind
-                    .strip_prefix("group-text:")
-                    .map(|sender| ("text", sender.to_owned()))
-                    .or_else(|| {
-                        entry
-                            .kind
-                            .strip_prefix("group-file:")
-                            .map(|sender| ("file", sender.to_owned()))
-                    })?;
-                let attachment = (kind == "file")
-                    .then(|| decode_attachment(&entry.body))
-                    .flatten();
-                let text = (kind == "text").then(|| decode_text_history(&entry.body));
-                Some(ClientGroupMessage {
-                    group_id: group_id.to_owned(),
-                    sender_peer_id,
-                    direction: entry.direction,
-                    kind: kind.into(),
-                    body: text.as_ref().map_or_else(
-                        || {
-                            attachment
-                                .as_ref()
-                                .map_or(entry.body, |item| item.2.clone())
-                        },
-                        |message| message.text.clone(),
-                    ),
-                    timestamp_ms: entry.timestamp_ms,
-                    emoticons: text.as_ref().map(client_emoticon_spans).unwrap_or_default(),
-                    attachment_id: attachment.as_ref().map(|item| item.0.clone()),
-                    attachment_mime: attachment.map(|item| item.1),
-                    event_id: Some(entry.event_id),
-                })
+        .into_iter()
+        .rev()
+        .filter_map(|entry| {
+            let (kind, sender_peer_id) = entry
+                .kind
+                .strip_prefix("group-text:")
+                .map(|sender| ("text", sender.to_owned()))
+                .or_else(|| {
+                    entry
+                        .kind
+                        .strip_prefix("group-file:")
+                        .map(|sender| ("file", sender.to_owned()))
+                })?;
+            let attachment = (kind == "file")
+                .then(|| decode_attachment(&entry.body))
+                .flatten();
+            let text = (kind == "text").then(|| decode_text_history(&entry.body));
+            Some(ClientGroupMessage {
+                group_id: group_id.to_owned(),
+                sender_peer_id,
+                direction: entry.direction,
+                kind: kind.into(),
+                body: text.as_ref().map_or_else(
+                    || {
+                        attachment
+                            .as_ref()
+                            .map_or(entry.body, |item| item.2.clone())
+                    },
+                    |message| message.text.clone(),
+                ),
+                timestamp_ms: entry.timestamp_ms,
+                emoticons: text.as_ref().map(client_emoticon_spans).unwrap_or_default(),
+                attachment_id: attachment.as_ref().map(|item| item.0.clone()),
+                attachment_mime: attachment.map(|item| item.1),
+                event_id: Some(entry.event_id),
             })
-            .collect())
+        })
+        .collect())
 }
 
 /// Messaggi più recenti di una conversazione nel formato atteso dalla UI.
-fn conversation_messages(history: &History, peer: &str) -> Result<Vec<ClientMessage>, Box<dyn Error>> {
+fn conversation_messages(
+    history: &History,
+    peer: &str,
+) -> Result<Vec<ClientMessage>, Box<dyn Error>> {
     conversation_page(history, peer, None)
 }
 
 /// Una pagina di messaggi di una conversazione, dal più vecchio, fino a
 /// `HISTORY_PAGE` e prima di `before` (id evento) se indicato.
-fn conversation_page(history: &History, peer: &str, before: Option<&str>) -> Result<Vec<ClientMessage>, Box<dyn Error>> {
+fn conversation_page(
+    history: &History,
+    peer: &str,
+    before: Option<&str>,
+) -> Result<Vec<ClientMessage>, Box<dyn Error>> {
     Ok(history
         .conversation_before(peer, before, HISTORY_PAGE)?
-            .into_iter()
-            .rev()
-            .map(|entry| {
-                let attachment = (entry.kind == "file")
-                    .then(|| decode_attachment(&entry.body))
-                    .flatten();
-                let text = (entry.kind == "text").then(|| decode_text_history(&entry.body));
-                ClientMessage {
-                    peer_id: entry.peer,
-                    direction: entry.direction,
-                    kind: entry.kind,
-                    body: text.as_ref().map_or_else(
-                        || {
-                            attachment
-                                .as_ref()
-                                .map_or(entry.body, |item| item.2.clone())
-                        },
-                        |message| message.text.clone(),
-                    ),
-                    timestamp_ms: entry.timestamp_ms,
-                    emoticons: text.as_ref().map(client_emoticon_spans).unwrap_or_default(),
-                    attachment_id: attachment.as_ref().map(|item| item.0.clone()),
-                    attachment_mime: attachment.map(|item| item.1),
-                    event_id: Some(entry.event_id),
-                    relayed: false,
-                }
-            })
-            .collect())
+        .into_iter()
+        .rev()
+        .map(|entry| {
+            let attachment = (entry.kind == "file")
+                .then(|| decode_attachment(&entry.body))
+                .flatten();
+            let text = (entry.kind == "text").then(|| decode_text_history(&entry.body));
+            ClientMessage {
+                peer_id: entry.peer,
+                direction: entry.direction,
+                kind: entry.kind,
+                body: text.as_ref().map_or_else(
+                    || {
+                        attachment
+                            .as_ref()
+                            .map_or(entry.body, |item| item.2.clone())
+                    },
+                    |message| message.text.clone(),
+                ),
+                timestamp_ms: entry.timestamp_ms,
+                emoticons: text.as_ref().map(client_emoticon_spans).unwrap_or_default(),
+                attachment_id: attachment.as_ref().map(|item| item.0.clone()),
+                attachment_mime: attachment.map(|item| item.1),
+                event_id: Some(entry.event_id),
+                relayed: false,
+            }
+        })
+        .collect())
 }
 
 /// Un contatto è una PERSONA (un account), non un singolo dispositivo. Questa
@@ -3919,7 +3958,11 @@ impl ContactDevices {
     /// Lega un contatto al suo account. Ritorna `true` se il legame è nuovo o
     /// cambiato (va persistito e sincronizzato).
     fn bind(&mut self, contact: PeerId, account: String) -> bool {
-        if self.accounts.get(&contact).is_some_and(|known| *known == account) {
+        if self
+            .accounts
+            .get(&contact)
+            .is_some_and(|known| *known == account)
+        {
             return false;
         }
         if let Some(previous) = self.accounts.insert(contact, account.clone()) {
@@ -4025,7 +4068,11 @@ fn recognize_presence(
         let verified = Some(account.clone());
         // Stesso account di un ALTRO contatto in rubrica: sono la stessa
         // persona vista da due dispositivi, vanno fusi.
-        if let Some(other) = devices.contacts.get(&account).copied().filter(|other| *other != peer)
+        if let Some(other) = devices
+            .contacts
+            .get(&account)
+            .copied()
+            .filter(|other| *other != peer)
         {
             let (keep, drop) = merge_target(contacts, other, peer);
             devices.forget(drop);
@@ -4091,9 +4138,10 @@ fn apply_presence_source(
             .bind_contact_account(&contact.to_string(), account, now_ms())?;
     }
     if let Some((duplicate, keep)) = source.merge {
-        let moved = context
-            .history
-            .merge_contact(&duplicate.to_string(), &keep.to_string(), now_ms())?;
+        let moved =
+            context
+                .history
+                .merge_contact(&duplicate.to_string(), &keep.to_string(), now_ms())?;
         println!("contatti uniti: {duplicate} -> {keep} ({moved} messaggi)");
         log::info!("contatti uniti: {duplicate} -> {keep} ({moved} messaggi)");
         context.peer_names.remove(&duplicate);
@@ -4541,12 +4589,23 @@ fn flush_outbox(
             continue;
         };
         for (event, attempts) in queue {
-            match send_event(swarm, sessions, devices, target, local_peer_id, sent_numbers, event.clone()) {
+            match send_event(
+                swarm,
+                sessions,
+                devices,
+                target,
+                local_peer_id,
+                sent_numbers,
+                event.clone(),
+            ) {
                 Some(request_id) => {
                     pending_messages.insert(request_id, (target, event, attempts, now_ms()));
                 }
                 None => {
-                    outbox.entry(target).or_default().push_back((event, attempts));
+                    outbox
+                        .entry(target)
+                        .or_default()
+                        .push_back((event, attempts));
                 }
             }
         }
@@ -4568,7 +4627,15 @@ fn resend_pending(
     event: ChatEvent,
     attempts: u8,
 ) {
-    match send_event(swarm, sessions, devices, peer, local_peer_id, sent_numbers, event.clone()) {
+    match send_event(
+        swarm,
+        sessions,
+        devices,
+        peer,
+        local_peer_id,
+        sent_numbers,
+        event.clone(),
+    ) {
         Some(request_id) => {
             pending_messages.insert(request_id, (peer, event, attempts, now_ms()));
         }
@@ -4589,14 +4656,25 @@ fn deliver_event(
     sent_numbers: &mut HashMap<PeerId, u64>,
     pending_messages: &mut HashMap<request_response::OutboundRequestId, PendingMessage>,
     outbox: &mut HashMap<PeerId, VecDeque<(ChatEvent, u8)>>,
-    pending_handshakes: &mut HashMap<request_response::OutboundRequestId, (PeerId, HybridInitiator)>,
+    pending_handshakes: &mut HashMap<
+        request_response::OutboundRequestId,
+        (PeerId, HybridInitiator),
+    >,
     local_peer_id: PeerId,
     peer: PeerId,
     event: ChatEvent,
 ) {
     let queue_empty = outbox.get(&peer).is_none_or(VecDeque::is_empty);
     if devices.secure(peer, sessions) && queue_empty {
-        match send_event(swarm, sessions, devices, peer, local_peer_id, sent_numbers, event.clone()) {
+        match send_event(
+            swarm,
+            sessions,
+            devices,
+            peer,
+            local_peer_id,
+            sent_numbers,
+            event.clone(),
+        ) {
             Some(request_id) => {
                 pending_messages.insert(request_id, (peer, event, 0, now_ms()));
             }
@@ -4604,7 +4682,16 @@ fn deliver_event(
         }
     } else if devices.secure(peer, sessions) {
         outbox.entry(peer).or_default().push_back((event, 0));
-        flush_outbox(swarm, sessions, devices, sent_numbers, pending_messages, outbox, local_peer_id, peer);
+        flush_outbox(
+            swarm,
+            sessions,
+            devices,
+            sent_numbers,
+            pending_messages,
+            outbox,
+            local_peer_id,
+            peer,
+        );
     } else {
         outbox.entry(peer).or_default().push_back((event, 0));
         maybe_start_hybrid_handshake(swarm, pending_handshakes, sessions, local_peer_id, peer);
@@ -4783,7 +4870,11 @@ fn send_current_transfer_chunk(
         // La sessione è caduta a metà invio: prima il chunk successivo non
         // partiva e la barra restava ferma senza nessun avviso. Le parti già
         // ricevute restano dal destinatario, quindi un nuovo invio riprende.
-        None => report_file_failed(events, &transfer.manifest.filename, "sessione cifrata persa durante l'invio"),
+        None => report_file_failed(
+            events,
+            &transfer.manifest.filename,
+            "sessione cifrata persa durante l'invio",
+        ),
     }
 }
 
@@ -4923,11 +5014,13 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                 .is_some()
             {
                 context.attachments.cancel(&cancel.attachment_id);
-                let _ = context.events.send(ClientEvent::IncomingAttachmentCancelled {
-                    peer_id: peer.to_string(),
-                    attachment_id: hex_asset_id(&cancel.attachment_id),
-                    offer_id: None,
-                });
+                let _ = context
+                    .events
+                    .send(ClientEvent::IncomingAttachmentCancelled {
+                        peer_id: peer.to_string(),
+                        attachment_id: hex_asset_id(&cancel.attachment_id),
+                        offer_id: None,
+                    });
             }
             ProtocolResponse::Ack
         }
@@ -4949,7 +5042,9 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                         return ProtocolResponse::Rejected("cancellazione non autorizzata".into());
                     }
                     if now_ms().saturating_sub(timestamp_ms) > DELETE_WINDOW_MS + DELETE_GRACE_MS {
-                        return ProtocolResponse::Rejected("finestra di cancellazione scaduta".into());
+                        return ProtocolResponse::Rejected(
+                            "finestra di cancellazione scaduta".into(),
+                        );
                     }
                     if let Err(error) = context.history.tombstone_event(&event_id, now_ms()) {
                         return ProtocolResponse::Rejected(error.to_string());
@@ -5541,6 +5636,14 @@ fn admin_group_update_allowed(
         && definition.admins == existing.admins
 }
 
+/// Oltre questa dimensione un file va sempre confermato, anche con
+/// l'auto-accept attivo: un contatto non deve poter riempire il disco.
+const AUTO_ACCEPT_MAX_BYTES: u64 = 100 * 1024 * 1024;
+
+fn offer_auto_accepted(manifest: &AttachmentManifest, allowed: &HashSet<String>) -> bool {
+    manifest.size <= AUTO_ACCEPT_MAX_BYTES && extension_auto_accepted(&manifest.filename, allowed)
+}
+
 fn extension_auto_accepted(filename: &str, allowed: &HashSet<String>) -> bool {
     if allowed.is_empty() {
         return false;
@@ -5665,7 +5768,14 @@ fn send_relay_text(
     };
     let sealed = devices::seal(account_key, &request)?;
     let request_id = swarm.behaviour_mut().devices.send_request(&device, sealed);
-    pending.insert(request_id, PendingDeviceRequest::Relay { peer: device, target, message });
+    pending.insert(
+        request_id,
+        PendingDeviceRequest::Relay {
+            peer: device,
+            target,
+            message,
+        },
+    );
     Ok(())
 }
 
@@ -5675,14 +5785,24 @@ fn send_relay_text(
 /// quelle oltre il budget arrivano come testo.
 const RELAY_EMOTICON_BUDGET: usize = 192 * 1024;
 
-fn relay_emoticon_offers(spans: &[EmoticonSpan], triggers: &[Trigger], store: &Path) -> Vec<EmoticonOffer> {
+fn relay_emoticon_offers(
+    spans: &[EmoticonSpan],
+    triggers: &[Trigger],
+    store: &Path,
+) -> Vec<EmoticonOffer> {
     let mut offers: Vec<EmoticonOffer> = Vec::new();
     let mut used = 0;
     for span in spans {
-        if offers.iter().any(|offer| offer.metadata.asset_id == span.asset_id) {
+        if offers
+            .iter()
+            .any(|offer| offer.metadata.asset_id == span.asset_id)
+        {
             continue;
         }
-        let Some(trigger) = triggers.iter().find(|trigger| trigger.asset_id == span.asset_id) else {
+        let Some(trigger) = triggers
+            .iter()
+            .find(|trigger| trigger.asset_id == span.asset_id)
+        else {
             continue;
         };
         match load_emoticon_offer(store, trigger) {
@@ -5690,7 +5810,10 @@ fn relay_emoticon_offers(spans: &[EmoticonSpan], triggers: &[Trigger], store: &P
                 used += offer.bytes.len();
                 offers.push(offer);
             }
-            Ok(_) => log::warn!("relay: emoticon {} oltre il budget, inviata come testo", trigger.text),
+            Ok(_) => log::warn!(
+                "relay: emoticon {} oltre il budget, inviata come testo",
+                trigger.text
+            ),
             Err(error) => log::warn!("relay: emoticon {} non disponibile: {error}", trigger.text),
         }
     }
@@ -6370,6 +6493,31 @@ impl ClientConfig {
 mod tests {
     use super::*;
 
+    #[test]
+    fn auto_accept_never_covers_large_files() {
+        let manifest = |filename: &str, size: u64| AttachmentManifest {
+            attachment_id: [0; 32],
+            filename: filename.into(),
+            mime: "application/octet-stream".into(),
+            size,
+            chunk_size: 1,
+            chunks: Vec::new(),
+        };
+        let all = HashSet::from(["*".to_owned()]);
+        let images = HashSet::from(["jpg".to_owned()]);
+        assert!(offer_auto_accepted(&manifest("foto.JPG", 1024), &images));
+        assert!(!offer_auto_accepted(&manifest("doc.pdf", 1024), &images));
+        assert!(offer_auto_accepted(&manifest("doc.pdf", 1024), &all));
+        assert!(!offer_auto_accepted(
+            &manifest("big.iso", AUTO_ACCEPT_MAX_BYTES + 1),
+            &all
+        ));
+        assert!(!offer_auto_accepted(
+            &manifest("foto.jpg", 5 * 1024 * 1024 * 1024),
+            &images
+        ));
+    }
+
     async fn receive_until(
         events: &mut mpsc::UnboundedReceiver<ClientEvent>,
         predicate: impl Fn(&ClientEvent) -> bool,
@@ -7023,7 +7171,9 @@ mod tests {
     impl TestNode {
         /// Va chiamato dentro un `LocalSet`: `run` non è `Send`.
         async fn start(config: ClientConfig) -> Self {
-            Self::try_start(config).await.expect("il nodo non è partito")
+            Self::try_start(config)
+                .await
+                .expect("il nodo non è partito")
         }
 
         async fn try_start(config: ClientConfig) -> Result<Self, String> {
@@ -7153,9 +7303,12 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let mut alice =
-                    TestNode::start(loopback_config("Alice", &alice_dir, Some(alice_listen.clone())))
-                        .await;
+                let mut alice = TestNode::start(loopback_config(
+                    "Alice",
+                    &alice_dir,
+                    Some(alice_listen.clone()),
+                ))
+                .await;
                 let mut bob = TestNode::start(loopback_config("Bob", &bob_dir, None)).await;
                 connect_pair(&mut alice, &mut bob).await;
 
@@ -7211,16 +7364,19 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let mut alice = TestNode::start(loopback_config("Alice", &root.join("alice"), None)).await;
-                let mut bob = TestNode::start(loopback_config("Bob", &root.join("bob"), None)).await;
+                let mut alice =
+                    TestNode::start(loopback_config("Alice", &root.join("alice"), None)).await;
+                let mut bob =
+                    TestNode::start(loopback_config("Bob", &root.join("bob"), None)).await;
                 connect_pair(&mut alice, &mut bob).await;
 
                 bob.send(ClientCommand::SendText {
                     peer: alice.peer,
                     text: "x".repeat(20 * 1024),
                 });
-                let ClientEvent::Error { message } =
-                    bob.until(|event| matches!(event, ClientEvent::Error { .. })).await
+                let ClientEvent::Error { message } = bob
+                    .until(|event| matches!(event, ClientEvent::Error { .. }))
+                    .await
                 else {
                     unreachable!()
                 };
@@ -7260,9 +7416,11 @@ mod tests {
                 .unwrap()
                 .0;
                 node.send(ClientCommand::ImportDeviceLink { link });
-                node.until(|event| matches!(event, ClientEvent::Error { .. })).await;
+                node.until(|event| matches!(event, ClientEvent::Error { .. }))
+                    .await;
                 node.send(ClientCommand::RequestContactLink);
-                node.until(|event| matches!(event, ClientEvent::ContactLink { .. })).await;
+                node.until(|event| matches!(event, ClientEvent::ContactLink { .. }))
+                    .await;
                 node.shutdown().await;
             })
             .await;
@@ -7432,7 +7590,10 @@ mod tests {
 
     /// Ordina i due nodi per ruolo nell'handshake: il primo è quello che lo
     /// avvia quando manca la sessione.
-    fn by_handshake_role<'a>(a: &'a mut TestNode, b: &'a mut TestNode) -> (&'a mut TestNode, &'a mut TestNode) {
+    fn by_handshake_role<'a>(
+        a: &'a mut TestNode,
+        b: &'a mut TestNode,
+    ) -> (&'a mut TestNode, &'a mut TestNode) {
         if should_initiate(a.peer, b.peer) {
             (a, b)
         } else {
@@ -7455,7 +7616,11 @@ mod tests {
         let root = test_root("queued-events");
         fs::create_dir_all(&root).unwrap();
         let emoticon = root.join("gatto.png");
-        fs::write(&emoticon, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01").unwrap();
+        fs::write(
+            &emoticon,
+            b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01",
+        )
+        .unwrap();
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -7520,14 +7685,19 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let mut alice = TestNode::start(loopback_config("Alice", &root.join("alice"), None)).await;
-                let mut bob = TestNode::start(loopback_config("Bob", &root.join("bob"), None)).await;
+                let mut alice =
+                    TestNode::start(loopback_config("Alice", &root.join("alice"), None)).await;
+                let mut bob =
+                    TestNode::start(loopback_config("Bob", &root.join("bob"), None)).await;
                 connect_pair(&mut alice, &mut bob).await;
                 // Chi invia non avvia l'handshake: la sessione resta assente
                 // quando arriva la richiesta dei chunk.
                 let (receiver, sender) = by_handshake_role(&mut alice, &mut bob);
 
-                sender.send(ClientCommand::SendFile { peer: receiver.peer, path: source.clone() });
+                sender.send(ClientCommand::SendFile {
+                    peer: receiver.peer,
+                    path: source.clone(),
+                });
                 let ClientEvent::IncomingAttachmentOffered { offer_id, .. } = receiver
                     .until(|event| matches!(event, ClientEvent::IncomingAttachmentOffered { .. }))
                     .await
@@ -7559,7 +7729,9 @@ mod tests {
         let root = test_root("reject-request");
         let alice_dir = root.join("alice");
         let alice_port = available_udp_port();
-        let alice_listen: Multiaddr = format!("/ip4/127.0.0.1/udp/{alice_port}/quic-v1").parse().unwrap();
+        let alice_listen: Multiaddr = format!("/ip4/127.0.0.1/udp/{alice_port}/quic-v1")
+            .parse()
+            .unwrap();
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -7658,16 +7830,25 @@ mod tests {
     /// 50 MB). Ora è una miniatura di pochi KB.
     #[test]
     fn inline_preview_is_a_small_thumbnail() {
-        let photo = image::RgbImage::from_fn(3000, 2000, |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, 90]));
+        let photo = image::RgbImage::from_fn(3000, 2000, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 90])
+        });
         let mut png = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgb8(photo).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        image::DynamicImage::ImageRgb8(photo)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
         let original = png.into_inner();
 
         let data_url = thumbnail_data_url(&original).unwrap();
         let encoded = data_url.strip_prefix("data:image/png;base64,").unwrap();
         let thumbnail = image::load_from_memory(&BASE64.decode(encoded).unwrap()).unwrap();
         assert_eq!((thumbnail.width(), thumbnail.height()), (640, 427));
-        assert!(data_url.len() < original.len() / 4, "{} vs {}", data_url.len(), original.len());
+        assert!(
+            data_url.len() < original.len() / 4,
+            "{} vs {}",
+            data_url.len(),
+            original.len()
+        );
         assert!(thumbnail_data_url(b"non un'immagine").is_err());
     }
 
@@ -7675,7 +7856,8 @@ mod tests {
     /// sotto il limite di libp2p.
     #[test]
     fn relay_carries_emoticons_within_budget() {
-        let store = std::env::temp_dir().join(format!("msnnext-relay-emoticons-{}", std::process::id()));
+        let store =
+            std::env::temp_dir().join(format!("msnnext-relay-emoticons-{}", std::process::id()));
         fs::create_dir_all(&store).unwrap();
         let mut triggers = Vec::new();
         let small = store.join("small.png");
@@ -7701,11 +7883,29 @@ mod tests {
     fn relay_request_from_older_client_still_decodes() {
         #[derive(Serialize)]
         enum OldRequest {
-            RelayText { target: String, id: [u8; 16], text: String },
+            RelayText {
+                target: String,
+                id: [u8; 16],
+                text: String,
+            },
         }
         let key = [9u8; 32];
-        let sealed = devices::seal(&key, &OldRequest::RelayText { target: "x".into(), id: [1; 16], text: "ciao".into() }).unwrap();
-        let DeviceRequest::RelayText { text, emoticons, offers, .. } = devices::open::<DeviceRequest>(&key, &sealed).unwrap() else {
+        let sealed = devices::seal(
+            &key,
+            &OldRequest::RelayText {
+                target: "x".into(),
+                id: [1; 16],
+                text: "ciao".into(),
+            },
+        )
+        .unwrap();
+        let DeviceRequest::RelayText {
+            text,
+            emoticons,
+            offers,
+            ..
+        } = devices::open::<DeviceRequest>(&key, &sealed).unwrap()
+        else {
             panic!("variante inattesa")
         };
         assert_eq!(text, "ciao");
@@ -7725,8 +7925,10 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let mut alice = TestNode::start(loopback_config("Alice", &root.join("alice"), None)).await;
-                let mut bob = TestNode::start(loopback_config("Bob", &root.join("bob"), None)).await;
+                let mut alice =
+                    TestNode::start(loopback_config("Alice", &root.join("alice"), None)).await;
+                let mut bob =
+                    TestNode::start(loopback_config("Bob", &root.join("bob"), None)).await;
                 connect_pair(&mut alice, &mut bob).await;
 
                 bob.send(ClientCommand::SendFile {
@@ -7740,17 +7942,19 @@ mod tests {
                     unreachable!()
                 };
                 alice.send(ClientCommand::AcceptAttachment { offer_id });
-                let ClientEvent::AttachmentReceived { id, .. } = receive_until_within(
-                    &mut alice.events,
-                    Duration::from_secs(60),
-                    |event| matches!(event, ClientEvent::AttachmentReceived { .. }),
-                )
-                .await
+                let ClientEvent::AttachmentReceived { id, .. } =
+                    receive_until_within(&mut alice.events, Duration::from_secs(60), |event| {
+                        matches!(event, ClientEvent::AttachmentReceived { .. })
+                    })
+                    .await
                 else {
                     unreachable!()
                 };
                 let received = root.join("ricevuto.bin");
-                alice.send(ClientCommand::ExportAttachment { id: id.clone(), path: received.clone() });
+                alice.send(ClientCommand::ExportAttachment {
+                    id: id.clone(),
+                    path: received.clone(),
+                });
                 alice
                     .until(|event| matches!(event, ClientEvent::AttachmentExported { .. }))
                     .await;
@@ -7758,7 +7962,10 @@ mod tests {
 
                 // Il mittente riapre il proprio file dal riferimento, senza copia.
                 let reopened = root.join("riaperto.bin");
-                bob.send(ClientCommand::ExportAttachment { id, path: reopened.clone() });
+                bob.send(ClientCommand::ExportAttachment {
+                    id,
+                    path: reopened.clone(),
+                });
                 bob.until(|event| matches!(event, ClientEvent::AttachmentExported { .. }))
                     .await;
                 assert_eq!(fs::read(&reopened).unwrap(), bytes);
@@ -7791,8 +7998,13 @@ mod tests {
         while let Ok(event) = events.try_recv() {
             received.push(event);
         }
-        assert!(matches!(received.last(), Some(ClientEvent::Stopped)), "{received:?}");
-        assert!(received.iter().any(|event| matches!(event, ClientEvent::Error { .. })));
+        assert!(
+            matches!(received.last(), Some(ClientEvent::Stopped)),
+            "{received:?}"
+        );
+        assert!(received
+            .iter()
+            .any(|event| matches!(event, ClientEvent::Error { .. })));
         fs::remove_dir_all(root).ok();
     }
 

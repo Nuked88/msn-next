@@ -654,8 +654,14 @@ mod tests {
         receiver.store_reference(&manifest, &source).unwrap();
 
         let vault_bytes: u64 = walk_size(&root.join("vault"));
-        assert!(vault_bytes < 4096, "il vault non deve contenere una copia: {vault_bytes}");
-        assert_eq!(receiver.read(&manifest.attachment_id).unwrap(), fs::read(&source).unwrap());
+        assert!(
+            vault_bytes < 4096,
+            "il vault non deve contenere una copia: {vault_bytes}"
+        );
+        assert_eq!(
+            receiver.read(&manifest.attachment_id).unwrap(),
+            fs::read(&source).unwrap()
+        );
         let exported = root.join("copia.png");
         receiver.export(&manifest.attachment_id, &exported).unwrap();
         assert_eq!(fs::read(&exported).unwrap(), fs::read(&source).unwrap());
@@ -663,7 +669,9 @@ mod tests {
         // Se l'originale cambia, non si spaccia un altro file per quello inviato.
         fs::write(&source, vec![6; 3 * CHUNK_SIZE]).unwrap();
         assert!(receiver.read(&manifest.attachment_id).is_err());
-        assert!(receiver.export(&manifest.attachment_id, &root.join("altra.png")).is_err());
+        assert!(receiver
+            .export(&manifest.attachment_id, &root.join("altra.png"))
+            .is_err());
         assert!(!root.join("altra.png").exists());
         fs::remove_dir_all(root).ok();
     }

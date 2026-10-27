@@ -78,7 +78,10 @@ pub enum DeviceResponse {
     },
     Rejected(String),
     /// Esito di una richiesta RelayText: consegnato/accodato dal dispositivo.
-    RelayResult { id: [u8; 16], delivered: bool },
+    RelayResult {
+        id: [u8; 16],
+        delivered: bool,
+    },
 }
 
 pub fn create_pairing_link(

@@ -61,7 +61,8 @@ pub(crate) struct AccountIdentity {
 impl AccountIdentity {
     pub(crate) fn from_account_key(account_key: &[u8; 32]) -> Result<Self, Box<dyn Error>> {
         let mut classic_seed = blake3::derive_key("msnnext account identity v1", account_key);
-        let classic = ed25519::Keypair::from(ed25519::SecretKey::try_from_bytes(&mut classic_seed)?);
+        let classic =
+            ed25519::Keypair::from(ed25519::SecretKey::try_from_bytes(&mut classic_seed)?);
         let ml_dsa = MlDsaIdentity::from_seed(&blake3::derive_key(
             "msnnext account ml-dsa v1",
             account_key,
@@ -92,11 +93,8 @@ impl AccountIdentity {
 /// dell'account. Il peer id firmato impedisce di riusare la prova di un altro
 /// dispositivo: chi la rigioca da un peer diverso fallisce la verifica.
 pub(crate) fn verify_account_proof(proof: &AccountProof, device: PeerId) -> Option<String> {
-    let payload = account_proof_payload(
-        &proof.classic_public_key,
-        &proof.ml_dsa_public_key,
-        device,
-    );
+    let payload =
+        account_proof_payload(&proof.classic_public_key, &proof.ml_dsa_public_key, device);
     let classic = ed25519::PublicKey::try_from_bytes(&proof.classic_public_key).ok()?;
     if !classic.verify(&payload, &proof.classic_signature) {
         return None;
@@ -573,10 +571,7 @@ mod tests {
         let other = PeerId::from(libp2p::identity::Keypair::generate_ed25519().public());
         let proof = account.proof(device).unwrap();
 
-        assert_eq!(
-            verify_account_proof(&proof, device),
-            Some(account.id())
-        );
+        assert_eq!(verify_account_proof(&proof, device), Some(account.id()));
         // Prova rigiocata da un altro peer: rifiutata.
         assert!(verify_account_proof(&proof, other).is_none());
         // Stessa chiave di account su un altro dispositivo: stesso id.
@@ -808,7 +803,10 @@ mod tests {
             .collect::<Vec<_>>();
         let after = alice_session.encrypt(b"dopo", b"conversation").unwrap();
 
-        assert_eq!(bob_session.decrypt(&after, b"conversation").unwrap(), b"dopo");
+        assert_eq!(
+            bob_session.decrypt(&after, b"conversation").unwrap(),
+            b"dopo"
+        );
         // I più recenti dei messaggi persi si possono ancora leggere...
         assert_eq!(
             bob_session.decrypt(&lost[99], b"conversation").unwrap(),
@@ -821,7 +819,10 @@ mod tests {
         );
         // E la sessione continua a funzionare.
         let next = alice_session.encrypt(b"ancora", b"conversation").unwrap();
-        assert_eq!(bob_session.decrypt(&next, b"conversation").unwrap(), b"ancora");
+        assert_eq!(
+            bob_session.decrypt(&next, b"conversation").unwrap(),
+            b"ancora"
+        );
     }
 
     #[test]
