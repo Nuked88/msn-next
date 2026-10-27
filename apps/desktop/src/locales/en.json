@@ -388,6 +388,7 @@
   "toast.groupHistoryDeleted": "Group history deleted",
   "toast.fileExported": "File exported: {path}",
   "toast.messageTooLong": "Message too long: {max} KB at most",
+  "toast.fileNotSent": "File {filename} not sent: {reason}",
   "toast.messageNotDelivered": "Message not delivered: {reason}",
   "toast.oldFileNoArchive": "This file belongs to an old history and has no archive reference",
   "toast.settingsSaved": "Settings saved",

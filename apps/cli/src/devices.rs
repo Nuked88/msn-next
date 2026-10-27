@@ -7,6 +7,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{error::Error, time::Duration};
 
 use crate::history::SyncRecord;
+use msnnext_protocol::{EmoticonOffer, EmoticonSpan};
 
 pub const PAIRING_VALIDITY: Duration = Duration::from_secs(10 * 60);
 pub const MAX_SYNC_RECORDS: usize = 500;
@@ -52,6 +53,12 @@ pub enum DeviceRequest {
         target: String,
         id: [u8; 16],
         text: String,
+        /// Assenti nelle richieste dei client precedenti: il dispositivo che
+        /// consegna usa allora i propri trigger.
+        #[serde(default)]
+        emoticons: Vec<EmoticonSpan>,
+        #[serde(default)]
+        offers: Vec<EmoticonOffer>,
     },
 }
 

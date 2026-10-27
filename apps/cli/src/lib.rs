@@ -37,7 +37,7 @@ use libp2p::{
 use msnnext_protocol::{
     resolve_emoticons, validate_text_message, validate_triggers, AccountProof, AttachmentManifest,
     ChatEvent,
-    DeleteRequest, Emoticon, EmoticonOffer, Envelope, GroupAttachmentOffer, GroupBan,
+    DeleteRequest, Emoticon, EmoticonOffer, EmoticonSpan, Envelope, GroupAttachmentOffer, GroupBan,
     GroupDefinition, GroupTextMessage, Mime, Nudge, NudgeRateLimit, PresenceUpdate,
     ProtocolResponse, TextMessage, Trigger, PROTOCOL_VERSION,
 };
@@ -457,6 +457,12 @@ pub enum ClientEvent {
         total_chunks: usize,
     },
     AttachmentTransfersCancelled,
+    /// Un invio di file si è fermato senza arrivare: la UI chiude la barra di
+    /// avanzamento di quel file e mostra il motivo.
+    AttachmentFailed {
+        filename: String,
+        reason: String,
+    },
     IncomingAttachmentOffered {
         offer_id: u64,
         peer_id: String,
@@ -543,7 +549,7 @@ struct PendingInboundOffer {
 enum PendingDeviceRequest {
     Pair { peer: PeerId, key: [u8; 32] },
     Sync { peer: PeerId },
-    Relay { peer: PeerId },
+    Relay { peer: PeerId, target: PeerId, message: TextMessage },
 }
 
 struct PendingPairing {
@@ -826,6 +832,9 @@ async fn run_node(
     // è considerata rotta e si rifà l'handshake invece di rifiutare per sempre.
     let mut decrypt_failures = HashMap::<PeerId, u8>::new();
     let mut shared_emoticons = HashSet::<(PeerId, [u8; 32])>::new();
+    // Offerte di file pronte per un contatto connesso ma ancora senza
+    // sessione cifrata: partono quando l'handshake si completa.
+    let mut waiting_offers = HashMap::<PeerId, Vec<PendingOffer>>::new();
     let mut pending_emoticons = HashMap::<[u8; 32], EmoticonOffer>::new();
     let mut attachment_receiver = Receiver::new(args.downloads.clone(), attachment_key);
     // Lavoro pesante sui file (hash in invio, verifica finale in ricezione)
@@ -1008,7 +1017,8 @@ async fn run_node(
                 let manifest = match prepared.manifest {
                     Ok(manifest) => manifest,
                     Err(message) => {
-                        let _ = events.send(ClientEvent::Error { message: format!("file non inviato: {message}") });
+                        let filename = prepared.path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+                        report_file_failed(&events, &filename, &message);
                         return Ok(LoopFlow::Continue);
                     }
                 };
@@ -1022,64 +1032,31 @@ async fn run_node(
                 match prepared.target {
                     FileTarget::Peer(peer) => {
                         if !contact_devices.online(peer, &peers) {
-                            let _ = events.send(ClientEvent::Error { message: "contatto non collegato".into() });
+                            report_file_failed(&events, &manifest.filename, "contatto non collegato");
                             return Ok(LoopFlow::Continue);
                         }
-                        record(&history, &peer, "out", "file", &encode_attachment(&manifest));
-                        if let Some(request_id) = send_event(
-                            &mut swarm,
-                            &mut sessions,
-                            &contact_devices,
-                            peer,
-                            local_peer_id,
-                            &mut sent_numbers,
-                            ChatEvent::AttachmentOffer(manifest.clone()),
-                        ) {
-                            let _ = events.send(ClientEvent::Message {
-                                message: ClientMessage {
-                                    peer_id: peer.to_string(),
-                                    direction: "out".into(),
-                                    kind: "file".into(),
-                                    body: manifest.filename.clone(),
-                                    timestamp_ms: now_ms(),
-                                    emoticons: Vec::new(),
-                                    attachment_id: Some(attachment_hex),
-                                    attachment_mime: Some(manifest.mime.clone()),
-                                    event_id: None,
-                                    relayed: false,
-                                },
-                            });
-                            pending_offers.insert(request_id, PendingOffer {
-                                peer,
-                                path,
-                                manifest,
-                                retries: 0,
-                                group_id: None,
-                            });
+                        let offer = PendingOffer { peer, path, manifest, retries: 0, group_id: None };
+                        if contact_devices.secure(peer, &sessions) {
+                            offer_file(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_offers, &history, &events, local_peer_id, offer);
                         } else {
-                            let _ = events.send(ClientEvent::Error { message: "invio file fallito: canale cifrato non pronto".into() });
+                            waiting_offers.entry(peer).or_default().push(offer);
+                            maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
                         }
                     }
                     FileTarget::Group { group_id, parsed_id } => {
                         let Some(group) = history.group_chat(&group_id)? else {
-                            let _ = events.send(ClientEvent::Error { message: "chat di gruppo non trovata".into() });
+                            report_file_failed(&events, &manifest.filename, "chat di gruppo non trovata");
                             return Ok(LoopFlow::Continue);
                         };
                         let timestamp_ms = now_ms();
                         let recipients = match group_file_recipients(&group, local_peer_id, &sessions, timestamp_ms) {
                             Ok(recipients) => recipients,
                             Err(message) => {
-                                let _ = events.send(ClientEvent::Error { message: message.into() });
+                                report_file_failed(&events, &manifest.filename, message);
                                 return Ok(LoopFlow::Continue);
                             }
                         };
-                        history.record(
-                            &group_history_key(&group_id),
-                            "out",
-                            &format!("group-file:{local_peer_id}"),
-                            &encode_attachment(&manifest),
-                            timestamp_ms,
-                        )?;
+                        let mut offered = 0;
                         for recipient in recipients {
                             if let Some(request_id) = send_event(
                                 &mut swarm,
@@ -1093,6 +1070,7 @@ async fn run_node(
                                     manifest: manifest.clone(),
                                 }),
                             ) {
+                                offered += 1;
                                 pending_offers.insert(request_id, PendingOffer {
                                     peer: recipient,
                                     path: path.clone(),
@@ -1100,8 +1078,21 @@ async fn run_node(
                                     retries: 0,
                                     group_id: Some(parsed_id),
                                 });
+                            } else {
+                                report_file_failed(&events, &manifest.filename, "canale cifrato non pronto");
                             }
                         }
+                        // In cronologia solo se almeno un'offerta è partita.
+                        if offered == 0 {
+                            return Ok(LoopFlow::Continue);
+                        }
+                        history.record(
+                            &group_history_key(&group_id),
+                            "out",
+                            &format!("group-file:{local_peer_id}"),
+                            &encode_attachment(&manifest),
+                            timestamp_ms,
+                        )?;
                         let _ = events.send(ClientEvent::GroupMessage { message: ClientGroupMessage {
                             group_id,
                             sender_peer_id: local_peer_id.to_string(),
@@ -1162,7 +1153,7 @@ async fn run_node(
                     .filter(|peer| !pending_device_requests.values().any(|pending| match pending {
                         PendingDeviceRequest::Pair { peer: pending_peer, .. }
                         | PendingDeviceRequest::Sync { peer: pending_peer }
-                        | PendingDeviceRequest::Relay { peer: pending_peer } => pending_peer == peer,
+                        | PendingDeviceRequest::Relay { peer: pending_peer, .. } => pending_peer == peer,
                     }))
                     .collect::<Vec<_>>();
                 for peer in available {
@@ -1529,79 +1520,8 @@ async fn run_node(
                         let _ = events.send(ClientEvent::Error { message });
                         return Ok(LoopFlow::Continue);
                     }
-                    // Nessun canale cifrato diretto col contatto (offline, oppure
-                    // connesso ma handshake non ancora completo): se ho un dispositivo
-                    // collegato online gli chiedo di consegnare il messaggio (relay).
-                    // Il reconciler continua a tentare l'handshake diretto in
-                    // parallelo, così appena è pronto si passa al canale diretto.
-                    // Senza dispositivi collegati si prosegue sotto: il messaggio
-                    // viene accodato finché la sessione diretta non è disponibile.
-                    if !contact_devices.secure(peer, &sessions) && !online_devices.is_empty() {
-                        let mut message_id = [0u8; 16];
-                        OsRng.fill_bytes(&mut message_id);
-                        let emoticons = resolve_emoticons(&text, &triggers).unwrap_or_default();
-                        let message = TextMessage { text: text.clone(), emoticons, id: message_id };
-                        let client_emoticons = client_emoticon_spans(&message);
-                        record_text(&history, &peer, "out", &message);
-                        let _ = events.send(ClientEvent::Message {
-                            message: ClientMessage {
-                                peer_id: peer.to_string(),
-                                direction: "out".into(),
-                                kind: "text".into(),
-                                body: text.clone(),
-                                timestamp_ms: now_ms(),
-                                emoticons: client_emoticons,
-                                attachment_id: None,
-                                attachment_mime: None,
-                                event_id: Some(hex_group_id(&message_id)),
-                                relayed: true,
-                            },
-                        });
-                        for device in online_devices.iter().copied().collect::<Vec<_>>() {
-                            log::info!("relay: chiedo a {device} di consegnare a {peer}");
-                            if let Err(error) = send_relay_text(&mut swarm, &account_key, &mut pending_device_requests, device, &peer, message_id, text.clone()) {
-                                eprintln!("relay verso dispositivo fallito: {error}");
-                                log::warn!("relay verso dispositivo fallito: {error}");
-                            }
-                        }
-                        return Ok(LoopFlow::Continue);
-                    }
                     let emoticons = resolve_emoticons(&text, &triggers)
                         .map_err(|error| format!("trigger emoticon non valido: {error:?}"))?;
-                    for asset_id in emoticons
-                        .iter()
-                        .map(|span| span.asset_id)
-                        .collect::<HashSet<_>>()
-                    {
-                        if shared_emoticons.insert((peer, asset_id)) {
-                            if let Some(trigger) =
-                                triggers.iter().find(|trigger| trigger.asset_id == asset_id)
-                            {
-                                match load_emoticon_offer(&args.emotes, trigger) {
-                                    Ok(offer) => {
-                                        send_event(
-                                            &mut swarm,
-                                            &mut sessions,
-                                            &contact_devices,
-                                            peer,
-                                            local_peer_id,
-                                            &mut sent_numbers,
-                                            ChatEvent::EmoticonOffer(offer),
-                                        );
-                                    }
-                                    Err(error) => {
-                                        shared_emoticons.remove(&(peer, asset_id));
-                                        let _ = events.send(ClientEvent::Error {
-                                            message: format!(
-                                                "emoticon {} non disponibile: {error}",
-                                                trigger.text
-                                            ),
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
                     let mut message_id = [0u8; 16];
                     OsRng.fill_bytes(&mut message_id);
                     let message = TextMessage {
@@ -1610,30 +1530,31 @@ async fn run_node(
                         id: message_id,
                     };
                     let client_emoticons = client_emoticon_spans(&message);
-                    let event = ChatEvent::Text(message.clone());
-                    // Affidabilità: se la sessione cifrata è pronta invia e traccia
-                    // per il retry; altrimenti accoda e avvia l'handshake — il
-                    // messaggio parte al completamento (niente drop silenziosi).
-                    // Con messaggi ancora in coda il nuovo va in fondo: non deve
-                    // superare quelli in attesa di reinvio.
-                    let queue_empty = outbox.get(&peer).is_none_or(VecDeque::is_empty);
-                    if contact_devices.secure(peer, &sessions) && queue_empty {
-                        match send_event(&mut swarm, &mut sessions, &contact_devices, peer, local_peer_id, &mut sent_numbers, event.clone()) {
-                            Some(request_id) => {
-                                pending_messages.insert(request_id, (peer, event, 0));
-                            }
-                            None => {
-                                outbox.entry(peer).or_default().push_back((event, 0));
-                            }
-                        }
-                    } else if contact_devices.secure(peer, &sessions) {
-                        outbox.entry(peer).or_default().push_back((event, 0));
-                        flush_outbox(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, local_peer_id, peer);
+                    // Contatto non connesso ma un mio dispositivo collegato è online:
+                    // gli chiedo di consegnare il messaggio (relay). Uno solo, così il
+                    // contatto non riceve doppioni; se il relay fallisce il messaggio
+                    // torna nella coda diretta. Con il contatto connesso e l'handshake
+                    // ancora in corso si aspetta la sessione diretta, che arriva a breve.
+                    let relay_device = if contact_devices.online(peer, &peers) {
+                        None
                     } else {
-                        outbox.entry(peer).or_default().push_back((event, 0));
-                        maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
+                        online_devices.iter().min().copied()
+                    };
+                    let relayed = relay_device.is_some_and(|device| {
+                        log::info!("relay: chiedo a {device} di consegnare a {peer}");
+                        let offers = relay_emoticon_offers(&message.emoticons, &triggers, &args.emotes);
+                        send_relay_text(&mut swarm, &account_key, &mut pending_device_requests, device, peer, message.clone(), offers)
+                            .inspect_err(|error| log::warn!("relay verso dispositivo fallito: {error}"))
+                            .is_ok()
+                    });
+                    if !relayed {
+                        // Le emoticon partono prima del testo e con la stessa
+                        // consegna affidabile: il destinatario le ha quando lo legge.
+                        for offer in new_emoticon_offers(&message.emoticons, peer, &mut shared_emoticons, &triggers, &args.emotes, &events) {
+                            deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, peer, ChatEvent::EmoticonOffer(offer));
+                        }
+                        deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, peer, ChatEvent::Text(message.clone()));
                     }
-                    let timestamp_ms = now_ms();
                     record_text(&history, &peer, "out", &message);
                     let _ = events.send(ClientEvent::Message {
                         message: ClientMessage {
@@ -1641,63 +1562,55 @@ async fn run_node(
                             direction: "out".into(),
                             kind: "text".into(),
                             body: text,
-                            timestamp_ms,
+                            timestamp_ms: now_ms(),
                             emoticons: client_emoticons,
                             attachment_id: None,
                             attachment_mime: None,
                             event_id: Some(hex_group_id(&message_id)),
-                            relayed: false,
+                            relayed,
                         },
                     });
                 }
                 Some(ClientCommand::SendNudge { peer }) => {
-                    nudge_counter += 1;
+                    // Prima la connessione, poi il limite: un trillo che non può
+                    // partire non deve consumare il rate limit.
+                    if !contact_devices.online(peer, &peers) {
+                        let _ = events.send(ClientEvent::Error {
+                            message: "contatto non collegato".into(),
+                        });
+                        return Ok(LoopFlow::Continue);
+                    }
                     let timestamp_ms = now_ms();
+                    if let Err(wait_ms) = nudge_limits.entry(peer).or_default().try_acquire(timestamp_ms) {
+                        let _ = events.send(ClientEvent::Error {
+                            message: format!(
+                                "trillo limitato: riprova tra {}s",
+                                wait_ms.div_ceil(1_000)
+                            ),
+                        });
+                        return Ok(LoopFlow::Continue);
+                    }
+                    nudge_counter += 1;
                     let mut id = [0; 16];
                     id[..8].copy_from_slice(&timestamp_ms.to_be_bytes());
                     id[8..].copy_from_slice(&nudge_counter.to_be_bytes());
-                    match nudge_limits.entry(peer).or_default().try_acquire(timestamp_ms) {
-                        Ok(()) if contact_devices.online(peer, &peers) => {
-                            if send_event(
-                                &mut swarm,
-                                &mut sessions,
-                                &contact_devices,
-                                peer,
-                                local_peer_id,
-                                &mut sent_numbers,
-                                ChatEvent::Nudge(Nudge { id, intensity: 1, timestamp_ms }),
-                            ).is_some() {
-                                record(&history, &peer, "out", "nudge", "trillo");
-                                let _ = events.send(ClientEvent::Message {
-                                    message: ClientMessage {
-                                        peer_id: peer.to_string(),
-                                        direction: "out".into(),
-                                        kind: "nudge".into(),
-                                        body: "trillo".into(),
-                                        timestamp_ms,
-                                        emoticons: Vec::new(),
-                                        attachment_id: None,
-                                        attachment_mime: None,
-                                        event_id: None,
-                                        relayed: false,
-                                    },
-                                });
-                            }
-                        }
-                        Ok(()) => {
-                            let _ = events.send(ClientEvent::Error {
-                                message: "contatto non collegato".into(),
-                            });
-                        }
-                        Err(wait_ms) => {
-                            let _ = events.send(ClientEvent::Error {
-                                message: format!(
-                                    "trillo limitato: riprova tra {}s",
-                                    wait_ms.div_ceil(1_000)
-                                ),
-                            });
-                        }
-                    }
+                    deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, peer,
+                        ChatEvent::Nudge(Nudge { id, intensity: 1, timestamp_ms }));
+                    record(&history, &peer, "out", "nudge", "trillo");
+                    let _ = events.send(ClientEvent::Message {
+                        message: ClientMessage {
+                            peer_id: peer.to_string(),
+                            direction: "out".into(),
+                            kind: "nudge".into(),
+                            body: "trillo".into(),
+                            timestamp_ms,
+                            emoticons: Vec::new(),
+                            attachment_id: None,
+                            attachment_mime: None,
+                            event_id: None,
+                            relayed: false,
+                        },
+                    });
                 }
                 Some(ClientCommand::SendFile { peer, path }) => {
                     if !contact_devices.online(peer, &peers) {
@@ -1906,7 +1819,9 @@ async fn run_node(
                             } else if now_ms().saturating_sub(timestamp_ms) > DELETE_WINDOW_MS {
                                 let _ = events.send(ClientEvent::Error { message: "tempo scaduto per la cancellazione per tutti".into() });
                             } else if let Some(id) = parse_message_id(&event_id) {
-                                send_event(&mut swarm, &mut sessions, &contact_devices, peer, local_peer_id, &mut sent_numbers,
+                                // Come i messaggi: in coda se il contatto è offline,
+                                // con retry e avviso se non arriva.
+                                deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, peer,
                                     ChatEvent::DeleteMessage(DeleteRequest { id, group_id: None }));
                                 if let Err(error) = history.tombstone_event(&event_id, now_ms()) {
                                     let _ = events.send(ClientEvent::Error { message: error.to_string() });
@@ -2055,17 +1970,11 @@ async fn run_node(
                         let _ = events.send(ClientEvent::Error { message: "nessun partecipante è online con una sessione protetta".into() });
                         return Ok(LoopFlow::Continue);
                     }
-                    for recipient in &recipients {
-                        for asset_id in emoticons.iter().map(|span| span.asset_id).collect::<HashSet<_>>() {
-                            if shared_emoticons.insert((*recipient, asset_id)) {
-                                if let Some(trigger) = triggers.iter().find(|trigger| trigger.asset_id == asset_id) {
-                                    if let Ok(offer) = load_emoticon_offer(&args.emotes, trigger) {
-                                        send_event(&mut swarm, &mut sessions, &contact_devices, *recipient, local_peer_id, &mut sent_numbers, ChatEvent::EmoticonOffer(offer));
-                                    }
-                                }
-                            }
+                    for recipient in recipients {
+                        for offer in new_emoticon_offers(&emoticons, recipient, &mut shared_emoticons, &triggers, &args.emotes, &events) {
+                            deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, recipient, ChatEvent::EmoticonOffer(offer));
                         }
-                        send_event(&mut swarm, &mut sessions, &contact_devices, *recipient, local_peer_id, &mut sent_numbers, group_event.clone());
+                        deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, recipient, group_event.clone());
                     }
                     history.record(&group_history_key(&group_id), "out", &format!("group-text:{local_peer_id}"), &encode_text_history(&message)?, timestamp_ms)?;
                     let _ = events.send(ClientEvent::GroupMessage { message: ClientGroupMessage {
@@ -2258,7 +2167,7 @@ async fn run_node(
                         match pending {
                             PendingDeviceRequest::Pair { peer, .. }
                             | PendingDeviceRequest::Sync { peer }
-                            | PendingDeviceRequest::Relay { peer } => *peer == peer_id,
+                            | PendingDeviceRequest::Relay { peer, .. } => *peer == peer_id,
                         }
                     });
                     if let Some(pairing) = pending_pair_targets
@@ -2342,6 +2251,11 @@ async fn run_node(
                             .retain(|_, (pending_peer, _)| *pending_peer != peer_id);
                         handshake_retries.remove(&peer_id);
                         decrypt_failures.remove(&peer_id);
+                        if !contact_devices.online(contact_devices.canonical(peer_id), &peers) {
+                            for offer in take_waiting_offers(&mut waiting_offers, &contact_devices, peer_id) {
+                                report_file_failed(&events, &offer.manifest.filename, "contatto disconnesso");
+                            }
+                        }
                         nudge_limits.remove(&peer_id);
                         incoming_nudge_limits.remove(&peer_id);
                         if was_application_peer {
@@ -2738,14 +2652,12 @@ async fn run_node(
                                             );
                                         }
                                         Err(error) => {
-                                            let _ = events.send(ClientEvent::Error {
-                                                message: format!("richiesta chunk non valida: {error}"),
-                                            });
+                                            report_file_failed(&events, &pending.manifest.filename, &format!("richiesta chunk non valida: {error}"));
                                         }
                                     }
                                 }
                                 ProtocolResponse::Rejected(error) => {
-                                    let _ = events.send(ClientEvent::Error { message: format!("file rifiutato: {error}") });
+                                    report_file_failed(&events, &pending.manifest.filename, &format!("file rifiutato: {error}"));
                                 }
                                 ProtocolResponse::Ack => {
                                     let _ = events.send(ClientEvent::AttachmentSent {
@@ -2776,10 +2688,10 @@ async fn run_node(
                                     )
                                 },
                                 ProtocolResponse::Rejected(error) => {
-                                    let _ = events.send(ClientEvent::Error { message: format!("trasferimento rifiutato: {error}") });
+                                    report_file_failed(&events, &transfer.manifest.filename, &format!("trasferimento rifiutato: {error}"));
                                 }
                                 ProtocolResponse::MissingChunks(_) => {
-                                    let _ = events.send(ClientEvent::Error { message: "risposta non valida durante il trasferimento".into() });
+                                    report_file_failed(&events, &transfer.manifest.filename, "risposta non valida durante il trasferimento");
                                 }
                             }
                         } else if let Some((msg_peer, event, attempts)) = pending_messages.remove(&request_id) {
@@ -2801,10 +2713,10 @@ async fn run_node(
                                     maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, peer);
                                 }
                                 ProtocolResponse::Rejected(reason) => {
-                                    report_undelivered(&events, msg_peer, &event, &reason);
+                                    report_undelivered(&events, &mut shared_emoticons, msg_peer, &event, &reason);
                                 }
                                 ProtocolResponse::MissingChunks(_) => {
-                                    report_undelivered(&events, msg_peer, &event, "risposta non valida");
+                                    report_undelivered(&events, &mut shared_emoticons, msg_peer, &event, "risposta non valida");
                                 }
                             }
                         }
@@ -2831,10 +2743,12 @@ async fn run_node(
                                 event,
                             ) {
                                 pending_offers.insert(next_id, pending);
+                            } else {
+                                report_file_failed(&events, &pending.manifest.filename, "sessione cifrata persa");
                             }
                         } else {
                             eprintln!("offerta file fallita definitivamente per {peer}: {error}");
-                            let _ = events.send(ClientEvent::Error { message: format!("invio file fallito: {error}") });
+                            report_file_failed(&events, &pending.manifest.filename, &error.to_string());
                         }
                     } else if let Some(mut transfer) = pending_transfers.remove(&request_id) {
                         if let Some(retries) = next_request_retry(transfer.retries) {
@@ -2851,7 +2765,7 @@ async fn run_node(
                             );
                         } else {
                             eprintln!("trasferimento file fallito definitivamente per {peer}: {error}");
-                            let _ = events.send(ClientEvent::Error { message: format!("trasferimento file fallito: {error}") });
+                            report_file_failed(&events, &transfer.manifest.filename, &error.to_string());
                         }
                     } else if let Some((msg_peer, event, retries)) = pending_messages.remove(&request_id) {
                         // Retry di un messaggio di testo fallito in transito.
@@ -2866,7 +2780,7 @@ async fn run_node(
                             }
                         } else {
                             eprintln!("messaggio non consegnato definitivamente a {peer}: {error}");
-                            report_undelivered(&events, msg_peer, &event, &error.to_string());
+                            report_undelivered(&events, &mut shared_emoticons, msg_peer, &event, &error.to_string());
                         }
                     } else {
                         eprintln!("invio cifrato fallito per {peer}: {error}");
@@ -2951,6 +2865,9 @@ async fn run_node(
                                         peer,
                                     );
                                     flush_outbox(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, local_peer_id, peer);
+                                    for offer in take_waiting_offers(&mut waiting_offers, &contact_devices, peer) {
+                                        offer_file(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_offers, &history, &events, local_peer_id, offer);
+                                    }
                                 }
                                 Err(error) => eprintln!("handshake ibrido fallito con {peer}: {error}"),
                             },
@@ -3008,6 +2925,9 @@ async fn run_node(
                                 peer,
                             );
                             flush_outbox(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, local_peer_id, peer);
+                            for offer in take_waiting_offers(&mut waiting_offers, &contact_devices, peer) {
+                                offer_file(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_offers, &history, &events, local_peer_id, offer);
+                            }
                         }
                     }
                 }
@@ -3121,7 +3041,7 @@ async fn run_node(
                                     });
                                     devices::seal(&key, &payload)?
                                 }
-                                Ok(DeviceRequest::RelayText { target, id, text })
+                                Ok(DeviceRequest::RelayText { target, id, text, emoticons, offers })
                                     if pairing_key.is_none() && known_devices.contains_key(&peer) =>
                                 {
                                     // Un dispositivo collegato ci chiede di consegnare un
@@ -3133,20 +3053,33 @@ async fn run_node(
                                         parsed.map(|p| known_contacts.contains(&p)).unwrap_or(false),
                                         parsed.map(|p| sessions.contains_key(&p)).unwrap_or(false)
                                     );
-                                    let delivered = match target.parse::<PeerId>() {
-                                        Ok(target_peer) if known_contacts.contains(&target_peer) => {
-                                            let emoticons = resolve_emoticons(&text, &triggers).unwrap_or_default();
-                                            let message = TextMessage { text: text.clone(), emoticons, id };
-                                            let event = ChatEvent::Text(message.clone());
-                                            if sessions.contains_key(&target_peer) {
-                                                match send_event(&mut swarm, &mut sessions, &contact_devices, target_peer, local_peer_id, &mut sent_numbers, event.clone()) {
-                                                    Some(request_id) => { pending_messages.insert(request_id, (target_peer, event, 0)); }
-                                                    None => { outbox.entry(target_peer).or_default().push_back((event, 0)); }
+                                    // Le emoticon arrivano dal dispositivo mittente insieme
+                                    // al testo: le sue emoticon personalizzate qui potrebbero
+                                    // non esistere. Un mittente vecchio non le manda, e si
+                                    // usano i trigger locali come prima.
+                                    let emoticons = if emoticons.is_empty() {
+                                        resolve_emoticons(&text, &triggers).unwrap_or_default()
+                                    } else {
+                                        emoticons
+                                    };
+                                    let message = TextMessage { text: text.clone(), emoticons, id };
+                                    let delivered = match parsed {
+                                        Some(target_peer)
+                                            if known_contacts.contains(&target_peer)
+                                                && validate_text_message(&message).is_ok() =>
+                                        {
+                                            for offer in offers {
+                                                let asset_id = offer.metadata.asset_id;
+                                                if message.emoticons.iter().any(|span| span.asset_id == asset_id)
+                                                    && shared_emoticons.insert((target_peer, asset_id))
+                                                {
+                                                    deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, target_peer, ChatEvent::EmoticonOffer(offer));
                                                 }
-                                            } else {
-                                                outbox.entry(target_peer).or_default().push_back((event, 0));
-                                                maybe_start_hybrid_handshake(&mut swarm, &mut pending_handshakes, &sessions, local_peer_id, target_peer);
                                             }
+                                            for offer in new_emoticon_offers(&message.emoticons, target_peer, &mut shared_emoticons, &triggers, &args.emotes, &events) {
+                                                deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, target_peer, ChatEvent::EmoticonOffer(offer));
+                                            }
+                                            deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, target_peer, ChatEvent::Text(message.clone()));
                                             record_text(&history, &target_peer, "out", &message);
                                             let _ = events.send(ClientEvent::Message {
                                                 message: ClientMessage {
@@ -3179,22 +3112,25 @@ async fn run_node(
                         let Some(pending) = pending_device_requests.remove(&request_id) else {
                             return Ok(LoopFlow::Continue);
                         };
-                        // La risposta a un RelayText conferma solo la consegna: nessuno
-                        // stato da aggiornare qui (il messaggio è già mostrato e verrà
-                        // sincronizzato dal dispositivo che l'ha inoltrato).
-                        if let PendingDeviceRequest::Relay { peer: relay_peer } = pending {
-                            if relay_peer == peer {
-                                match devices::open::<DeviceResponse>(&account_key, &response) {
-                                    Ok(DeviceResponse::RelayResult { delivered, .. }) => {
-                                        log::info!("relay: risposta da {peer} delivered={delivered}");
-                                        if !delivered {
-                                            let _ = events.send(ClientEvent::Error {
-                                                message: "il dispositivo collegato non ha potuto consegnare il messaggio".into(),
-                                            });
-                                        }
+                        // Il messaggio è già mostrato e verrà sincronizzato dal
+                        // dispositivo che l'ha inoltrato. Se invece il dispositivo non
+                        // ha potuto consegnarlo torna nella coda diretta: parte appena
+                        // abbiamo una sessione col contatto.
+                        if let PendingDeviceRequest::Relay { peer: relay_peer, target, message } = pending {
+                            let delivered = relay_peer == peer
+                                && match devices::open::<DeviceResponse>(&account_key, &response) {
+                                    Ok(DeviceResponse::RelayResult { delivered, .. }) => delivered,
+                                    other => {
+                                        log::warn!("relay: risposta inattesa da {peer}: {other:?}");
+                                        false
                                     }
-                                    other => log::warn!("relay: risposta inattesa da {peer}: {other:?}"),
+                                };
+                            log::info!("relay: risposta da {peer} delivered={delivered}");
+                            if !delivered {
+                                for offer in new_emoticon_offers(&message.emoticons, target, &mut shared_emoticons, &triggers, &args.emotes, &events) {
+                                    deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, target, ChatEvent::EmoticonOffer(offer));
                                 }
+                                deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, target, ChatEvent::Text(message));
                             }
                             return Ok(LoopFlow::Continue);
                         }
@@ -3285,7 +3221,15 @@ async fn run_node(
                     }
                 },
                 SwarmEvent::Behaviour(BehaviourEvent::Devices(request_response::Event::OutboundFailure { peer, request_id, error, .. })) => {
-                    pending_device_requests.remove(&request_id);
+                    if let Some(PendingDeviceRequest::Relay { target, message, .. }) = pending_device_requests.remove(&request_id) {
+                        // Relay non riuscito: il messaggio torna nella coda diretta.
+                        log::warn!("relay tramite {peer} fallito: {error}");
+                        for offer in new_emoticon_offers(&message.emoticons, target, &mut shared_emoticons, &triggers, &args.emotes, &events) {
+                            deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, target, ChatEvent::EmoticonOffer(offer));
+                        }
+                        deliver_event(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, &mut pending_handshakes, local_peer_id, target, ChatEvent::Text(message));
+                        return Ok(LoopFlow::Continue);
+                    }
                     let _ = events.send(ClientEvent::Error { message: format!("sincronizzazione con {peer} fallita: {error}") });
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Devices(request_response::Event::InboundFailure { peer, error, .. })) => {
@@ -3450,6 +3394,7 @@ fn requeue_in_order(queue: &mut VecDeque<(ChatEvent, u8)>, event: ChatEvent, att
 /// segna proprio quel messaggio come non consegnato.
 fn report_undelivered(
     events: &mpsc::UnboundedSender<ClientEvent>,
+    shared_emoticons: &mut HashSet<(PeerId, [u8; 32])>,
     peer: PeerId,
     event: &ChatEvent,
     reason: &str,
@@ -3463,12 +3408,91 @@ fn report_undelivered(
                 reason: reason.to_owned(),
             });
         }
-        _ => {
+        ChatEvent::EmoticonOffer(offer) => {
+            // Non più "già condivisa": il prossimo messaggio la riprova.
+            shared_emoticons.remove(&(peer, offer.metadata.asset_id));
+        }
+        other => {
+            let what = match other {
+                ChatEvent::Nudge(_) => "il trillo",
+                ChatEvent::DeleteMessage(_) => "la cancellazione per tutti",
+                ChatEvent::GroupText(_) => "un messaggio di gruppo",
+                _ => "un messaggio",
+            };
             let _ = events.send(ClientEvent::Error {
-                message: format!("un messaggio non è stato consegnato: {reason}"),
+                message: format!("{what} non è stato consegnato: {reason}"),
             });
         }
     }
+}
+
+/// Un invio di file finito male: la UI deve chiudere la barra di quel file,
+/// altrimenti resta ferma per sempre.
+fn report_file_failed(events: &mpsc::UnboundedSender<ClientEvent>, filename: &str, reason: &str) {
+    log::warn!("invio file {filename} non riuscito: {reason}");
+    let _ = events.send(ClientEvent::AttachmentFailed {
+        filename: filename.to_owned(),
+        reason: reason.to_owned(),
+    });
+}
+
+/// Invia l'offerta di un file a un contatto. Va in cronologia e in chat solo
+/// se parte davvero; altrimenti la UI riceve `AttachmentFailed`.
+#[allow(clippy::too_many_arguments)]
+fn offer_file(
+    swarm: &mut Swarm<Behaviour>,
+    sessions: &mut HashMap<PeerId, RatchetSession>,
+    devices: &ContactDevices,
+    sent_numbers: &mut HashMap<PeerId, u64>,
+    pending_offers: &mut HashMap<request_response::OutboundRequestId, PendingOffer>,
+    history: &History,
+    events: &mpsc::UnboundedSender<ClientEvent>,
+    local_peer_id: PeerId,
+    offer: PendingOffer,
+) {
+    let Some(request_id) = send_event(
+        swarm,
+        sessions,
+        devices,
+        offer.peer,
+        local_peer_id,
+        sent_numbers,
+        ChatEvent::AttachmentOffer(offer.manifest.clone()),
+    ) else {
+        report_file_failed(events, &offer.manifest.filename, "canale cifrato non pronto");
+        return;
+    };
+    record(history, &offer.peer, "out", "file", &encode_attachment(&offer.manifest));
+    let _ = events.send(ClientEvent::Message {
+        message: ClientMessage {
+            peer_id: offer.peer.to_string(),
+            direction: "out".into(),
+            kind: "file".into(),
+            body: offer.manifest.filename.clone(),
+            timestamp_ms: now_ms(),
+            emoticons: Vec::new(),
+            attachment_id: Some(hex_asset_id(&offer.manifest.attachment_id)),
+            attachment_mime: Some(offer.manifest.mime.clone()),
+            event_id: None,
+            relayed: false,
+        },
+    });
+    pending_offers.insert(request_id, offer);
+}
+
+/// Le offerte in attesa per un peer, cercate anche sul contatto a cui
+/// appartiene (le code sono indicizzate sul contatto).
+fn take_waiting_offers(
+    waiting: &mut HashMap<PeerId, Vec<PendingOffer>>,
+    devices: &ContactDevices,
+    peer: PeerId,
+) -> Vec<PendingOffer> {
+    let mut offers = waiting.remove(&peer).unwrap_or_default();
+    let contact = devices.canonical(peer);
+    if contact != peer {
+        offers.extend(waiting.remove(&contact).unwrap_or_default());
+    }
+    offers
 }
 
 /// Destinazione di un file in preparazione (hash in corso).
@@ -4235,6 +4259,76 @@ fn flush_outbox(
     }
 }
 
+/// Consegna affidabile di un evento cifrato a un contatto: con la sessione
+/// pronta e la coda vuota parte subito ed è tracciato per retry e rifiuti;
+/// altrimenti va in fondo alla coda (l'ordine resta quello di invio) e, senza
+/// sessione, si avvia l'handshake. Non c'è un esito "perso in silenzio": o
+/// arriva un Ack o `report_undelivered` avvisa l'utente.
+#[allow(clippy::too_many_arguments)]
+fn deliver_event(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    sessions: &mut HashMap<PeerId, RatchetSession>,
+    devices: &ContactDevices,
+    sent_numbers: &mut HashMap<PeerId, u64>,
+    pending_messages: &mut HashMap<request_response::OutboundRequestId, (PeerId, ChatEvent, u8)>,
+    outbox: &mut HashMap<PeerId, VecDeque<(ChatEvent, u8)>>,
+    pending_handshakes: &mut HashMap<request_response::OutboundRequestId, (PeerId, HybridInitiator)>,
+    local_peer_id: PeerId,
+    peer: PeerId,
+    event: ChatEvent,
+) {
+    let queue_empty = outbox.get(&peer).is_none_or(VecDeque::is_empty);
+    if devices.secure(peer, sessions) && queue_empty {
+        match send_event(swarm, sessions, devices, peer, local_peer_id, sent_numbers, event.clone()) {
+            Some(request_id) => {
+                pending_messages.insert(request_id, (peer, event, 0));
+            }
+            None => outbox.entry(peer).or_default().push_back((event, 0)),
+        }
+    } else if devices.secure(peer, sessions) {
+        outbox.entry(peer).or_default().push_back((event, 0));
+        flush_outbox(swarm, sessions, devices, sent_numbers, pending_messages, outbox, local_peer_id, peer);
+    } else {
+        outbox.entry(peer).or_default().push_back((event, 0));
+        maybe_start_hybrid_handshake(swarm, pending_handshakes, sessions, local_peer_id, peer);
+    }
+}
+
+/// Le emoticon personalizzate di un messaggio che `peer` non ha ancora
+/// ricevuto. Vengono segnate come condivise subito, così non partono due
+/// volte; se la consegna fallisce `report_undelivered` toglie il segno e il
+/// messaggio successivo le riprova.
+fn new_emoticon_offers(
+    spans: &[EmoticonSpan],
+    peer: PeerId,
+    shared: &mut HashSet<(PeerId, [u8; 32])>,
+    triggers: &[Trigger],
+    store: &Path,
+    events: &mpsc::UnboundedSender<ClientEvent>,
+) -> Vec<EmoticonOffer> {
+    let mut offers = Vec::new();
+    for span in spans {
+        let asset_id = span.asset_id;
+        if !shared.insert((peer, asset_id)) {
+            continue;
+        }
+        let Some(trigger) = triggers.iter().find(|trigger| trigger.asset_id == asset_id) else {
+            shared.remove(&(peer, asset_id));
+            continue;
+        };
+        match load_emoticon_offer(store, trigger) {
+            Ok(offer) => offers.push(offer),
+            Err(error) => {
+                shared.remove(&(peer, asset_id));
+                let _ = events.send(ClientEvent::Error {
+                    message: format!("emoticon {} non disponibile: {error}", trigger.text),
+                });
+            }
+        }
+    }
+    offers
+}
+
 fn send_event(
     swarm: &mut libp2p::Swarm<Behaviour>,
     sessions: &mut HashMap<PeerId, RatchetSession>,
@@ -4353,13 +4447,11 @@ fn send_current_transfer_chunk(
         Ok(chunk) => chunk,
         Err(error) => {
             eprintln!("invio interrotto: {error}");
-            let _ = events.send(ClientEvent::Error {
-                message: format!("invio file interrotto: {error}"),
-            });
+            report_file_failed(events, &transfer.manifest.filename, &error.to_string());
             return;
         }
     };
-    if let Some(request_id) = send_event(
+    match send_event(
         swarm,
         sessions,
         devices,
@@ -4368,7 +4460,13 @@ fn send_current_transfer_chunk(
         sent_numbers,
         ChatEvent::AttachmentChunk(chunk),
     ) {
-        pending_transfers.insert(request_id, transfer);
+        Some(request_id) => {
+            pending_transfers.insert(request_id, transfer);
+        }
+        // La sessione è caduta a metà invio: prima il chunk successivo non
+        // partiva e la barra restava ferma senza nessun avviso. Le parti già
+        // ricevute restano dal destinatario, quindi un nuovo invio riprende.
+        None => report_file_failed(events, &transfer.manifest.filename, "sessione cifrata persa durante l'invio"),
     }
 }
 
@@ -5205,19 +5303,49 @@ fn send_relay_text(
     account_key: &[u8; 32],
     pending: &mut HashMap<request_response::OutboundRequestId, PendingDeviceRequest>,
     device: PeerId,
-    target: &PeerId,
-    id: [u8; 16],
-    text: String,
+    target: PeerId,
+    message: TextMessage,
+    offers: Vec<EmoticonOffer>,
 ) -> Result<(), Box<dyn Error>> {
     let request = DeviceRequest::RelayText {
         target: target.to_string(),
-        id,
-        text,
+        id: message.id,
+        text: message.text.clone(),
+        emoticons: message.emoticons.clone(),
+        offers,
     };
     let sealed = devices::seal(account_key, &request)?;
     let request_id = swarm.behaviour_mut().devices.send_request(&device, sealed);
-    pending.insert(request_id, PendingDeviceRequest::Relay { peer: device });
+    pending.insert(request_id, PendingDeviceRequest::Relay { peer: device, target, message });
     Ok(())
+}
+
+/// Le immagini delle emoticon personalizzate viaggiano col relay: il
+/// dispositivo che consegna potrebbe non averle. Restano sotto il limite di
+/// una richiesta libp2p (1 MiB, e i byte in CBOR occupano fino al doppio):
+/// quelle oltre il budget arrivano come testo.
+const RELAY_EMOTICON_BUDGET: usize = 192 * 1024;
+
+fn relay_emoticon_offers(spans: &[EmoticonSpan], triggers: &[Trigger], store: &Path) -> Vec<EmoticonOffer> {
+    let mut offers: Vec<EmoticonOffer> = Vec::new();
+    let mut used = 0;
+    for span in spans {
+        if offers.iter().any(|offer| offer.metadata.asset_id == span.asset_id) {
+            continue;
+        }
+        let Some(trigger) = triggers.iter().find(|trigger| trigger.asset_id == span.asset_id) else {
+            continue;
+        };
+        match load_emoticon_offer(store, trigger) {
+            Ok(offer) if used + offer.bytes.len() <= RELAY_EMOTICON_BUDGET => {
+                used += offer.bytes.len();
+                offers.push(offer);
+            }
+            Ok(_) => log::warn!("relay: emoticon {} oltre il budget, inviata come testo", trigger.text),
+            Err(error) => log::warn!("relay: emoticon {} non disponibile: {error}", trigger.text),
+        }
+    }
+    offers
 }
 
 fn send_device_sync(
@@ -6943,13 +7071,175 @@ mod tests {
                     unreachable!()
                 };
                 alice.send(ClientCommand::RejectAttachment { offer_id });
-                bob.until(|event| matches!(event, ClientEvent::Error { message } if message.contains("rifiutato")))
+                bob.until(|event| matches!(event, ClientEvent::AttachmentFailed { reason, .. } if reason.contains("rifiutato")))
                     .await;
                 alice.shutdown().await;
                 bob.shutdown().await;
             })
             .await;
         fs::remove_dir_all(root).ok();
+    }
+
+    /// Ordina i due nodi per ruolo nell'handshake: il primo è quello che lo
+    /// avvia quando manca la sessione.
+    fn by_handshake_role<'a>(a: &'a mut TestNode, b: &'a mut TestNode) -> (&'a mut TestNode, &'a mut TestNode) {
+        if should_initiate(a.peer, b.peer) {
+            (a, b)
+        } else {
+            (b, a)
+        }
+    }
+
+    async fn forget_session(node: &mut TestNode, peer: PeerId) {
+        node.send(ClientCommand::ForgetSession { peer });
+        node.until(|event| matches!(event, ClientEvent::ContactStatus { status, .. } if status == "session-forgotten"))
+            .await;
+    }
+
+    /// Audit #7 e #9: trillo, emoticon personalizzata e "elimina per tutti"
+    /// partivano una volta sola e senza sessione andavano persi in silenzio.
+    /// Ora restano in coda e arrivano dopo il nuovo handshake.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(windows, ignore = "il teardown libp2p può bloccare l'harness Windows")]
+    async fn nudge_emoticon_and_delete_survive_a_lost_session() {
+        let root = test_root("queued-events");
+        fs::create_dir_all(&root).unwrap();
+        let emoticon = root.join("gatto.png");
+        fs::write(&emoticon, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01").unwrap();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut alice = TestNode::start(loopback_config("Alice", &root.join("alice"), None)).await;
+                let mut bob = TestNode::start(loopback_config("Bob", &root.join("bob"), None)).await;
+                connect_pair(&mut alice, &mut bob).await;
+                // Chi invia avvia anche l'handshake: la coda si svuota da sola.
+                let (sender, receiver) = by_handshake_role(&mut alice, &mut bob);
+
+                forget_session(sender, receiver.peer).await;
+                sender.send(ClientCommand::SendNudge { peer: receiver.peer });
+                receiver
+                    .until(|event| matches!(event, ClientEvent::Message { message } if message.direction == "in" && message.kind == "nudge"))
+                    .await;
+
+                sender.send(ClientCommand::CreateEmoticon { path: emoticon.clone(), trigger: ":gatto:".into() });
+                sender.until(|event| matches!(event, ClientEvent::EmoticonCatalog { .. })).await;
+                forget_session(sender, receiver.peer).await;
+                sender.send(ClientCommand::SendText { peer: receiver.peer, text: "ciao :gatto:".into() });
+                // Offerta e testo viaggiano su richieste separate: l'ordine di
+                // arrivo non è garantito.
+                let mut offered = false;
+                let mut received = None;
+                while !offered || received.is_none() {
+                    match receiver
+                        .until(|event| {
+                            matches!(event, ClientEvent::EmoticonOffered { .. })
+                                || matches!(event, ClientEvent::Message { message } if message.direction == "in" && message.body == "ciao :gatto:")
+                        })
+                        .await
+                    {
+                        ClientEvent::EmoticonOffered { .. } => offered = true,
+                        ClientEvent::Message { message } => received = Some(message),
+                        _ => unreachable!(),
+                    }
+                }
+                let message = received.unwrap();
+                assert_eq!(message.emoticons.len(), 1);
+                let event_id = message.event_id.expect("id del messaggio");
+
+                forget_session(sender, receiver.peer).await;
+                sender.send(ClientCommand::DeleteMessageForEveryone { peer: receiver.peer, event_id: event_id.clone() });
+                receiver
+                    .until(|event| matches!(event, ClientEvent::MessageDeleted { event_id: deleted, .. } if *deleted == event_id))
+                    .await;
+                alice.shutdown().await;
+                bob.shutdown().await;
+            })
+            .await;
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Audit #6: se la sessione cadeva durante un invio il chunk successivo
+    /// non partiva, senza errori, e la barra restava ferma per sempre.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(windows, ignore = "il teardown libp2p può bloccare l'harness Windows")]
+    async fn file_transfer_interrupted_by_lost_session_reports_failure() {
+        let root = test_root("file-lost-session");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("doc.bin");
+        fs::write(&source, vec![7u8; 2 * attachments::CHUNK_SIZE]).unwrap();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut alice = TestNode::start(loopback_config("Alice", &root.join("alice"), None)).await;
+                let mut bob = TestNode::start(loopback_config("Bob", &root.join("bob"), None)).await;
+                connect_pair(&mut alice, &mut bob).await;
+                // Chi invia non avvia l'handshake: la sessione resta assente
+                // quando arriva la richiesta dei chunk.
+                let (receiver, sender) = by_handshake_role(&mut alice, &mut bob);
+
+                sender.send(ClientCommand::SendFile { peer: receiver.peer, path: source.clone() });
+                let ClientEvent::IncomingAttachmentOffered { offer_id, .. } = receiver
+                    .until(|event| matches!(event, ClientEvent::IncomingAttachmentOffered { .. }))
+                    .await
+                else {
+                    unreachable!()
+                };
+                forget_session(sender, receiver.peer).await;
+                receiver.send(ClientCommand::AcceptAttachment { offer_id });
+                let ClientEvent::AttachmentFailed { filename, reason } = sender
+                    .until(|event| matches!(event, ClientEvent::AttachmentFailed { .. }))
+                    .await
+                else {
+                    unreachable!()
+                };
+                assert_eq!(filename, "doc.bin");
+                assert!(reason.contains("sessione"), "{reason}");
+                alice.shutdown().await;
+                bob.shutdown().await;
+            })
+            .await;
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Audit #8: le emoticon viaggiano col relay, ma una richiesta resta
+    /// sotto il limite di libp2p.
+    #[test]
+    fn relay_carries_emoticons_within_budget() {
+        let store = std::env::temp_dir().join(format!("msnnext-relay-emoticons-{}", std::process::id()));
+        fs::create_dir_all(&store).unwrap();
+        let mut triggers = Vec::new();
+        let small = store.join("small.png");
+        fs::write(&small, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01").unwrap();
+        create_emoticon(&small, ":piccola:", &store, &mut triggers).unwrap();
+        let mut big = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x02\0\0\0\x02".to_vec();
+        big.resize(RELAY_EMOTICON_BUDGET, 0);
+        fs::write(store.join("big.png"), &big).unwrap();
+        create_emoticon(&store.join("big.png"), ":grande:", &store, &mut triggers).unwrap();
+
+        let spans = resolve_emoticons(":piccola: :grande: :piccola:", &triggers).unwrap();
+        assert_eq!(spans.len(), 3);
+        let offers = relay_emoticon_offers(&spans, &triggers, &store);
+        // Una sola copia per immagine, e la grande non ci sta più.
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].metadata.asset_id, spans[0].asset_id);
+        fs::remove_dir_all(store).ok();
+    }
+
+    /// Audit #8: un dispositivo aggiornato deve capire il RelayText dei client
+    /// precedenti, che non hanno i campi delle emoticon.
+    #[test]
+    fn relay_request_from_older_client_still_decodes() {
+        #[derive(Serialize)]
+        enum OldRequest {
+            RelayText { target: String, id: [u8; 16], text: String },
+        }
+        let key = [9u8; 32];
+        let sealed = devices::seal(&key, &OldRequest::RelayText { target: "x".into(), id: [1; 16], text: "ciao".into() }).unwrap();
+        let DeviceRequest::RelayText { text, emoticons, offers, .. } = devices::open::<DeviceRequest>(&key, &sealed).unwrap() else {
+            panic!("variante inattesa")
+        };
+        assert_eq!(text, "ciao");
+        assert!(emoticons.is_empty() && offers.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

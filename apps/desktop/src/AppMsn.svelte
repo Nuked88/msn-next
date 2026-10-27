@@ -171,6 +171,7 @@
     | { type: 'attachmentSent'; peerId: string; filename: string }
     | { type: 'attachmentProgress'; filename: string; completedChunks: number; totalChunks: number }
     | { type: 'attachmentTransfersCancelled' }
+    | { type: 'attachmentFailed'; filename: string; reason: string }
     | ({ type: 'incomingAttachmentOffered' } & IncomingAttachmentOffer)
     | { type: 'contactRemoved'; peerId: string }
     | { type: 'conversationCleared'; peerId: string }
@@ -913,6 +914,16 @@
       transferProgress = event.totalChunks
         ? Math.round(event.completedChunks * 100 / event.totalChunks)
         : 100
+      return
+    }
+    if (event.type === 'attachmentFailed') {
+      pendingFileCount = Math.max(0, pendingFileCount - 1)
+      fileSending = pendingFileCount > 0
+      if (transferFilename === event.filename || !fileSending) {
+        transferFilename = ''
+        transferProgress = 0
+      }
+      showToast($t('toast.fileNotSent', { filename: event.filename, reason: event.reason }))
       return
     }
     if (event.type === 'attachmentTransfersCancelled') {
