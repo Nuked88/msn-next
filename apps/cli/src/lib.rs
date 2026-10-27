@@ -70,12 +70,12 @@ const MAX_PENDING_INBOUND_OFFERS: usize = 8;
 /// Emoticon ricevute in attesa di salvataggio (fino a ~350 KB l'una).
 const MAX_PENDING_EMOTICONS: usize = 64;
 const ATTACHMENT_DECISION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-/// Entro quanto un messaggio deve essere confermato prima del reinvio. Il
-/// timeout di libp2p è unico per il protocollo cifrato e vale 5 minuti per
-/// via delle offerte di file: per i messaggi lo accorciamo noi.
 /// Messaggi caricati per volta in una conversazione; i precedenti arrivano
 /// a pagine su richiesta della UI.
 const HISTORY_PAGE: usize = 100;
+/// Entro quanto un messaggio deve essere confermato prima del reinvio. Il
+/// timeout di libp2p è unico per il protocollo cifrato e vale 5 minuti per
+/// via delle offerte di file: per i messaggi lo accorciamo noi.
 const MESSAGE_ACK_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 20 });
 const DELIVERY_CHECK_INTERVAL: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 5 });
 
@@ -83,7 +83,12 @@ const DELIVERY_CHECK_INTERVAL: Duration = Duration::from_secs(if cfg!(test) { 1 
 /// istante di invio (ms).
 type PendingMessage = (PeerId, ChatEvent, u8, u64);
 const RELAY_MAX_CIRCUIT_BYTES: u64 = attachments::MAX_FILE_BYTES + 64 * 1024 * 1024;
-const RELAY_MAX_CIRCUIT_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
+/// Basta per 5 GB anche a ~250 KB/s; oltre, il trasferimento riprende su un
+/// nuovo circuito grazie al resume a chunk.
+const RELAY_MAX_CIRCUIT_DURATION: Duration = Duration::from_secs(6 * 60 * 60);
+/// Circuiti aperti per peer sorgente: limita quanto un singolo estraneo può
+/// occupare il relay pubblico.
+const RELAY_MAX_CIRCUITS_PER_PEER: usize = 2;
 const DEFAULT_RELAY_ADDRESS: &str =
     "/ip4/173.212.233.151/tcp/4001/p2p/12D3KooWCQBCLXYhjkhay3hXTrhrNF8ZjRLd8qHL2nD2iufais4k";
 type AccountKeyStore = Arc<dyn Fn([u8; 32]) -> Result<(), String> + Send + Sync>;
@@ -726,6 +731,7 @@ fn build_swarm(
                         relay::Config {
                             max_circuit_bytes: RELAY_MAX_CIRCUIT_BYTES,
                             max_circuit_duration: RELAY_MAX_CIRCUIT_DURATION,
+                            max_circuits_per_peer: RELAY_MAX_CIRCUITS_PER_PEER,
                             ..relay::Config::default()
                         },
                     )
@@ -6399,12 +6405,21 @@ impl ClientConfig {
         if name.trim().is_empty() || name.len() > 64 {
             return Err("nome non valido".into());
         }
+        // Più relay separati da virgola o spazi: se uno cade restano gli altri.
         let relay = relay
             .filter(|address| !address.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_RELAY_ADDRESS.to_owned())
-            .parse::<Multiaddr>()?;
-        split_peer_address(&relay)?;
-        let relays = vec![relay];
+            .unwrap_or_else(|| DEFAULT_RELAY_ADDRESS.to_owned());
+        let mut relays = Vec::<Multiaddr>::new();
+        for address in relay.split(|c: char| c == ',' || c.is_whitespace()) {
+            if address.is_empty() {
+                continue;
+            }
+            let address = address.parse::<Multiaddr>()?;
+            split_peer_address(&address)?;
+            if !relays.contains(&address) {
+                relays.push(address);
+            }
+        }
         Ok(Self {
             listen: "/ip4/0.0.0.0/udp/0/quic-v1".parse()?,
             listen_tcp: "/ip4/0.0.0.0/tcp/0".parse()?,
@@ -8111,6 +8126,20 @@ mod tests {
             Some("/dns4/relay.example.com/tcp/4001".into()),
         )
         .is_err());
+
+        let backup_peer = PeerId::from(Keypair::generate_ed25519().public());
+        let backup = format!("/ip4/10.0.0.1/udp/4001/quic-v1/p2p/{backup_peer}");
+        let several = ClientConfig::desktop(
+            "Alice".into(),
+            std::env::temp_dir(),
+            None,
+            Some(format!("{relay}, {backup}\n{relay}")),
+        )
+        .unwrap();
+        assert_eq!(
+            several.relays,
+            vec![relay.parse().unwrap(), backup.parse().unwrap()]
+        );
     }
 
     #[tokio::test]

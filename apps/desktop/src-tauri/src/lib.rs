@@ -1370,7 +1370,7 @@ fn profile_save(
         .unwrap_or_default()
         .trim()
         .to_owned();
-    if relay_address.len() > 512
+    if relay_address.len() > 1024
         || ClientConfig::desktop(
             name.to_owned(),
             data_dir.clone(),

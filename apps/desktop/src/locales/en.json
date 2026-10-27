@@ -314,7 +314,7 @@
   "settings.network.body": "The mini-node helps devices find each other; data stays encrypted between clients.",
   "settings.network.relay": "Custom relay",
   "settings.network.relayPlaceholder": "Use the msnnext mini-node",
-  "settings.network.relayHint": "Leave empty to use the public mini-node automatically. Reconnect after changing it.",
+  "settings.network.relayHint": "Leave empty to use the public mini-node. You can list several, separated by commas: if one is down the others are used. Reconnect after changing it.",
   "settings.network.security.title": "Protecting your data",
   "settings.network.security.desc": "Encryption, local identity and security model limits",
   "settings.footer.note": "Theme and text changes are visible immediately.",

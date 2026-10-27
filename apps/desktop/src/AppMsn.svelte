@@ -2597,7 +2597,7 @@
         <details>
           <summary>{$t('setup.advanced')}</summary>
           <label>{$t('setup.peerAddress')} <small>{$t('setup.optional')}</small><input bind:value={directAddress} placeholder="/ip4/…/udp/…/quic-v1/p2p/…" /></label>
-          <label>{$t('setup.customRelay')} <small>{$t('setup.optional')}</small><input bind:value={relayAddress} maxlength="512" placeholder={$t('setup.relayPlaceholder')} /></label>
+          <label>{$t('setup.customRelay')} <small>{$t('setup.optional')}</small><input bind:value={relayAddress} maxlength="1024" placeholder={$t('setup.relayPlaceholder')} /></label>
         </details>
         <button class="primary-button wide" disabled={starting || !displayName.trim()} onclick={() => startNode()}>
           {starting ? $t('setup.connecting') : $t('setup.goOnline')}
@@ -2861,7 +2861,7 @@
                 <h3 id="network-panel-title">{$t('settings.network.title')}</h3>
                 <p>{$t('settings.network.body')}</p>
               </header>
-              <label class="settings-field">{$t('settings.network.relay')}<input bind:value={relayAddress} maxlength="512" placeholder={$t('settings.network.relayPlaceholder')} /><small>{$t('settings.network.relayHint')}</small></label>
+              <label class="settings-field">{$t('settings.network.relay')}<input bind:value={relayAddress} maxlength="1024" placeholder={$t('settings.network.relayPlaceholder')} /><small>{$t('settings.network.relayHint')}</small></label>
               <button class="security-settings-row" onclick={() => securityIntroOpen = true}><ShieldCheck size={19} /><span><strong>{$t('settings.network.security.title')}</strong><small>{$t('settings.network.security.desc')}</small></span><ExternalLink size={15} /></button>
             </section>
           {/if}
