@@ -1261,6 +1261,28 @@ fn node_request_device_link(state: State<'_, NodeState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn node_revoke_device(state: State<'_, NodeState>, peer_id: String) -> Result<(), String> {
+    send_command(
+        &state,
+        ClientCommand::RevokeDevice {
+            peer: parse_peer(&peer_id)?,
+        },
+    )
+}
+
+#[tauri::command]
+fn node_answer_account_rotation(
+    state: State<'_, NodeState>,
+    request_id: u64,
+    accept: bool,
+) -> Result<(), String> {
+    send_command(
+        &state,
+        ClientCommand::AnswerAccountRotation { request_id, accept },
+    )
+}
+
+#[tauri::command]
 fn node_import_device_link(state: State<'_, NodeState>, link: String) -> Result<(), String> {
     send_command(&state, ClientCommand::ImportDeviceLink { link })
 }
@@ -1781,6 +1803,8 @@ pub fn run() {
             node_request_contact_link,
             node_request_device_link,
             node_import_device_link,
+            node_revoke_device,
+            node_answer_account_rotation,
             scan_contact_qr,
             save_contact_qr,
             profile_load,
