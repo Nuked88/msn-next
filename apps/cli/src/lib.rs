@@ -10314,9 +10314,12 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let source = root.join("grande.bin");
         // File sparso: non occupa disco ma va letto e hashato per intero.
+        // 2 GB: con 1 GB, su una CI veloce e con
+        // gli altri test in parallelo, l'hash poteva finire prima che il
+        // testo facesse il giro della rete.
         fs::File::create(&source)
             .unwrap()
-            .set_len(1024 * 1024 * 1024)
+            .set_len(2 * 1024 * 1024 * 1024)
             .unwrap();
         let local = tokio::task::LocalSet::new();
         local
