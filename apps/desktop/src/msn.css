@@ -2736,9 +2736,11 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
 .linked-device-list { margin: 0; }
 
 .linked-device-row {
-  grid-template-columns: 12px minmax(0, 1fr);
+  grid-template-columns: 12px minmax(0, 1fr) auto;
   cursor: default;
 }
+
+.linked-device-row > .danger-button { white-space: nowrap; }
 
 .device-status-dot {
   width: 8px;
