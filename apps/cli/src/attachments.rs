@@ -14,6 +14,9 @@ use std::{
 pub const CHUNK_SIZE: usize = 256 * 1024;
 pub const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MAX_PREVIEW_BYTES: u64 = 50 * 1024 * 1024;
+/// Trasferimenti in arrivo tenuti in memoria allo stesso tempo: oltre questo
+/// numero le nuove offerte vengono rifiutate finché uno non finisce.
+pub const MAX_ACTIVE_INCOMING: usize = 32;
 
 pub fn build_manifest(path: &Path) -> Result<AttachmentManifest, Box<dyn Error>> {
     let size = fs::metadata(path)?.len();
@@ -185,6 +188,11 @@ impl Receiver {
                 return Ok((vec![], Some(Completion::Ready(completed(&manifest)))));
             }
         }
+        if !self.active.contains_key(&manifest.attachment_id)
+            && self.active.len() >= MAX_ACTIVE_INCOMING
+        {
+            return Err("troppi trasferimenti in arrivo".into());
+        }
         fs::create_dir_all(self.vault.parts_dir(&manifest.attachment_id))?;
         // Per il resume basta guardare la dimensione delle parti già scritte:
         // ogni chunk è stato verificato prima di salvarlo e la cifratura
@@ -276,8 +284,21 @@ impl Receiver {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn read(&self, id: &[u8; 32]) -> Result<Vec<u8>, Box<dyn Error>> {
         self.vault.read(id)
+    }
+
+    /// Il mittente ha annullato: niente più chunk per questo file, e le
+    /// parti già ricevute vengono eliminate.
+    pub fn cancel(&mut self, id: &[u8; 32]) {
+        self.active.remove(id);
+        let _ = fs::remove_dir_all(self.vault.parts_dir(id));
+    }
+
+    /// Il vault da usare fuori dal loop (thread bloccanti).
+    pub fn vault(&self) -> Vault {
+        self.vault.clone()
     }
 
     pub fn export(&self, id: &[u8; 32], path: &Path) -> Result<(), Box<dyn Error>> {
@@ -367,7 +388,7 @@ impl Vault {
         Ok((file, reference.manifest))
     }
 
-    fn read(&self, id: &[u8; 32]) -> Result<Vec<u8>, Box<dyn Error>> {
+    pub fn read(&self, id: &[u8; 32]) -> Result<Vec<u8>, Box<dyn Error>> {
         if let Ok(bytes) = self.read_legacy(id) {
             return Ok(bytes);
         }
@@ -603,6 +624,30 @@ mod tests {
     }
 
     #[test]
+    fn active_incoming_transfers_are_capped() {
+        let root = std::env::temp_dir().join(format!("msnnext-cap-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        let mut receiver = Receiver::new(root.join("received"), [12; 32]);
+        let manifests: Vec<_> = (0..=MAX_ACTIVE_INCOMING)
+            .map(|index| {
+                let source = root.join(format!("{index}.bin"));
+                fs::write(&source, vec![index as u8; CHUNK_SIZE + 1]).unwrap();
+                build_manifest(&source).unwrap()
+            })
+            .collect();
+        for manifest in &manifests[..MAX_ACTIVE_INCOMING] {
+            receiver.accept_offer(manifest.clone()).unwrap();
+        }
+        assert!(receiver
+            .accept_offer(manifests[MAX_ACTIVE_INCOMING].clone())
+            .is_err());
+        // Riproporre un trasferimento già attivo (resume) resta possibile.
+        assert!(receiver.accept_offer(manifests[0].clone()).is_ok());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn corrupted_part_fails_finalize_and_restarts_transfer() {
         let root = std::env::temp_dir().join(format!("msnnext-corrupt-{}", std::process::id()));
         fs::remove_dir_all(&root).ok();
@@ -641,8 +686,14 @@ mod tests {
         receiver.store_reference(&manifest, &source).unwrap();
 
         let vault_bytes: u64 = walk_size(&root.join("vault"));
-        assert!(vault_bytes < 4096, "il vault non deve contenere una copia: {vault_bytes}");
-        assert_eq!(receiver.read(&manifest.attachment_id).unwrap(), fs::read(&source).unwrap());
+        assert!(
+            vault_bytes < 4096,
+            "il vault non deve contenere una copia: {vault_bytes}"
+        );
+        assert_eq!(
+            receiver.read(&manifest.attachment_id).unwrap(),
+            fs::read(&source).unwrap()
+        );
         let exported = root.join("copia.png");
         receiver.export(&manifest.attachment_id, &exported).unwrap();
         assert_eq!(fs::read(&exported).unwrap(), fs::read(&source).unwrap());
@@ -650,7 +701,9 @@ mod tests {
         // Se l'originale cambia, non si spaccia un altro file per quello inviato.
         fs::write(&source, vec![6; 3 * CHUNK_SIZE]).unwrap();
         assert!(receiver.read(&manifest.attachment_id).is_err());
-        assert!(receiver.export(&manifest.attachment_id, &root.join("altra.png")).is_err());
+        assert!(receiver
+            .export(&manifest.attachment_id, &root.join("altra.png"))
+            .is_err());
         assert!(!root.join("altra.png").exists());
         fs::remove_dir_all(root).ok();
     }

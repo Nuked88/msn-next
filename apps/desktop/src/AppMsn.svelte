@@ -1,4 +1,14 @@
 <script lang="ts">
+  import {
+    BUILTIN_EMOTICONS,
+    formatBytes,
+    messageParts as splitMessage,
+    parseExtensions,
+    prependOlderMessages,
+    type Emoticon,
+    type MessagePart as MessagePartOf,
+  } from './lib/messages'
+  import { version as packageVersion } from '../package.json'
   import { invoke, isTauri } from '@tauri-apps/api/core'
   import { getVersion } from '@tauri-apps/api/app'
   import { listen, type UnlistenFn } from '@tauri-apps/api/event'
@@ -6,7 +16,6 @@
   import { getCurrentWindow, UserAttentionType } from '@tauri-apps/api/window'
   import { Image } from '@tauri-apps/api/image'
   import { PhysicalPosition } from '@tauri-apps/api/dpi'
-  import { open, save } from '@tauri-apps/plugin-dialog'
   import { scan, Format } from '@tauri-apps/plugin-barcode-scanner'
   import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
   import { relaunch } from '@tauri-apps/plugin-process'
@@ -108,7 +117,6 @@
     emoticons: ClientEmoticonSpan[]
     attachmentId?: string
     attachmentMime?: string
-    attachmentDataUrl?: string
     senderPeerId?: string
     eventId?: string
     deleted?: boolean
@@ -149,6 +157,7 @@
     emoticons: ClientEmoticonSpan[]
     attachmentId?: string
     attachmentMime?: string
+    eventId?: string
   }
 
   type ClientEvent =
@@ -166,6 +175,8 @@
     | { type: 'deviceLink'; link: string; qrLink: string; expiresAtMs: number }
     | { type: 'devicesUpdated'; devices: LinkedDevice[] }
     | { type: 'deviceSynchronized'; peerId: string; applied: number; paired: boolean }
+    | { type: 'accountRotationRequested'; requestId: number; fromPeerId: string; fromName: string; revoked: string[] }
+    | { type: 'deviceRevoked'; peerId: string }
     | { type: 'attachmentReceived'; peerId: string; id: string; filename: string; mime: string }
     | { type: 'groupAttachmentReceived'; groupId: string; id: string; filename: string; mime: string }
     | { type: 'attachmentSent'; peerId: string; filename: string }
@@ -173,13 +184,16 @@
     | { type: 'attachmentTransfersCancelled' }
     | { type: 'attachmentFailed'; filename: string; reason: string }
     | ({ type: 'incomingAttachmentOffered' } & IncomingAttachmentOffer)
-    | { type: 'contactRemoved'; peerId: string }
+    | { type: 'incomingAttachmentCancelled'; peerId: string; attachmentId: string; offerId?: number }
+    | { type: 'contactRemoved'; peerId: string; reason: 'deleted' | 'rejected' | 'merged' | 'withdrawn' }
     | { type: 'conversationCleared'; peerId: string }
     | { type: 'groupChatsUpdated'; groups: Omit<GroupChat, 'unread'>[] }
     | { type: 'groupConversationLoaded'; groupId: string; messages: ClientGroupMessage[] }
+    | { type: 'olderMessagesLoaded'; peerId: string; messages: ClientMessage[]; hasMore: boolean }
+    | { type: 'olderGroupMessagesLoaded'; groupId: string; messages: ClientGroupMessage[]; hasMore: boolean }
     | { type: 'groupMessage'; message: ClientGroupMessage }
     | { type: 'groupConversationCleared'; groupId: string }
-    | { type: 'attachmentOpened'; id: string; dataUrl: string }
+    | { type: 'attachmentOpened'; id: string; dataUrl: string; thumbnail: boolean }
     | { type: 'attachmentExported'; path: string }
     | { type: 'error'; message: string }
     | { type: 'messageFailed'; peerId: string; eventId: string; reason: string }
@@ -189,8 +203,7 @@
   type Theme = 'light' | 'dark' | 'system'
   type SettingsSection = 'profile' | 'appearance' | 'devices' | 'data' | 'updates' | 'network'
   type UpdateStatus = 'idle' | 'checking' | 'available' | 'downloading' | 'installing' | 'current' | 'error'
-  type Emoticon = { glyph: string; shortcut: string; label: string }
-  type MessagePart = { text: string; emoticon?: Emoticon; custom?: ClientEmoticon }
+  type MessagePart = MessagePartOf<ClientEmoticon>
   type Profile = {
     name: string
     avatarDataUrl: string | null
@@ -205,27 +218,7 @@
   /** Limite del protocollo per un messaggio di testo (crates/protocol MAX_TEXT_BYTES). */
   const MAX_TEXT_BYTES = 16_384
 
-  const emoticons: Emoticon[] = [
-    { glyph: '🙂', shortcut: ':)', label: 'Sorriso' },
-    { glyph: '😄', shortcut: ':D', label: 'Risata' },
-    { glyph: '😉', shortcut: ';)', label: 'Occhiolino' },
-    { glyph: '😛', shortcut: ':P', label: 'Linguaccia' },
-    { glyph: '😢', shortcut: ':(', label: 'Triste' },
-    { glyph: '😮', shortcut: ':o', label: 'Sorpresa' },
-    { glyph: '❤️', shortcut: '<3', label: 'Cuore' },
-    { glyph: '😎', shortcut: '8)', label: 'Forte' },
-    { glyph: '😐', shortcut: ':|', label: 'Neutro' },
-    { glyph: '😳', shortcut: ':$', label: 'Imbarazzato' },
-    { glyph: '😘', shortcut: ':*', label: 'Bacio' },
-    { glyph: '😠', shortcut: ':@', label: 'Arrabbiato' },
-    { glyph: '😇', shortcut: 'O:)', label: 'Angelo' },
-    { glyph: '😈', shortcut: '}:)', label: 'Diavoletto' },
-    { glyph: '😴', shortcut: '|-)', label: 'Assonnato' },
-    { glyph: '👍', shortcut: '(y)', label: 'Pollice su' },
-    { glyph: '👎', shortcut: '(n)', label: 'Pollice giù' },
-    { glyph: '🌹', shortcut: '@}-', label: 'Rosa' },
-    { glyph: '🎉', shortcut: '\\o/', label: 'Festa' },
-  ]
+  const emoticons = BUILTIN_EMOTICONS
 
   const appWindow = isTauri() ? getCurrentWindow() : null
   const isMobile = typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
@@ -281,9 +274,6 @@
     ? ''
     : (localStorage.getItem(autoAcceptExtKey) || '')
   let autoAcceptAll = typeof localStorage !== 'undefined' && localStorage.getItem(autoAcceptAllKey) === '1'
-  function parseExtensions(value: string): string[] {
-    return value.split(/[\s,]+/).map((ext) => ext.trim().replace(/^\./, '').toLowerCase()).filter(Boolean)
-  }
   async function applyAutoAccept() {
     if (!isTauri()) return
     const extensions = autoAcceptAll ? ['*'] : parseExtensions(autoAcceptExtensions)
@@ -399,8 +389,10 @@
   let contextY = 0
   let fileDropActive = false
   let mediaPreview = ''
-  let pendingSentPreviews: Record<string, string[]> = {}
-  const automaticPreviewIds = new Set<string>()
+  // Anteprime ridotte per id allegato: una sola copia anche se lo stesso file
+  // compare in più messaggi, e solo le più recenti restano in memoria.
+  const MAX_INLINE_PREVIEWS = 60
+  let attachmentPreviews: Record<string, string> = {}
   let rosterOpen = false
   let linkRequested = false
   let toastText = ''
@@ -420,7 +412,7 @@
   let notificationMutes = loadNotificationMutes()
   let overlayIcon: Image | undefined
   let taskbarUpdate = 0
-  let appVersion = '0.2.0'
+  let appVersion = packageVersion
   let updateCandidate: Update | null = null
   let updateStatus: UpdateStatus = 'idle'
   let updateMessage = ''
@@ -435,6 +427,11 @@
   $: activeGroup = chatGroups.find((group) => group.id === selectedGroupId)
   $: conversationKey = selectedGroupId ? `group:${selectedGroupId}` : selectedPeerId
   $: messages = conversationKey ? conversations[conversationKey] || [] : []
+  // Il nodo manda gli ultimi HISTORY_PAGE messaggi per chat; i precedenti
+  // arrivano a pagine quando l'utente li chiede.
+  const HISTORY_PAGE = 100
+  let olderAvailable: Record<string, boolean> = {}
+  let loadingOlder = ''
   $: visibleContacts = contacts.filter((contact) =>
     contact.name.toLocaleLowerCase().includes(searchQuery.trim().toLocaleLowerCase())
   )
@@ -825,7 +822,16 @@
         ...conversations,
         [event.peerId]: event.messages.map(toChatMessage),
       }
+      olderAvailable = { ...olderAvailable, [event.peerId]: event.messages.length >= HISTORY_PAGE }
       scrollMessages()
+      return
+    }
+    if (event.type === 'olderMessagesLoaded') {
+      prependOlder(event.peerId, event.messages.map(toChatMessage), event.hasMore)
+      return
+    }
+    if (event.type === 'olderGroupMessagesLoaded') {
+      prependOlder(`group:${event.groupId}`, event.messages.map(toGroupChatMessage), event.hasMore)
       return
     }
     if (event.type === 'message') {
@@ -876,6 +882,20 @@
       linkedDevices = event.devices
       return
     }
+    if (event.type === 'accountRotationRequested') {
+      // Chi rifiuta tratta come compromesso il dispositivo che ha chiesto la revoca.
+      const accept = confirm($t('devices.rotation.prompt', {
+        from: event.fromName,
+        revoked: event.revoked.join(', '),
+      }))
+      void invoke('node_answer_account_rotation', { requestId: event.requestId, accept })
+        .catch((error) => showToast(String(error)))
+      return
+    }
+    if (event.type === 'deviceRevoked') {
+      showToast($t('toast.deviceRevoked'))
+      return
+    }
     if (event.type === 'deviceSynchronized') {
       devicePairingBusy = false
       if (event.paired) {
@@ -888,19 +908,13 @@
     }
     if (event.type === 'attachmentReceived') {
       const conversation = [...(conversations[event.peerId] || [])]
-      const index = conversation.findLastIndex((message) => !message.mine && message.kind === 'file' && message.body === event.filename)
+      const index = receivedFileIndex(conversation, event.id, event.filename)
       if (index >= 0) conversation[index] = {
         ...conversation[index], attachmentId: event.id, attachmentMime: event.mime,
       }
       conversations = { ...conversations, [event.peerId]: conversation }
       showToast($t('toast.fileReceived', { filename: event.filename }))
-      if (previewReceivedImages && event.mime.startsWith('image/')) {
-        automaticPreviewIds.add(event.id)
-        void invoke('node_read_attachment', { id: event.id, mime: event.mime }).catch((error) => {
-          automaticPreviewIds.delete(event.id)
-          showToast(String(error))
-        })
-      }
+      if (previewReceivedImages) requestInlinePreview(event.id, event.mime)
       return
     }
     if (event.type === 'attachmentSent') {
@@ -934,6 +948,14 @@
       showToast($t('toast.sendCancelled'))
       return
     }
+    if (event.type === 'incomingAttachmentCancelled') {
+      if (event.offerId != null) {
+        incomingAttachmentOffers = incomingAttachmentOffers.filter((offer) => offer.offerId !== event.offerId)
+      }
+      const name = contacts.find((item) => item.peerId === event.peerId)?.name || $t('toast.aContact')
+      showToast($t('toast.incomingCancelled', { name }))
+      return
+    }
     if (event.type === 'incomingAttachmentOffered') {
       incomingAttachmentOffers = [...incomingAttachmentOffers, event]
       return
@@ -958,7 +980,10 @@
       conversations = remaining
       if (selectedPeerId === event.peerId) selectedPeerId = contacts[0]?.peerId || ''
       detailsOpen = false
-      showToast($t('toast.contactDeleted'))
+      // Una fusione di duplicati o una richiesta ritirata non sono
+      // cancellazioni: niente toast "contatto eliminato".
+      if (event.reason === 'deleted') showToast($t('toast.contactDeleted'))
+      else if (event.reason === 'rejected') showToast($t('toast.requestRejected'))
       return
     }
     if (event.type === 'groupChatsUpdated') {
@@ -976,6 +1001,7 @@
         ...conversations,
         [`group:${event.groupId}`]: event.messages.map(toGroupChatMessage),
       }
+      olderAvailable = { ...olderAvailable, [`group:${event.groupId}`]: event.messages.length >= HISTORY_PAGE }
       if (pendingGroupCreation) {
         pendingGroupCreation = false
         groupCreateOpen = false
@@ -988,8 +1014,8 @@
     if (event.type === 'groupMessage') {
       const key = `group:${event.message.groupId}`
       const next = toGroupChatMessage(event.message)
-      if (event.message.direction === 'out' && event.message.kind === 'file') {
-        consumeSentPreview(next, key, event.message.body)
+      if (event.message.direction === 'out' && event.message.kind === 'file' && previewSentImages && event.message.attachmentId) {
+        requestInlinePreview(event.message.attachmentId, event.message.attachmentMime)
       }
       conversations = {
         ...conversations,
@@ -1010,19 +1036,13 @@
     if (event.type === 'groupAttachmentReceived') {
       const key = `group:${event.groupId}`
       const conversation = [...(conversations[key] || [])]
-      const index = conversation.findLastIndex((message) => !message.mine && message.kind === 'file' && message.body === event.filename)
+      const index = receivedFileIndex(conversation, event.id, event.filename)
       if (index >= 0) conversation[index] = {
         ...conversation[index], attachmentId: event.id, attachmentMime: event.mime,
       }
       conversations = { ...conversations, [key]: conversation }
       showToast($t('toast.fileReceivedGroup', { filename: event.filename }))
-      if (previewReceivedImages && event.mime.startsWith('image/')) {
-        automaticPreviewIds.add(event.id)
-        void invoke('node_read_attachment', { id: event.id, mime: event.mime }).catch((error) => {
-          automaticPreviewIds.delete(event.id)
-          showToast(String(error))
-        })
-      }
+      if (previewReceivedImages) requestInlinePreview(event.id, event.mime)
       return
     }
     if (event.type === 'groupConversationCleared') {
@@ -1031,15 +1051,7 @@
       return
     }
     if (event.type === 'attachmentOpened') {
-      for (const [id, conversation] of Object.entries(conversations)) {
-        conversations = {
-          ...conversations,
-          [id]: conversation.map((message) => message.attachmentId === event.id
-            ? { ...message, attachmentDataUrl: event.dataUrl }
-            : message),
-        }
-      }
-      if (automaticPreviewIds.has(event.id)) automaticPreviewIds.delete(event.id)
+      if (event.thumbnail) storeInlinePreview(event.id, event.dataUrl)
       else mediaPreview = event.dataUrl
       return
     }
@@ -1107,7 +1119,8 @@
 
   function toGroupChatMessage(message: ClientGroupMessage): ChatMessage {
     return {
-      id: `${message.timestampMs}-${crypto.randomUUID()}`,
+      id: message.eventId || `${message.timestampMs}-${crypto.randomUUID()}`,
+      eventId: message.eventId,
       kind: message.kind === 'file' ? 'file' : message.direction === 'out' ? 'outgoing' : 'incoming',
       body: message.body,
       emoticons: message.emoticons || [],
@@ -1133,8 +1146,8 @@
   function addMessage(message: ClientMessage) {
     const conversation = conversations[message.peerId] || []
     const next = toChatMessage(message)
-    if (message.direction === 'out' && message.kind === 'file') {
-      consumeSentPreview(next, message.peerId, message.body)
+    if (message.direction === 'out' && message.kind === 'file' && previewSentImages && message.attachmentId) {
+      requestInlinePreview(message.attachmentId, message.attachmentMime)
     }
     conversations = {
       ...conversations,
@@ -1160,12 +1173,26 @@
     scrollMessages()
   }
 
-  function consumeSentPreview(message: ChatMessage, conversation: string, filename: string) {
-    const key = `${conversation}\u0000${filename}`
-    const previews = pendingSentPreviews[key]
-    if (!previews?.length) return
-    message.attachmentDataUrl = previews.shift()
-    if (!previews.length) delete pendingSentPreviews[key]
+  // Il messaggio di un file ricevuto: per id allegato, così due file con lo
+  // stesso nome non si scambiano. Per nome solo con la cronologia vecchia,
+  // che non ha l'id.
+  function receivedFileIndex(conversation: ChatMessage[], id: string, filename: string) {
+    const byId = conversation.findLastIndex((message) => message.kind === 'file' && message.attachmentId === id)
+    if (byId >= 0) return byId
+    return conversation.findLastIndex((message) => !message.mine && message.kind === 'file' && !message.attachmentId && message.body === filename)
+  }
+
+  function requestInlinePreview(id: string, mime?: string) {
+    if (!mime?.startsWith('image/') || attachmentPreviews[id]) return
+    void invoke('node_read_attachment', { id, mime, thumbnail: true }).catch((error) => showToast(String(error)))
+  }
+
+  function storeInlinePreview(id: string, dataUrl: string) {
+    const { [id]: _previous, ...rest } = attachmentPreviews
+    const entries = Object.entries(rest)
+    // Le chiavi restano in ordine di inserimento: la più vecchia esce per prima.
+    const kept = entries.slice(Math.max(0, entries.length - MAX_INLINE_PREVIEWS + 1))
+    attachmentPreviews = { ...Object.fromEntries(kept), [id]: dataUrl }
   }
 
   async function focusComposer() {
@@ -1232,6 +1259,11 @@
     return $t('ban.until', { date: new Date(ban.expiresAtMs).toLocaleString() })
   }
 
+  async function revokeDevice(device: LinkedDevice) {
+    if (!confirm($t('settings.devices.revokeConfirm', { name: device.name }))) return
+    await invoke('node_revoke_device', { peerId: device.peerId }).catch((error) => showToast(String(error)))
+  }
+
   function deviceStatus(device: LinkedDevice) {
     if (device.online) return $t('device.syncing')
     if (!device.lastSeenMs) return $t('device.neverLinked')
@@ -1268,45 +1300,8 @@
     return contact.secure ? $t('subtitle.protected') : contact.online ? $t('subtitle.connecting') : $t('subtitle.offline')
   }
 
-  function builtinMessageParts(text: string): MessagePart[] {
-    const escaped = emoticons
-      .map((item) => item.shortcut.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-      .join('|')
-    const matcher = new RegExp(`(${escaped})`, 'g')
-    return text.split(matcher).filter(Boolean).map((part) => ({
-      text: part,
-      emoticon: emoticons.find((item) => item.shortcut === part),
-    }))
-  }
-
-  function textIndexAtByteOffset(text: string, offset: number) {
-    let bytes = 0
-    let index = 0
-    for (const character of text) {
-      if (bytes >= offset) break
-      bytes += new TextEncoder().encode(character).length
-      index += character.length
-    }
-    return index
-  }
-
   function messageParts(message: ChatMessage, availableEmoticons: ClientEmoticon[]): MessagePart[] {
-    if (!message.emoticons.length) return builtinMessageParts(message.body)
-    const parts: MessagePart[] = []
-    let cursor = 0
-    for (const span of [...message.emoticons].sort((a, b) => a.start - b.start)) {
-      const start = textIndexAtByteOffset(message.body, span.start)
-      const end = textIndexAtByteOffset(message.body, span.end)
-      if (start < cursor || end <= start) continue
-      parts.push(...builtinMessageParts(message.body.slice(cursor, start)))
-      const custom = availableEmoticons.find((item) => item.assetId === span.assetId)
-      parts.push(custom
-        ? { text: message.body.slice(start, end), custom }
-        : { text: message.body.slice(start, end) })
-      cursor = end
-    }
-    parts.push(...builtinMessageParts(message.body.slice(cursor)))
-    return parts
+    return splitMessage(message.body, message.emoticons, availableEmoticons)
   }
 
   function draftText(node: Node): string {
@@ -1403,6 +1398,42 @@
     syncDraft()
   }
 
+  async function loadOlderMessages() {
+    const key = conversationKey
+    const before = messages.find((message) => message.eventId)?.eventId
+    if (!key || !before || loadingOlder) {
+      olderAvailable = { ...olderAvailable, [key]: false }
+      return
+    }
+    loadingOlder = key
+    try {
+      if (key.startsWith('group:')) {
+        await invoke('node_load_older_group_messages', { groupId: key.slice('group:'.length), beforeEventId: before })
+      } else {
+        await invoke('node_load_older_messages', { peerId: key, beforeEventId: before })
+      }
+    } catch (error) {
+      loadingOlder = ''
+      showToast(String(error))
+    }
+  }
+
+  function prependOlder(key: string, older: ChatMessage[], hasMore: boolean) {
+    const previousHeight = messageList?.scrollHeight ?? 0
+    conversations = {
+      ...conversations,
+      [key]: prependOlderMessages(conversations[key] || [], older),
+    }
+    olderAvailable = { ...olderAvailable, [key]: hasMore }
+    if (loadingOlder === key) loadingOlder = ''
+    // Resta sullo stesso messaggio invece di saltare in cima.
+    if (key === conversationKey) {
+      void tick().then(() => {
+        if (messageList) messageList.scrollTop += messageList.scrollHeight - previousHeight
+      })
+    }
+  }
+
   function scrollMessages() {
     void tick().then(() =>
       messageList?.scrollTo({ top: messageList.scrollHeight, behavior: 'smooth' })
@@ -1478,15 +1509,27 @@
     }
   }
 
+  type DialogFilter = { name: string, extensions: string[] }
+
+  // I dialog passano dal backend, che accetta solo i percorsi scelti qui o trascinati.
+  async function pickFile(filters: DialogFilter[] = []) {
+    const [path] = await invoke<string[]>('dialog_open', { multiple: false, filters })
+    return path ?? null
+  }
+
+  async function pickSavePath(defaultPath: string, filters: DialogFilter[] = []) {
+    return invoke<string | null>('dialog_save', { defaultPath, filters })
+  }
+
   async function chooseFile() {
     if (!canSend || (!selectedPeerId && !selectedGroupId)) return
-    const selected = await open({ multiple: false, directory: false })
-    if (!selected || Array.isArray(selected)) return
+    const selected = await pickFile()
+    if (!selected) return
     await sendFiles([selected])
   }
 
   async function cancelFileTransfers() {
-    await invoke('node_cancel_file_transfers').catch((error) => showToast(String(error)))
+    await invoke('node_cancel_file_transfers', { conversation: conversationKey || null }).catch((error) => showToast(String(error)))
   }
 
   async function answerAttachmentOffer(offer: IncomingAttachmentOffer, accept: boolean) {
@@ -1500,33 +1543,15 @@
     }
   }
 
-  function formatBytes(bytes: number) {
-    if (bytes < 1024) return `${bytes} B`
-    if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`
-    if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`
-    return `${(bytes / 1024 ** 3).toFixed(2)} GB`
-  }
-
   async function sendFiles(paths: string[]) {
     if (!canSend || (!selectedPeerId && !selectedGroupId) || !paths.length) return
     const targetPeer = selectedPeerId
     const targetGroup = selectedGroupId
-    const targetConversation = targetGroup ? `group:${targetGroup}` : targetPeer
     const targetCount = targetGroup ? Math.max(1, groupOnline) : 1
     pendingFileCount += paths.length * targetCount
     fileSending = true
     for (const path of paths) {
       try {
-        const filename = path.split(/[\\/]/).at(-1) || path
-        if (previewSentImages && isImagePath(path)) {
-          try {
-            const preview = await invoke<string>('image_preview', { path })
-            const key = `${targetConversation}\u0000${filename}`
-            pendingSentPreviews[key] = [...(pendingSentPreviews[key] || []), preview]
-          } catch {
-            // L'anteprima è facoltativa: il file può comunque essere inviato.
-          }
-        }
         if (targetGroup) await invoke('node_send_group_file', { groupId: targetGroup, path })
         else await invoke('node_send_file', { peerId: targetPeer, path })
       } catch (error) {
@@ -1537,9 +1562,6 @@
     }
   }
 
-  function isImagePath(path: string) {
-    return /\.(avif|bmp|gif|jpe?g|png|webp)$/i.test(path)
-  }
 
   function showContactMenu(event: MouseEvent, contact: Contact) {
     event.preventDefault()
@@ -1614,23 +1636,19 @@
     }
     if (message.attachmentMime.startsWith('image/') || message.attachmentMime.startsWith('video/')) {
       await invoke('node_read_attachment', {
-        id: message.attachmentId, mime: message.attachmentMime,
+        id: message.attachmentId, mime: message.attachmentMime, thumbnail: false,
       }).catch((error) => showToast(String(error)))
       return
     }
-    const path = await save({ defaultPath: message.body })
+    const path = await pickSavePath(message.body)
     if (path) await invoke('node_export_attachment', {
       id: message.attachmentId, path,
     }).catch((error) => showToast(String(error)))
   }
 
   async function chooseEmoticonFile() {
-    const selected = await open({
-      multiple: false,
-      directory: false,
-      filters: [{ name: 'Emoticon', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'] }],
-    })
-    if (!selected || Array.isArray(selected)) return
+    const selected = await pickFile([{ name: 'Emoticon', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'] }])
+    if (!selected) return
     emoticonPath = selected
     emoticonTrigger = ''
     emoticonCreateOpen = true
@@ -1714,12 +1732,8 @@
   }
 
   async function chooseAvatar() {
-    const selected = await open({
-      multiple: false,
-      directory: false,
-      filters: [{ name: 'Profile image', extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
-    })
-    if (selected && !Array.isArray(selected)) await saveProfile(selected, false, false)
+    const selected = await pickFile([{ name: 'Profile image', extensions: ['png', 'jpg', 'jpeg', 'webp'] }])
+    if (selected) await saveProfile(selected, false, false)
   }
 
   async function renameContact() {
@@ -1756,12 +1770,8 @@
   }
 
   async function scanContactQr() {
-    const selected = await open({
-      multiple: false,
-      directory: false,
-      filters: [{ name: 'QR images', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] }],
-    })
-    if (!selected || Array.isArray(selected)) return
+    const selected = await pickFile([{ name: 'QR images', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] }])
+    if (!selected) return
     try {
       contactLink = await invoke<string>('scan_contact_qr', { path: selected })
       await importContact()
@@ -1794,10 +1804,7 @@
 
   async function saveContactQr() {
     if (!ownContactQr) return
-    const path = await save({
-      defaultPath: 'msnnext-contact.png',
-      filters: [{ name: 'PNG image', extensions: ['png'] }],
-    })
+    const path = await pickSavePath('msnnext-contact.png', [{ name: 'PNG image', extensions: ['png'] }])
     if (!path) return
     await invoke('save_contact_qr', { path, dataUrl: ownContactQr })
       .then(() => showToast($t('toast.qrSaved')))
@@ -1874,12 +1881,8 @@
   }
 
   async function scanDevicePairingQr() {
-    const selected = await open({
-      multiple: false,
-      directory: false,
-      filters: [{ name: 'QR images', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] }],
-    })
-    if (!selected || Array.isArray(selected)) return
+    const selected = await pickFile([{ name: 'QR images', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] }])
+    if (!selected) return
     try {
       devicePairingLink = await invoke<string>('scan_contact_qr', { path: selected })
       await importDevicePairing()
@@ -1896,10 +1899,7 @@
 
   async function saveDevicePairingQr() {
     if (!devicePairingQr) return
-    const path = await save({
-      defaultPath: 'msnnext-device.png',
-      filters: [{ name: 'PNG image', extensions: ['png'] }],
-    })
+    const path = await pickSavePath('msnnext-device.png', [{ name: 'PNG image', extensions: ['png'] }])
     if (!path) return
     await invoke('save_contact_qr', { path, dataUrl: devicePairingQr })
       .then(() => showToast($t('toast.deviceQrSaved')))
@@ -1911,10 +1911,7 @@
       showToast($t('toast.goOfflineBackup'))
       return
     }
-    const path = await save({
-      defaultPath: 'msnnext-account.msnnext-account',
-      filters: [{ name: 'msnnext account backup', extensions: ['msnnext-account'] }],
-    })
+    const path = await pickSavePath('msnnext-account.msnnext-account', [{ name: 'msnnext account backup', extensions: ['msnnext-account'] }])
     if (!path) return
     accountBackupMode = 'export'
     accountBackupPath = path
@@ -1927,12 +1924,8 @@
       showToast($t('toast.goOfflineRestore'))
       return
     }
-    const path = await open({
-      multiple: false,
-      directory: false,
-      filters: [{ name: 'msnnext account backup', extensions: ['msnnext-account'] }],
-    })
-    if (!path || Array.isArray(path)) return
+    const path = await pickFile([{ name: 'msnnext account backup', extensions: ['msnnext-account'] }])
+    if (!path) return
     accountBackupMode = 'import'
     accountBackupPath = path
     accountBackupPassword = ''
@@ -2027,7 +2020,7 @@
     const next: Record<string, ChatMessage[]> = {}
     for (const [key, list] of Object.entries(conversations)) {
       next[key] = list.map((message) => message.eventId === eventId
-        ? { ...message, deleted: true, body: '', emoticons: [], attachmentId: undefined, attachmentDataUrl: undefined }
+        ? { ...message, deleted: true, body: '', emoticons: [], attachmentId: undefined }
         : message)
     }
     conversations = next
@@ -2269,7 +2262,11 @@
               <p>{activeGroup ? (ready ? $t('convEmpty.groupReady') : $t('convEmpty.groupWait')) : ready ? $t('convEmpty.ready') : $t('convEmpty.offline')}</p>
             </div>
           {:else}
-            <div class="session-start"><span>{$t('msg.sessionStart')}</span></div>
+            {#if olderAvailable[conversationKey]}
+              <button class="load-older" disabled={loadingOlder === conversationKey} onclick={loadOlderMessages}>{$t('msg.loadOlder')}</button>
+            {:else}
+              <div class="session-start"><span>{$t('msg.sessionStart')}</span></div>
+            {/if}
             {#each messages as message, index (message.id)}
               {#if message.kind === 'nudge'}
                 <div class="nudge-message">
@@ -2291,8 +2288,8 @@
                     <p class="deleted-message"><Trash2 size={13} /> {message.mine ? $t('msg.deletedByYou') : $t('msg.deletedMessage')}</p>
                   {:else if message.kind === 'file'}
                     <button class="file-line" disabled={!message.attachmentId} onclick={() => openAttachment(message)}>
-                      {#if message.attachmentDataUrl}
-                        <img src={message.attachmentDataUrl} alt={message.body} />
+                      {#if message.attachmentId && attachmentPreviews[message.attachmentId]}
+                        <img src={attachmentPreviews[message.attachmentId]} alt={message.body} />
                       {:else}<Paperclip size={17} />{/if}
                       <span><b>{message.attachmentMime?.startsWith('image/') ? (message.mine ? $t('msg.imageSent') : $t('msg.imageReceived')) : (message.mine ? $t('msg.fileSent') : $t('msg.fileReceived'))}</b><small>{message.body}</small></span>
                       {#if message.attachmentId}<ExternalLink size={14} />{/if}
@@ -2561,7 +2558,7 @@
         <details>
           <summary>{$t('setup.advanced')}</summary>
           <label>{$t('setup.peerAddress')} <small>{$t('setup.optional')}</small><input bind:value={directAddress} placeholder="/ip4/…/udp/…/quic-v1/p2p/…" /></label>
-          <label>{$t('setup.customRelay')} <small>{$t('setup.optional')}</small><input bind:value={relayAddress} maxlength="512" placeholder={$t('setup.relayPlaceholder')} /></label>
+          <label>{$t('setup.customRelay')} <small>{$t('setup.optional')}</small><input bind:value={relayAddress} maxlength="1024" placeholder={$t('setup.relayPlaceholder')} /></label>
         </details>
         <button class="primary-button wide" disabled={starting || !displayName.trim()} onclick={() => startNode()}>
           {starting ? $t('setup.connecting') : $t('setup.goOnline')}
@@ -2744,6 +2741,7 @@
                     <div class="linked-device-row settings-row">
                       <span class:online={device.online} class="device-status-dot"></span>
                       <span><strong>{device.name}</strong><small>{deviceStatus(device)}</small></span>
+                      <button class="danger-button" disabled={!running} onclick={() => revokeDevice(device)}>{$t('settings.devices.revoke')}</button>
                     </div>
                   {/each}
                 </div>
@@ -2825,7 +2823,7 @@
                 <h3 id="network-panel-title">{$t('settings.network.title')}</h3>
                 <p>{$t('settings.network.body')}</p>
               </header>
-              <label class="settings-field">{$t('settings.network.relay')}<input bind:value={relayAddress} maxlength="512" placeholder={$t('settings.network.relayPlaceholder')} /><small>{$t('settings.network.relayHint')}</small></label>
+              <label class="settings-field">{$t('settings.network.relay')}<input bind:value={relayAddress} maxlength="1024" placeholder={$t('settings.network.relayPlaceholder')} /><small>{$t('settings.network.relayHint')}</small></label>
               <button class="security-settings-row" onclick={() => securityIntroOpen = true}><ShieldCheck size={19} /><span><strong>{$t('settings.network.security.title')}</strong><small>{$t('settings.network.security.desc')}</small></span><ExternalLink size={15} /></button>
             </section>
           {/if}
