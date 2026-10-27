@@ -7,6 +7,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fs, path::Path};
 
+/// `(peer, direction, timestamp_ms)` di un evento in cronologia.
+pub type EventMeta = (String, String, u64);
+
 pub struct History {
     connection: Connection,
     cipher: XChaCha20Poly1305,
@@ -254,7 +257,7 @@ impl History {
     pub fn event_meta(
         &self,
         event_id: &str,
-    ) -> Result<Option<(String, String, u64)>, Box<dyn Error>> {
+    ) -> Result<Option<EventMeta>, Box<dyn Error>> {
         Ok(self
             .connection
             .query_row(

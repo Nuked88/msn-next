@@ -786,7 +786,7 @@ pub async fn run(
     let mut inbound_offer_counter = 0_u64;
     let mut peer_names = HashMap::<PeerId, String>::new();
     let mut nudge_counter = 0_u64;
-    let mut stdin_open = true;
+    let mut stdin_open = args.read_stdin;
     let mut commands_open = true;
     let mut contact_link_requested = false;
     let mut device_link_requested = false;
@@ -3729,7 +3729,8 @@ fn connect_contact(
     for address in addresses {
         // Il loopback di un peer remoto non è mai raggiungibile: scartarlo evita
         // di sprecare lo slot di dial (cicli "Rifiuto persistente" su 127.0.0.1).
-        if is_loopback_multiaddr(&address) {
+        // Nei test end-to-end i due nodi girano davvero sullo stesso host.
+        if !cfg!(test) && is_loopback_multiaddr(&address) {
             continue;
         }
         match split_peer_address(&address) {
@@ -3953,6 +3954,7 @@ fn send_event(
     Some(request_id)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_next_transfer_chunk(
     swarm: &mut Swarm<Behaviour>,
     sessions: &mut HashMap<PeerId, RatchetSession>,
@@ -4002,6 +4004,7 @@ fn validate_missing_chunks(
     Ok(indices.into())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_current_transfer_chunk(
     swarm: &mut Swarm<Behaviour>,
     sessions: &mut HashMap<PeerId, RatchetSession>,
@@ -5453,6 +5456,9 @@ pub struct ClientConfig {
     downloads: PathBuf,
     history: PathBuf,
     notifications: bool,
+    /// Legge comandi da stdin (solo CLI). L'app desktop e i test non lo usano:
+    /// una lettura bloccata su stdin impedisce lo spegnimento del runtime.
+    read_stdin: bool,
     name: String,
 }
 
@@ -5511,6 +5517,7 @@ impl ClientConfig {
             downloads: data_dir.join("downloads"),
             history: data_dir.join("history.db"),
             notifications: true,
+            read_stdin: false,
             name,
         })
     }
@@ -5579,6 +5586,7 @@ impl ClientConfig {
             downloads,
             history,
             notifications,
+            read_stdin: true,
             name,
         })
     }
@@ -6211,14 +6219,150 @@ mod tests {
         assert_eq!(*swarm.local_peer_id(), expected_peer);
     }
 
+    /// Nodo di test su loopback: niente relay né bootstrap pubblici, così i
+    /// test end-to-end non dipendono dalla rete esterna.
+    fn loopback_config(name: &str, dir: &Path, listen: Option<Multiaddr>) -> ClientConfig {
+        let mut config = ClientConfig::desktop(name.into(), dir.to_path_buf(), None, None).unwrap();
+        config.listen = listen.unwrap_or_else(|| "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap());
+        config.listen_tcp = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+        config.relays.clear();
+        config.bootstrap.clear();
+        config.notifications = false;
+        config
+    }
+
+    struct TestNode {
+        commands: mpsc::UnboundedSender<ClientCommand>,
+        events: mpsc::UnboundedReceiver<ClientEvent>,
+        task: tokio::task::JoinHandle<Result<(), String>>,
+        peer: PeerId,
+    }
+
+    impl TestNode {
+        /// Va chiamato dentro un `LocalSet`: `run` non è `Send`.
+        async fn start(config: ClientConfig) -> Self {
+            Self::try_start(config).await.expect("il nodo non è partito")
+        }
+
+        async fn try_start(config: ClientConfig) -> Result<Self, String> {
+            let (commands, command_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut events) = mpsc::unbounded_channel();
+            let mut task = tokio::task::spawn_local(async move {
+                run(config, command_rx, event_tx)
+                    .await
+                    .map_err(|error| format!("{error:?}"))
+            });
+            let peer_id = loop {
+                match events.recv().await {
+                    Some(ClientEvent::Started { peer_id, .. }) => break peer_id,
+                    Some(_) => {}
+                    None => return Err(format!("{:?}", (&mut task).await)),
+                }
+            };
+            Ok(Self {
+                commands,
+                events,
+                task,
+                peer: peer_id.parse().unwrap(),
+            })
+        }
+
+        /// Riavvio sulla stessa porta: l'endpoint QUIC del nodo precedente può
+        /// liberare la porta UDP con qualche istante di ritardo.
+        async fn restart(make_config: impl Fn() -> ClientConfig) -> Self {
+            let mut last_error = String::new();
+            for _ in 0..40 {
+                match Self::try_start(make_config()).await {
+                    Ok(node) => return node,
+                    Err(error) => last_error = error,
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            panic!("il nodo non è ripartito: {last_error}");
+        }
+
+        fn send(&self, command: ClientCommand) {
+            self.commands.send(command).unwrap();
+        }
+
+        async fn until(&mut self, predicate: impl Fn(&ClientEvent) -> bool) -> ClientEvent {
+            receive_until(&mut self.events, predicate).await
+        }
+
+        async fn until_secure(&mut self) {
+            self.until(|event| {
+                matches!(
+                    event,
+                    ClientEvent::ContactUpdated {
+                        contact: ClientContact { secure: true, .. }
+                    }
+                )
+            })
+            .await;
+        }
+
+        async fn until_text(&mut self, text: &str) -> ClientMessage {
+            let ClientEvent::Message { message } = self
+                .until(|event| {
+                    matches!(
+                        event,
+                        ClientEvent::Message { message } if message.direction == "in" && message.body == text
+                    )
+                })
+                .await
+            else {
+                unreachable!()
+            };
+            message
+        }
+
+        async fn shutdown(self) {
+            self.commands.send(ClientCommand::Shutdown).ok();
+            tokio::time::timeout(Duration::from_secs(5), self.task)
+                .await
+                .expect("il nodo non si è arrestato")
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    /// Bob importa il link di Alice e aspetta che il canale cifrato sia pronto
+    /// da entrambe le parti.
+    async fn connect_pair(alice: &mut TestNode, bob: &mut TestNode) {
+        alice.send(ClientCommand::RequestContactLink);
+        let ClientEvent::ContactLink { link, .. } = alice
+            .until(|event| matches!(event, ClientEvent::ContactLink { .. }))
+            .await
+        else {
+            unreachable!()
+        };
+        bob.send(ClientCommand::ImportContactLink { link });
+        // Alice vede Bob come richiesta di contatto: finché non la accetta il
+        // canale cifrato non parte.
+        alice
+            .until(|event| matches!(event, ClientEvent::ContactRequest { .. }))
+            .await;
+        alice.send(ClientCommand::AcceptContactRequest { peer: bob.peer });
+        alice.until_secure().await;
+        bob.until_secure().await;
+    }
+
+    fn test_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "msnnext-{label}-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::remove_dir_all(&root).ok();
+        root
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    #[ignore = "usa socket reali e il teardown libp2p può bloccare l'harness Windows"]
+    #[cfg_attr(windows, ignore = "il teardown libp2p può bloccare l'harness Windows")]
     async fn two_clients_exchange_messages_and_reconnect_after_restart() {
-        let root =
-            std::env::temp_dir().join(format!("msnnext-pair-{}-{}", std::process::id(), now_ms()));
+        let root = test_root("pair");
         let alice_dir = root.join("alice");
         let bob_dir = root.join("bob");
-        fs::remove_dir_all(&root).ok();
         let alice_port = available_udp_port();
         let alice_listen: Multiaddr = format!("/ip4/127.0.0.1/udp/{alice_port}/quic-v1")
             .parse()
@@ -6227,94 +6371,22 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let mut alice_config =
-                    ClientConfig::desktop("Alice".into(), alice_dir.clone(), None, None).unwrap();
-                alice_config.listen = alice_listen.clone();
-                alice_config.notifications = false;
-                let (alice_commands, alice_command_rx) = mpsc::unbounded_channel();
-                let (alice_event_tx, mut alice_events) = mpsc::unbounded_channel();
-                let alice_task =
-                    tokio::task::spawn_local(run(alice_config, alice_command_rx, alice_event_tx));
-                receive_until(&mut alice_events, |event| {
-                    matches!(event, ClientEvent::Started { .. })
-                })
-                .await;
-                alice_commands
-                    .send(ClientCommand::RequestContactLink)
-                    .unwrap();
-                let ClientEvent::ContactLink { link, .. } =
-                    receive_until(&mut alice_events, |event| {
-                        matches!(event, ClientEvent::ContactLink { .. })
-                    })
-                    .await
-                else {
-                    unreachable!()
-                };
+                let mut alice =
+                    TestNode::start(loopback_config("Alice", &alice_dir, Some(alice_listen.clone())))
+                        .await;
+                let mut bob = TestNode::start(loopback_config("Bob", &bob_dir, None)).await;
+                connect_pair(&mut alice, &mut bob).await;
 
-                let mut bob_config =
-                    ClientConfig::desktop("Bob".into(), bob_dir.clone(), None, None).unwrap();
-                bob_config.notifications = false;
-                let (bob_commands, bob_command_rx) = mpsc::unbounded_channel();
-                let (bob_event_tx, mut bob_events) = mpsc::unbounded_channel();
-                let mut bob_task =
-                    tokio::task::spawn_local(run(bob_config, bob_command_rx, bob_event_tx));
-                let ClientEvent::Started {
-                    peer_id: bob_peer, ..
-                } = receive_until(&mut bob_events, |event| {
-                    matches!(event, ClientEvent::Started { .. })
-                })
-                .await
-                else {
-                    unreachable!()
-                };
-                bob_commands
-                    .send(ClientCommand::ImportContactLink { link })
-                    .unwrap();
+                bob.send(ClientCommand::SendText {
+                    peer: alice.peer,
+                    text: "prima".into(),
+                });
+                alice.until_text("prima").await;
 
-                let ClientEvent::ContactUpdated { contact } =
-                    receive_until(&mut bob_events, |event| {
-                        matches!(
-                            event,
-                            ClientEvent::ContactUpdated {
-                                contact: ClientContact { secure: true, .. }
-                            }
-                        )
-                    })
-                    .await
-                else {
-                    unreachable!()
-                };
-                let alice_peer: PeerId = contact.peer_id.parse().unwrap();
-                receive_until(&mut alice_events, |event| {
-                    matches!(
-                        event,
-                        ClientEvent::ContactUpdated {
-                            contact: ClientContact { secure: true, .. }
-                        }
-                    )
-                })
-                .await;
-
-                bob_commands
-                    .send(ClientCommand::SendText {
-                        peer: alice_peer,
-                        text: "prima".into(),
-                    })
-                    .unwrap();
-                receive_until(&mut alice_events, |event| {
-                    matches!(
-                        event,
-                        ClientEvent::Message {
-                            message: ClientMessage { body, .. }
-                        } if body == "prima"
-                    )
-                })
-                .await;
-
-                alice_commands.send(ClientCommand::Shutdown).unwrap();
-                alice_task.await.unwrap().unwrap();
+                let alice_peer = alice.peer;
+                alice.shutdown().await;
                 tokio::select! {
-                    _ = receive_until(&mut bob_events, |event| {
+                    _ = receive_until(&mut bob.events, |event| {
                         matches!(
                             event,
                             ClientEvent::ContactUpdated {
@@ -6322,73 +6394,27 @@ mod tests {
                             }
                         )
                     }) => {}
-                    result = &mut bob_task => {
+                    result = &mut bob.task => {
                         panic!("Bob terminato durante la disconnessione: {result:?}");
                     }
                 }
 
-                let mut restarted_config =
-                    ClientConfig::desktop("Alice".into(), alice_dir.clone(), None, None).unwrap();
-                restarted_config.listen = alice_listen;
-                restarted_config.notifications = false;
-                let (restarted_commands, restarted_command_rx) = mpsc::unbounded_channel();
-                let (restarted_event_tx, mut restarted_events) = mpsc::unbounded_channel();
-                let restarted_task = tokio::task::spawn_local(run(
-                    restarted_config,
-                    restarted_command_rx,
-                    restarted_event_tx,
-                ));
-                receive_until(&mut restarted_events, |event| {
-                    matches!(event, ClientEvent::Started { .. })
+                let mut alice = TestNode::restart(|| {
+                    loopback_config("Alice", &alice_dir, Some(alice_listen.clone()))
                 })
                 .await;
-                receive_until(&mut bob_events, |event| {
-                    matches!(
-                        event,
-                        ClientEvent::ContactUpdated {
-                            contact: ClientContact { secure: true, .. }
-                        }
-                    )
-                })
-                .await;
-                receive_until(&mut restarted_events, |event| {
-                    matches!(
-                        event,
-                        ClientEvent::ContactUpdated {
-                            contact: ClientContact { secure: true, .. }
-                        }
-                    )
-                })
-                .await;
+                assert_eq!(alice.peer, alice_peer);
+                bob.until_secure().await;
+                alice.until_secure().await;
 
-                restarted_commands
-                    .send(ClientCommand::SendText {
-                        peer: bob_peer.parse().unwrap(),
-                        text: "dopo il riavvio".into(),
-                    })
-                    .unwrap();
-                receive_until(&mut bob_events, |event| {
-                    matches!(
-                        event,
-                        ClientEvent::Message {
-                            message: ClientMessage { body, .. }
-                        } if body == "dopo il riavvio"
-                    )
-                })
-                .await;
+                alice.send(ClientCommand::SendText {
+                    peer: bob.peer,
+                    text: "dopo il riavvio".into(),
+                });
+                bob.until_text("dopo il riavvio").await;
 
-                restarted_commands.send(ClientCommand::Shutdown).unwrap();
-                tokio::time::timeout(Duration::from_secs(5), restarted_task)
-                    .await
-                    .expect("Alice non si è arrestata")
-                    .unwrap()
-                    .unwrap();
-                bob_commands.send(ClientCommand::Shutdown).unwrap();
-                tokio::time::timeout(Duration::from_secs(5), bob_task)
-                    .await
-                    .expect("Bob non si è arrestato")
-                    .unwrap()
-                    .unwrap();
+                alice.shutdown().await;
+                bob.shutdown().await;
             })
             .await;
         fs::remove_dir_all(root).ok();
