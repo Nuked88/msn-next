@@ -1540,6 +1540,28 @@ button:disabled {
   background: var(--line-soft);
 }
 
+.load-older {
+  display: block;
+  margin: 0 auto 19px;
+  padding: 6px 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--faint);
+  font: inherit;
+  font-size: 0.72rem;
+  cursor: pointer;
+}
+
+.load-older:hover:not(:disabled) {
+  color: inherit;
+}
+
+.load-older:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
+
 .message-line {
   position: relative;
   max-width: 780px;
@@ -1583,6 +1605,15 @@ button:disabled {
   color: #1982b8;
   font-size: 0.625rem;
   font-weight: 750;
+}
+
+.failed-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: #c0392b;
+  font-size: 0.85em;
+  cursor: help;
 }
 
 .relayed-badge {
