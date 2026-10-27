@@ -6,7 +6,6 @@
   import { getCurrentWindow, UserAttentionType } from '@tauri-apps/api/window'
   import { Image } from '@tauri-apps/api/image'
   import { PhysicalPosition } from '@tauri-apps/api/dpi'
-  import { open, save } from '@tauri-apps/plugin-dialog'
   import { scan, Format } from '@tauri-apps/plugin-barcode-scanner'
   import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
   import { relaunch } from '@tauri-apps/plugin-process'
@@ -1542,10 +1541,22 @@
     }
   }
 
+  type DialogFilter = { name: string, extensions: string[] }
+
+  // I dialog passano dal backend, che accetta solo i percorsi scelti qui o trascinati.
+  async function pickFile(filters: DialogFilter[] = []) {
+    const [path] = await invoke<string[]>('dialog_open', { multiple: false, filters })
+    return path ?? null
+  }
+
+  async function pickSavePath(defaultPath: string, filters: DialogFilter[] = []) {
+    return invoke<string | null>('dialog_save', { defaultPath, filters })
+  }
+
   async function chooseFile() {
     if (!canSend || (!selectedPeerId && !selectedGroupId)) return
-    const selected = await open({ multiple: false, directory: false })
-    if (!selected || Array.isArray(selected)) return
+    const selected = await pickFile()
+    if (!selected) return
     await sendFiles([selected])
   }
 
@@ -1668,19 +1679,15 @@
       }).catch((error) => showToast(String(error)))
       return
     }
-    const path = await save({ defaultPath: message.body })
+    const path = await pickSavePath(message.body)
     if (path) await invoke('node_export_attachment', {
       id: message.attachmentId, path,
     }).catch((error) => showToast(String(error)))
   }
 
   async function chooseEmoticonFile() {
-    const selected = await open({
-      multiple: false,
-      directory: false,
-      filters: [{ name: 'Emoticon', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'] }],
-    })
-    if (!selected || Array.isArray(selected)) return
+    const selected = await pickFile([{ name: 'Emoticon', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'] }])
+    if (!selected) return
     emoticonPath = selected
     emoticonTrigger = ''
     emoticonCreateOpen = true
@@ -1764,12 +1771,8 @@
   }
 
   async function chooseAvatar() {
-    const selected = await open({
-      multiple: false,
-      directory: false,
-      filters: [{ name: 'Profile image', extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
-    })
-    if (selected && !Array.isArray(selected)) await saveProfile(selected, false, false)
+    const selected = await pickFile([{ name: 'Profile image', extensions: ['png', 'jpg', 'jpeg', 'webp'] }])
+    if (selected) await saveProfile(selected, false, false)
   }
 
   async function renameContact() {
@@ -1806,12 +1809,8 @@
   }
 
   async function scanContactQr() {
-    const selected = await open({
-      multiple: false,
-      directory: false,
-      filters: [{ name: 'QR images', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] }],
-    })
-    if (!selected || Array.isArray(selected)) return
+    const selected = await pickFile([{ name: 'QR images', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] }])
+    if (!selected) return
     try {
       contactLink = await invoke<string>('scan_contact_qr', { path: selected })
       await importContact()
@@ -1844,10 +1843,7 @@
 
   async function saveContactQr() {
     if (!ownContactQr) return
-    const path = await save({
-      defaultPath: 'msnnext-contact.png',
-      filters: [{ name: 'PNG image', extensions: ['png'] }],
-    })
+    const path = await pickSavePath('msnnext-contact.png', [{ name: 'PNG image', extensions: ['png'] }])
     if (!path) return
     await invoke('save_contact_qr', { path, dataUrl: ownContactQr })
       .then(() => showToast($t('toast.qrSaved')))
@@ -1924,12 +1920,8 @@
   }
 
   async function scanDevicePairingQr() {
-    const selected = await open({
-      multiple: false,
-      directory: false,
-      filters: [{ name: 'QR images', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] }],
-    })
-    if (!selected || Array.isArray(selected)) return
+    const selected = await pickFile([{ name: 'QR images', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] }])
+    if (!selected) return
     try {
       devicePairingLink = await invoke<string>('scan_contact_qr', { path: selected })
       await importDevicePairing()
@@ -1946,10 +1938,7 @@
 
   async function saveDevicePairingQr() {
     if (!devicePairingQr) return
-    const path = await save({
-      defaultPath: 'msnnext-device.png',
-      filters: [{ name: 'PNG image', extensions: ['png'] }],
-    })
+    const path = await pickSavePath('msnnext-device.png', [{ name: 'PNG image', extensions: ['png'] }])
     if (!path) return
     await invoke('save_contact_qr', { path, dataUrl: devicePairingQr })
       .then(() => showToast($t('toast.deviceQrSaved')))
@@ -1961,10 +1950,7 @@
       showToast($t('toast.goOfflineBackup'))
       return
     }
-    const path = await save({
-      defaultPath: 'msnnext-account.msnnext-account',
-      filters: [{ name: 'msnnext account backup', extensions: ['msnnext-account'] }],
-    })
+    const path = await pickSavePath('msnnext-account.msnnext-account', [{ name: 'msnnext account backup', extensions: ['msnnext-account'] }])
     if (!path) return
     accountBackupMode = 'export'
     accountBackupPath = path
@@ -1977,12 +1963,8 @@
       showToast($t('toast.goOfflineRestore'))
       return
     }
-    const path = await open({
-      multiple: false,
-      directory: false,
-      filters: [{ name: 'msnnext account backup', extensions: ['msnnext-account'] }],
-    })
-    if (!path || Array.isArray(path)) return
+    const path = await pickFile([{ name: 'msnnext account backup', extensions: ['msnnext-account'] }])
+    if (!path) return
     accountBackupMode = 'import'
     accountBackupPath = path
     accountBackupPassword = ''
