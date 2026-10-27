@@ -5,7 +5,10 @@ mod crypto;
 mod devices;
 mod history;
 
-use attachments::{build_manifest, read_chunk, validate_manifest, CompletedAttachment, Receiver};
+use attachments::{
+    build_manifest, read_chunk, validate_manifest, CompletedAttachment, Completion, FinalizeJob,
+    Receiver,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chacha20poly1305::aead::rand_core::{OsRng, RngCore};
 use connectivity::{relay_route, split_peer_address, FallbackPlanner, Recovery};
@@ -559,6 +562,7 @@ struct Incoming<'a> {
     peer_names: &'a mut HashMap<PeerId, String>,
     local_peer_id: PeerId,
     incoming_attachments: &'a mut HashMap<(PeerId, [u8; 32]), HashSet<Option<String>>>,
+    vault_jobs: &'a mpsc::UnboundedSender<VaultJobDone>,
 }
 
 struct SyncConnections<'a> {
@@ -824,6 +828,10 @@ async fn run_node(
     let mut shared_emoticons = HashSet::<(PeerId, [u8; 32])>::new();
     let mut pending_emoticons = HashMap::<[u8; 32], EmoticonOffer>::new();
     let mut attachment_receiver = Receiver::new(args.downloads.clone(), attachment_key);
+    // Lavoro pesante sui file (hash in invio, verifica finale in ricezione)
+    // fuori dal loop: i risultati tornano su questi canali.
+    let (prepared_files_tx, mut prepared_files) = mpsc::unbounded_channel::<PreparedFile>();
+    let (vault_jobs_tx, mut vault_jobs) = mpsc::unbounded_channel::<VaultJobDone>();
     let mut incoming_attachments = HashMap::<(PeerId, [u8; 32]), HashSet<Option<String>>>::new();
     let mut pending_inbound_offers = HashMap::<u64, PendingInboundOffer>::new();
     let mut inbound_offer_counter = 0_u64;
@@ -996,6 +1004,150 @@ async fn run_node(
         // e il nodo continua a girare invece di spegnersi.
         let step: Result<LoopFlow, Box<dyn Error>> = async {
         tokio::select! {
+            Some(prepared) = prepared_files.recv() => {
+                let manifest = match prepared.manifest {
+                    Ok(manifest) => manifest,
+                    Err(message) => {
+                        let _ = events.send(ClientEvent::Error { message: format!("file non inviato: {message}") });
+                        return Ok(LoopFlow::Continue);
+                    }
+                };
+                let path = prepared.path;
+                let attachment_hex = hex_asset_id(&manifest.attachment_id);
+                // Niente copia nel vault: solo un riferimento al file originale,
+                // che resta riapribile finché esiste.
+                if let Err(error) = attachment_receiver.store_reference(&manifest, &path) {
+                    log::warn!("riferimento al file inviato non salvato: {error}");
+                }
+                match prepared.target {
+                    FileTarget::Peer(peer) => {
+                        if !contact_devices.online(peer, &peers) {
+                            let _ = events.send(ClientEvent::Error { message: "contatto non collegato".into() });
+                            return Ok(LoopFlow::Continue);
+                        }
+                        record(&history, &peer, "out", "file", &encode_attachment(&manifest));
+                        if let Some(request_id) = send_event(
+                            &mut swarm,
+                            &mut sessions,
+                            &contact_devices,
+                            peer,
+                            local_peer_id,
+                            &mut sent_numbers,
+                            ChatEvent::AttachmentOffer(manifest.clone()),
+                        ) {
+                            let _ = events.send(ClientEvent::Message {
+                                message: ClientMessage {
+                                    peer_id: peer.to_string(),
+                                    direction: "out".into(),
+                                    kind: "file".into(),
+                                    body: manifest.filename.clone(),
+                                    timestamp_ms: now_ms(),
+                                    emoticons: Vec::new(),
+                                    attachment_id: Some(attachment_hex),
+                                    attachment_mime: Some(manifest.mime.clone()),
+                                    event_id: None,
+                                    relayed: false,
+                                },
+                            });
+                            pending_offers.insert(request_id, PendingOffer {
+                                peer,
+                                path,
+                                manifest,
+                                retries: 0,
+                                group_id: None,
+                            });
+                        } else {
+                            let _ = events.send(ClientEvent::Error { message: "invio file fallito: canale cifrato non pronto".into() });
+                        }
+                    }
+                    FileTarget::Group { group_id, parsed_id } => {
+                        let Some(group) = history.group_chat(&group_id)? else {
+                            let _ = events.send(ClientEvent::Error { message: "chat di gruppo non trovata".into() });
+                            return Ok(LoopFlow::Continue);
+                        };
+                        let timestamp_ms = now_ms();
+                        let recipients = match group_file_recipients(&group, local_peer_id, &sessions, timestamp_ms) {
+                            Ok(recipients) => recipients,
+                            Err(message) => {
+                                let _ = events.send(ClientEvent::Error { message: message.into() });
+                                return Ok(LoopFlow::Continue);
+                            }
+                        };
+                        history.record(
+                            &group_history_key(&group_id),
+                            "out",
+                            &format!("group-file:{local_peer_id}"),
+                            &encode_attachment(&manifest),
+                            timestamp_ms,
+                        )?;
+                        for recipient in recipients {
+                            if let Some(request_id) = send_event(
+                                &mut swarm,
+                                &mut sessions,
+                                &contact_devices,
+                                recipient,
+                                local_peer_id,
+                                &mut sent_numbers,
+                                ChatEvent::GroupAttachmentOffer(GroupAttachmentOffer {
+                                    group_id: parsed_id,
+                                    manifest: manifest.clone(),
+                                }),
+                            ) {
+                                pending_offers.insert(request_id, PendingOffer {
+                                    peer: recipient,
+                                    path: path.clone(),
+                                    manifest: manifest.clone(),
+                                    retries: 0,
+                                    group_id: Some(parsed_id),
+                                });
+                            }
+                        }
+                        let _ = events.send(ClientEvent::GroupMessage { message: ClientGroupMessage {
+                            group_id,
+                            sender_peer_id: local_peer_id.to_string(),
+                            direction: "out".into(),
+                            kind: "file".into(),
+                            body: manifest.filename.clone(),
+                            timestamp_ms,
+                            emoticons: Vec::new(),
+                            attachment_id: Some(attachment_hex),
+                            attachment_mime: Some(manifest.mime),
+                        }});
+                    }
+                    FileTarget::AllPeers => {
+                        println!("offerta file: {} ({} chunk)", manifest.filename, manifest.chunks.len());
+                        for peer in &peers {
+                            record(&history, peer, "out", "file", &manifest.filename);
+                            if let Some(request_id) = send_event(&mut swarm, &mut sessions, &contact_devices, *peer, local_peer_id, &mut sent_numbers, ChatEvent::AttachmentOffer(manifest.clone())) {
+                                pending_offers.insert(request_id, PendingOffer { peer: *peer, path: path.clone(), manifest: manifest.clone(), retries: 0, group_id: None });
+                            }
+                        }
+                    }
+                }
+            }
+            Some(done) = vault_jobs.recv() => {
+                let destinations = incoming_attachments
+                    .remove(&(done.peer, done.id))
+                    .unwrap_or_else(|| HashSet::from([None]));
+                match done.result {
+                    Ok(completed) => {
+                        println!("{}: file ricevuto nell'archivio cifrato", done.peer);
+                        let should_notify = args.notifications && destinations.iter().any(|group_id| {
+                            let conversation = group_id
+                                .as_ref()
+                                .map_or_else(|| format!("peer:{}", done.peer), |id| format!("group:{id}"));
+                            notification_mute_allows(&notification_mutes, &conversation, now_ms())
+                        });
+                        notify(should_notify, "File ricevuto", &completed.filename);
+                        for group_id in destinations {
+                            emit_attachment_received(&events, done.peer, group_id, &completed);
+                        }
+                    }
+                    Err(message) => {
+                        let _ = events.send(ClientEvent::Error { message: format!("file ricevuto non valido: {message}") });
+                    }
+                }
+            }
             _ = device_sync_tick.tick(), if !online_devices.is_empty() => {
                 let latest_seq = history.latest_sync_seq()?;
                 let available = online_devices
@@ -1176,20 +1328,13 @@ async fn run_node(
                     }
                     Err(error) => eprintln!("emoticon rifiutata: {error}"),
                 },
-                Some(line) if line.starts_with("file ") => match build_manifest(Path::new(line[5..].trim())) {
-                    Ok(_manifest) if peers.is_empty() => eprintln!("nessun peer collegato"),
-                    Ok(manifest) => {
-                        let path = PathBuf::from(line[5..].trim());
-                        println!("offerta file: {} ({} chunk)", manifest.filename, manifest.chunks.len());
-                        for peer in &peers {
-                            record(&history, peer, "out", "file", &manifest.filename);
-                            if let Some(request_id) = send_event(&mut swarm, &mut sessions, &contact_devices, *peer, local_peer_id, &mut sent_numbers, ChatEvent::AttachmentOffer(manifest.clone())) {
-                                pending_offers.insert(request_id, PendingOffer { peer: *peer, path: path.clone(), manifest: manifest.clone(), retries: 0, group_id: None });
-                            }
-                        }
+                Some(line) if line.starts_with("file ") => {
+                    if peers.is_empty() {
+                        eprintln!("nessun peer collegato");
+                    } else {
+                        prepare_file(&prepared_files_tx, FileTarget::AllPeers, PathBuf::from(line[5..].trim()));
                     }
-                    Err(error) => eprintln!("file rifiutato: {error}"),
-                },
+                }
                 Some(_) => eprintln!("comando non valido"),
                 None => stdin_open = false,
             },
@@ -1561,49 +1706,10 @@ async fn run_node(
                         });
                         return Ok(LoopFlow::Continue);
                     }
-                    match build_manifest(&path) {
-                        Ok(manifest) => {
-                            // Salva anche il file inviato nel vault: così è cliccabile
-                            // e riapribile come quelli ricevuti (id in cronologia).
-                            let _ = attachment_receiver.store_local(&manifest, &path);
-                            record(&history, &peer, "out", "file", &encode_attachment(&manifest));
-                            let attachment_hex = hex_asset_id(&manifest.attachment_id);
-                            if let Some(request_id) = send_event(
-                                &mut swarm,
-                                &mut sessions,
-                                &contact_devices,
-                                peer,
-                                local_peer_id,
-                                &mut sent_numbers,
-                                ChatEvent::AttachmentOffer(manifest.clone()),
-                            ) {
-                                let _ = events.send(ClientEvent::Message {
-                                    message: ClientMessage {
-                                        peer_id: peer.to_string(),
-                                        direction: "out".into(),
-                                        kind: "file".into(),
-                                        body: manifest.filename.clone(),
-                                        timestamp_ms: now_ms(),
-                                        emoticons: Vec::new(),
-                                        attachment_id: Some(attachment_hex),
-                                        attachment_mime: Some(manifest.mime.clone()),
-                                        event_id: None,
-                                        relayed: false,
-                                    },
-                                });
-                                pending_offers.insert(request_id, PendingOffer {
-                                    peer,
-                                    path,
-                                    manifest,
-                                    retries: 0,
-                                    group_id: None,
-                                });
-                            }
-                        }
-                        Err(error) => {
-                            let _ = events.send(ClientEvent::Error { message: error.to_string() });
-                        }
-                    }
+                    // L'hash di un file fino a 5 GB richiede minuti: lo calcola un
+                    // thread a parte e l'offerta parte quando è pronto. Intanto il
+                    // loop continua a gestire messaggi, ping e handshake.
+                    prepare_file(&prepared_files_tx, FileTarget::Peer(peer), path);
                 }
                 Some(ClientCommand::CreateEmoticon { path, trigger }) => {
                     match create_emoticon(&path, &trigger, &args.emotes, &mut triggers) {
@@ -1983,68 +2089,11 @@ async fn run_node(
                         let _ = events.send(ClientEvent::Error { message: "chat di gruppo non trovata".into() });
                         return Ok(LoopFlow::Continue);
                     };
-                    let timestamp_ms = now_ms();
-                    if !group_member_can_send(&group, &local_peer_id.to_string(), timestamp_ms) {
-                        let _ = events.send(ClientEvent::Error { message: "non puoi inviare file: sei silenziato o bannato".into() });
+                    if let Err(message) = group_file_recipients(&group, local_peer_id, &sessions, now_ms()) {
+                        let _ = events.send(ClientEvent::Error { message: message.into() });
                         return Ok(LoopFlow::Continue);
                     }
-                    let recipients = group.members.iter()
-                        .filter_map(|value| value.parse::<PeerId>().ok())
-                        .filter(|peer| {
-                            *peer != local_peer_id
-                                && sessions.contains_key(peer)
-                                && !active_group_ban(&group, &peer.to_string(), timestamp_ms)
-                        })
-                        .collect::<Vec<_>>();
-                    if recipients.is_empty() {
-                        let _ = events.send(ClientEvent::Error { message: "nessun partecipante è online con una sessione protetta".into() });
-                        return Ok(LoopFlow::Continue);
-                    }
-                    match build_manifest(&path) {
-                        Ok(manifest) => {
-                            history.record(
-                                &group_history_key(&group_id),
-                                "out",
-                                &format!("group-file:{local_peer_id}"),
-                                &encode_attachment(&manifest),
-                                timestamp_ms,
-                            )?;
-                            for recipient in recipients {
-                                if let Some(request_id) = send_event(
-                                    &mut swarm,
-                                    &mut sessions,
-                                    &contact_devices,
-                                    recipient,
-                                    local_peer_id,
-                                    &mut sent_numbers,
-                                    ChatEvent::GroupAttachmentOffer(GroupAttachmentOffer {
-                                        group_id: parsed_id,
-                                        manifest: manifest.clone(),
-                                    }),
-                                ) {
-                                    pending_offers.insert(request_id, PendingOffer {
-                                        peer: recipient,
-                                        path: path.clone(),
-                                        manifest: manifest.clone(),
-                                        retries: 0,
-                                        group_id: Some(parsed_id),
-                                    });
-                                }
-                            }
-                            let _ = events.send(ClientEvent::GroupMessage { message: ClientGroupMessage {
-                                group_id,
-                                sender_peer_id: local_peer_id.to_string(),
-                                direction: "out".into(),
-                                kind: "file".into(),
-                                body: manifest.filename.clone(),
-                                timestamp_ms,
-                                emoticons: Vec::new(),
-                                attachment_id: None,
-                                attachment_mime: Some(manifest.mime),
-                            }});
-                        }
-                        Err(error) => { let _ = events.send(ClientEvent::Error { message: error.to_string() }); }
-                    }
+                    prepare_file(&prepared_files_tx, FileTarget::Group { group_id, parsed_id }, path);
                 }
                 Some(ClientCommand::ClearGroupConversation { group_id }) => {
                     match parse_group_id(&group_id).and_then(|_| history.clear_conversation(&group_history_key(&group_id)).map_err(|error| error.to_string())) {
@@ -2106,6 +2155,7 @@ async fn run_node(
                         peer_names: &mut peer_names,
                         local_peer_id,
                         incoming_attachments: &mut incoming_attachments,
+                        vault_jobs: &vault_jobs_tx,
                     });
                     if !matches!(&response, ProtocolResponse::Rejected(_)) {
                         if let Some(event) = client_event {
@@ -2377,6 +2427,7 @@ async fn run_node(
                                     peer_names: &mut peer_names,
                                     local_peer_id,
                                     incoming_attachments: &mut incoming_attachments,
+                                    vault_jobs: &vault_jobs_tx,
                                 }),
                                 true,
                             ),
@@ -2543,6 +2594,7 @@ async fn run_node(
                                                     peer_names: &mut peer_names,
                                                     local_peer_id,
                                                     incoming_attachments: &mut incoming_attachments,
+                                                    vault_jobs: &vault_jobs_tx,
                                                 });
                                                 if !matches!(&resp, ProtocolResponse::Rejected(_)) {
                                                     if let Some(event) = client_event {
@@ -2638,6 +2690,7 @@ async fn run_node(
                                         peer_names: &mut peer_names,
                                         local_peer_id,
                                         incoming_attachments: &mut incoming_attachments,
+                                        vault_jobs: &vault_jobs_tx,
                                     });
                                     if let Some(event) = client_event {
                                         let _ = events.send(event);
@@ -3416,6 +3469,75 @@ fn report_undelivered(
             });
         }
     }
+}
+
+/// Destinazione di un file in preparazione (hash in corso).
+enum FileTarget {
+    Peer(PeerId),
+    Group { group_id: String, parsed_id: [u8; 16] },
+    /// Comando `file` della CLI: a tutti i peer collegati.
+    AllPeers,
+}
+
+struct PreparedFile {
+    target: FileTarget,
+    path: PathBuf,
+    manifest: Result<AttachmentManifest, String>,
+}
+
+/// Esito della verifica finale di un file ricevuto.
+struct VaultJobDone {
+    peer: PeerId,
+    id: [u8; 32],
+    result: Result<CompletedAttachment, String>,
+}
+
+/// Calcola il manifest (hash BLAKE3 dell'intero file) in un thread bloccante.
+fn prepare_file(tx: &mpsc::UnboundedSender<PreparedFile>, target: FileTarget, path: PathBuf) {
+    let tx = tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let manifest = build_manifest(&path).map_err(|error| error.to_string());
+        let _ = tx.send(PreparedFile {
+            target,
+            path,
+            manifest,
+        });
+    });
+}
+
+fn spawn_finalize(tx: &mpsc::UnboundedSender<VaultJobDone>, peer: PeerId, job: FinalizeJob) {
+    let tx = tx.clone();
+    let id = job.attachment_id();
+    tokio::task::spawn_blocking(move || {
+        let result = job.run().map_err(|error| error.to_string());
+        let _ = tx.send(VaultJobDone { peer, id, result });
+    });
+}
+
+/// Membri del gruppo a cui si può mandare un file adesso.
+fn group_file_recipients(
+    group: &GroupChatEntry,
+    local_peer_id: PeerId,
+    sessions: &HashMap<PeerId, RatchetSession>,
+    timestamp_ms: u64,
+) -> Result<Vec<PeerId>, &'static str> {
+    if !group_member_can_send(group, &local_peer_id.to_string(), timestamp_ms) {
+        return Err("non puoi inviare file: sei silenziato o bannato");
+    }
+    let recipients = group
+        .members
+        .iter()
+        .filter_map(|value| value.parse::<PeerId>().ok())
+        .filter(|peer| {
+            *peer != local_peer_id
+                && sessions.contains_key(peer)
+                && !active_group_ban(group, &peer.to_string(), timestamp_ms)
+        })
+        .collect::<Vec<_>>();
+    if recipients.is_empty() {
+        return Err("nessun partecipante è online con una sessione protetta");
+    }
+    Ok(recipients)
 }
 
 /// Esito della gestione di un singolo evento del loop principale.
@@ -4554,14 +4676,20 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                             attachment_mime: Some(offer.manifest.mime.clone()),
                         },
                     });
-                    if let Some(completed) = completed {
-                        emit_attachment_received(context.events, peer, Some(id), &completed);
-                    } else {
-                        context
-                            .incoming_attachments
-                            .entry((peer, offer.manifest.attachment_id))
-                            .or_default()
-                            .insert(Some(id));
+                    match completed {
+                        Some(Completion::Ready(completed)) => {
+                            emit_attachment_received(context.events, peer, Some(id), &completed);
+                        }
+                        pending => {
+                            context
+                                .incoming_attachments
+                                .entry((peer, offer.manifest.attachment_id))
+                                .or_default()
+                                .insert(Some(id));
+                            if let Some(Completion::Finalize(job)) = pending {
+                                spawn_finalize(context.vault_jobs, peer, job);
+                            }
+                        }
                     }
                     ProtocolResponse::MissingChunks(missing)
                 }
@@ -4622,20 +4750,26 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                         "file",
                         &encode_attachment(manifest),
                     );
-                    if let Some(completed) = completed {
-                        println!("{peer}: file già presente nell'archivio cifrato");
-                        notify(
-                            notification_allowed(context, &format!("peer:{peer}")),
-                            "File ricevuto",
-                            &manifest.filename,
-                        );
-                        emit_attachment_received(context.events, peer, None, &completed);
-                    } else {
-                        context
-                            .incoming_attachments
-                            .entry((peer, manifest.attachment_id))
-                            .or_default()
-                            .insert(None);
+                    match completed {
+                        Some(Completion::Ready(completed)) => {
+                            println!("{peer}: file già presente nell'archivio cifrato");
+                            notify(
+                                notification_allowed(context, &format!("peer:{peer}")),
+                                "File ricevuto",
+                                &manifest.filename,
+                            );
+                            emit_attachment_received(context.events, peer, None, &completed);
+                        }
+                        pending => {
+                            context
+                                .incoming_attachments
+                                .entry((peer, manifest.attachment_id))
+                                .or_default()
+                                .insert(None);
+                            if let Some(Completion::Finalize(job)) = pending {
+                                spawn_finalize(context.vault_jobs, peer, job);
+                            }
+                        }
                     }
                     ProtocolResponse::MissingChunks(missing)
                 }
@@ -4643,22 +4777,10 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
             }
         }
         ChatEvent::AttachmentChunk(chunk) => match context.attachments.accept_chunk(chunk) {
-            Ok(Some(completed)) => {
-                println!("{peer}: file ricevuto nell'archivio cifrato");
-                let destinations = context
-                    .incoming_attachments
-                    .remove(&(peer, completed.id))
-                    .unwrap_or_else(|| HashSet::from([None]));
-                let should_notify = destinations.iter().any(|group_id| {
-                    let conversation = group_id
-                        .as_ref()
-                        .map_or_else(|| format!("peer:{peer}"), |id| format!("group:{id}"));
-                    notification_allowed(context, &conversation)
-                });
-                notify(should_notify, "File ricevuto", &completed.filename);
-                for group_id in destinations {
-                    emit_attachment_received(context.events, peer, group_id, &completed);
-                }
+            Ok(Some(job)) => {
+                // Ultimo chunk: la verifica dell'intero file gira fuori dal
+                // loop; notifica ed eventi UI partono quando ha finito.
+                spawn_finalize(context.vault_jobs, peer, job);
                 ProtocolResponse::Ack
             }
             Ok(None) => ProtocolResponse::Ack,
@@ -5812,7 +5934,15 @@ mod tests {
         events: &mut mpsc::UnboundedReceiver<ClientEvent>,
         predicate: impl Fn(&ClientEvent) -> bool,
     ) -> ClientEvent {
-        tokio::time::timeout(Duration::from_secs(15), async {
+        receive_until_within(events, Duration::from_secs(15), predicate).await
+    }
+
+    async fn receive_until_within(
+        events: &mut mpsc::UnboundedReceiver<ClientEvent>,
+        limit: Duration,
+        predicate: impl Fn(&ClientEvent) -> bool,
+    ) -> ClientEvent {
+        tokio::time::timeout(limit, async {
             loop {
                 let event = events.recv().await.expect("canale eventi chiuso");
                 if predicate(&event) {
@@ -6756,6 +6886,122 @@ mod tests {
                 for index in 0..3 {
                     alice.until_text(&format!("messaggio {index}")).await;
                 }
+                alice.shutdown().await;
+                bob.shutdown().await;
+            })
+            .await;
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Audit #5: l'hash del file veniva calcolato nel thread del loop, che per
+    /// tutto quel tempo non gestiva messaggi né ping. Ora un messaggio arriva
+    /// mentre un file da 1 GB è ancora in preparazione.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(windows, ignore = "il teardown libp2p può bloccare l'harness Windows")]
+    async fn hashing_a_large_file_does_not_block_messages() {
+        let root = test_root("big-file");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("grande.bin");
+        // File sparso: non occupa disco ma va letto e hashato per intero.
+        fs::File::create(&source)
+            .unwrap()
+            .set_len(1024 * 1024 * 1024)
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut alice = TestNode::start(loopback_config("Alice", &root.join("alice"), None)).await;
+                let mut bob = TestNode::start(loopback_config("Bob", &root.join("bob"), None)).await;
+                connect_pair(&mut alice, &mut bob).await;
+
+                bob.send(ClientCommand::SendFile {
+                    peer: alice.peer,
+                    path: source.clone(),
+                });
+                alice.send(ClientCommand::SendText {
+                    peer: bob.peer,
+                    text: "mentre prepari il file".into(),
+                });
+                // Il testo deve arrivare a Bob prima che il suo file sia pronto.
+                let first = receive_until_within(&mut bob.events, Duration::from_secs(120), |event| {
+                    matches!(event, ClientEvent::Message { message } if message.direction == "out" && message.kind == "file")
+                        || matches!(event, ClientEvent::Message { message } if message.direction == "in" && message.body == "mentre prepari il file")
+                })
+                .await;
+                assert!(
+                    matches!(&first, ClientEvent::Message { message } if message.direction == "in"),
+                    "il loop era bloccato dall'hash del file: {first:?}"
+                );
+
+                let ClientEvent::IncomingAttachmentOffered { offer_id, .. } = receive_until_within(
+                    &mut alice.events,
+                    Duration::from_secs(120),
+                    |event| matches!(event, ClientEvent::IncomingAttachmentOffered { .. }),
+                )
+                .await
+                else {
+                    unreachable!()
+                };
+                alice.send(ClientCommand::RejectAttachment { offer_id });
+                bob.until(|event| matches!(event, ClientEvent::Error { message } if message.contains("rifiutato")))
+                    .await;
+                alice.shutdown().await;
+                bob.shutdown().await;
+            })
+            .await;
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(windows, ignore = "il teardown libp2p può bloccare l'harness Windows")]
+    async fn sent_file_arrives_intact_and_sender_can_reopen_it() {
+        let root = test_root("file");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("foto.bin");
+        let bytes = (0..(3 * attachments::CHUNK_SIZE + 123))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        fs::write(&source, &bytes).unwrap();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut alice = TestNode::start(loopback_config("Alice", &root.join("alice"), None)).await;
+                let mut bob = TestNode::start(loopback_config("Bob", &root.join("bob"), None)).await;
+                connect_pair(&mut alice, &mut bob).await;
+
+                bob.send(ClientCommand::SendFile {
+                    peer: alice.peer,
+                    path: source.clone(),
+                });
+                let ClientEvent::IncomingAttachmentOffered { offer_id, .. } = alice
+                    .until(|event| matches!(event, ClientEvent::IncomingAttachmentOffered { .. }))
+                    .await
+                else {
+                    unreachable!()
+                };
+                alice.send(ClientCommand::AcceptAttachment { offer_id });
+                let ClientEvent::AttachmentReceived { id, .. } = receive_until_within(
+                    &mut alice.events,
+                    Duration::from_secs(60),
+                    |event| matches!(event, ClientEvent::AttachmentReceived { .. }),
+                )
+                .await
+                else {
+                    unreachable!()
+                };
+                let received = root.join("ricevuto.bin");
+                alice.send(ClientCommand::ExportAttachment { id: id.clone(), path: received.clone() });
+                alice
+                    .until(|event| matches!(event, ClientEvent::AttachmentExported { .. }))
+                    .await;
+                assert_eq!(fs::read(&received).unwrap(), bytes);
+
+                // Il mittente riapre il proprio file dal riferimento, senza copia.
+                let reopened = root.join("riaperto.bin");
+                bob.send(ClientCommand::ExportAttachment { id, path: reopened.clone() });
+                bob.until(|event| matches!(event, ClientEvent::AttachmentExported { .. }))
+                    .await;
+                assert_eq!(fs::read(&reopened).unwrap(), bytes);
                 alice.shutdown().await;
                 bob.shutdown().await;
             })
