@@ -80,6 +80,11 @@ pub enum SyncOperation {
     },
 }
 
+/// Byte di record per richiesta Pair/Sync. Il codec cbor di libp2p rifiuta
+/// richieste oltre 1 MiB, e il messaggio sigillato codifica il ciphertext
+/// come array (fino a 2 byte per byte): resta ampio margine.
+pub const MAX_SYNC_BATCH_BYTES: usize = 256 * 1024;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SyncRecord {
     pub seq: u64,
@@ -690,12 +695,20 @@ impl History {
             ))
         })?;
         let mut records = Vec::new();
+        let mut batch_bytes = 0;
         for row in rows {
             let (seq, op_id, payload) = row?;
+            let plain = self.unseal(&payload)?;
+            // Il resto arriva al giro successivo: chi riceve ripete il sync
+            // finché il cursore non raggiunge latest_seq.
+            batch_bytes += plain.len();
+            if !records.is_empty() && batch_bytes > MAX_SYNC_BATCH_BYTES {
+                break;
+            }
             records.push(SyncRecord {
                 seq,
                 op_id,
-                operation: cbor4ii::serde::from_slice(&self.unseal(&payload)?)?,
+                operation: cbor4ii::serde::from_slice(&plain)?,
             });
         }
         Ok(records)

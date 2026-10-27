@@ -170,6 +170,52 @@ pub fn open<T: DeserializeOwned>(
 mod tests {
     use super::*;
 
+    /// Audit #25: tanti messaggi lunghi superavano il limite di 1 MiB del
+    /// codec cbor e il sync si bloccava.
+    #[test]
+    fn sync_batches_fit_the_request_limit() {
+        let path =
+            std::env::temp_dir().join(format!("msnnext-sync-size-{}.db", std::process::id()));
+        std::fs::remove_file(&path).ok();
+        let history = crate::history::History::open(&path, [9; 32]).unwrap();
+        let long = "é".repeat(msnnext_protocol::MAX_TEXT_BYTES / 2);
+        // 150 messaggi da 16 KB bastano a superare 1 MiB di parecchio.
+        for index in 0..150 {
+            history
+                .record("alice", "in", "text", &long, index as u64)
+                .unwrap();
+        }
+        let mut cursor = 0;
+        let mut batches = 0;
+        loop {
+            let records = history
+                .sync_records_since(cursor, MAX_SYNC_RECORDS)
+                .unwrap();
+            let Some(last) = records.last() else { break };
+            cursor = last.seq;
+            batches += 1;
+            let request = DeviceRequest::Sync {
+                device: DeviceDescriptor {
+                    peer_id: "peer".into(),
+                    name: "PC".into(),
+                    addresses: Vec::new(),
+                },
+                after_seq: 0,
+                records,
+            };
+            let sealed = seal(&[1; 32], &request).unwrap();
+            let encoded = cbor4ii::serde::to_vec(Vec::new(), &sealed).unwrap();
+            assert!(
+                encoded.len() < 1024 * 1024,
+                "batch da {} byte",
+                encoded.len()
+            );
+        }
+        assert!(batches > 1);
+        assert_eq!(cursor, history.latest_sync_seq().unwrap());
+        std::fs::remove_file(path).ok();
+    }
+
     #[test]
     fn pairing_links_expire_and_round_trip() {
         let descriptor = DeviceDescriptor {
