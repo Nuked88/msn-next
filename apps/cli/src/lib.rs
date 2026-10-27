@@ -67,6 +67,15 @@ const CHAT_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const TEXT_HISTORY_PREFIX: &str = "msnnext-text-v1:";
 const MAX_PENDING_INBOUND_OFFERS: usize = 8;
 const ATTACHMENT_DECISION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Entro quanto un messaggio deve essere confermato prima del reinvio. Il
+/// timeout di libp2p è unico per il protocollo cifrato e vale 5 minuti per
+/// via delle offerte di file: per i messaggi lo accorciamo noi.
+const MESSAGE_ACK_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 20 });
+const DELIVERY_CHECK_INTERVAL: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 5 });
+
+/// Evento cifrato in attesa di conferma: destinatario, evento, tentativi e
+/// istante di invio (ms).
+type PendingMessage = (PeerId, ChatEvent, u8, u64);
 const RELAY_MAX_CIRCUIT_BYTES: u64 = attachments::MAX_FILE_BYTES + 64 * 1024 * 1024;
 const RELAY_MAX_CIRCUIT_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 const DEFAULT_RELAY_ADDRESS: &str =
@@ -197,6 +206,12 @@ pub enum ClientCommand {
     ScrambleSession {
         peer: PeerId,
     },
+    /// Solo test: gestisce i messaggi in arrivo ma non risponde, come se la
+    /// conferma si perdesse per strada.
+    #[cfg(test)]
+    WithholdAcks {
+        enabled: bool,
+    },
     Shutdown,
 }
 
@@ -214,6 +229,8 @@ impl ClientCommand {
             | Self::ClearConversation { peer } => Some(*peer),
             #[cfg(test)]
             Self::ForgetSession { peer } | Self::ScrambleSession { peer } => Some(*peer),
+            #[cfg(test)]
+            Self::WithholdAcks { .. } => None,
             Self::CreateEmoticon { .. }
             | Self::DeleteMessageForMe { .. }
             | Self::SetAutoAcceptExtensions { .. }
@@ -817,10 +834,15 @@ async fn run_node(
     // fallisce (frequente su mobile finché la connessione non è stabile).
     let mut handshake_retries = HashMap::<PeerId, u8>::new();
     // Affidabilità messaggi: coda per-peer quando la sessione non è pronta, e
-    // tracciamento (peer, evento, tentativi) per il retry sui fallimenti.
+    // tracciamento (peer, evento, tentativi, invio) per retry e timeout.
     let mut outbox = HashMap::<PeerId, VecDeque<(ChatEvent, u8)>>::new();
     let mut pending_messages =
-        HashMap::<request_response::OutboundRequestId, (PeerId, ChatEvent, u8)>::new();
+        HashMap::<request_response::OutboundRequestId, PendingMessage>::new();
+    let mut delivery_tick = tokio::time::interval(DELIVERY_CHECK_INTERVAL);
+    #[cfg(test)]
+    let mut withhold_acks = false;
+    #[cfg(test)]
+    let mut held_responses = Vec::new();
     // Estensioni (minuscole, senza punto) accettate automaticamente. Vuoto = off.
     let mut auto_accept_extensions = HashSet::<String>::new();
     // Stato di presenza comunicato ai contatti: "online" | "busy" | "away".
@@ -1172,6 +1194,30 @@ async fn run_node(
                     )?;
                 }
             }
+            _ = delivery_tick.tick(), if !pending_messages.is_empty() => {
+                // La richiesta cifrata ha un timeout di 5 minuti, pensato per le
+                // offerte di file che aspettano l'utente. Un messaggio senza
+                // conferma entro pochi secondi viene invece reinviato subito; il
+                // destinatario scarta i doppioni per id.
+                let now = now_ms();
+                let expired = pending_messages
+                    .iter()
+                    .filter(|(_, (_, _, _, sent_at))| now.saturating_sub(*sent_at) >= MESSAGE_ACK_TIMEOUT.as_millis() as u64)
+                    .map(|(request_id, _)| *request_id)
+                    .collect::<Vec<_>>();
+                for request_id in expired {
+                    let Some((msg_peer, event, attempts, _)) = pending_messages.remove(&request_id) else {
+                        continue;
+                    };
+                    match next_delivery_attempt(attempts) {
+                        Some(next) => {
+                            log::info!("nessuna conferma da {msg_peer}: reinvio");
+                            resend_pending(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, local_peer_id, msg_peer, event, next);
+                        }
+                        None => report_undelivered(&events, &mut shared_emoticons, msg_peer, &event, "nessuna conferma dal destinatario"),
+                    }
+                }
+            }
             _ = handshake_tick.tick(), if !peers.is_empty() => {
                 // Per ogni contatto connesso senza canale cifrato: se siamo
                 // l'iniziatore ritentiamo l'handshake, altrimenti ri-annunciamo
@@ -1346,6 +1392,12 @@ async fn run_node(
                         peer_id: peer.to_string(),
                         status: "session-scrambled".into(),
                     });
+                }
+                #[cfg(test)]
+                Some(ClientCommand::WithholdAcks { enabled }) => {
+                    // Le risposte trattenute restano aperte: chiuderle farebbe
+                    // fallire subito la richiesta invece di farla scadere.
+                    withhold_acks = enabled;
                 }
                 Some(ClientCommand::RequestContactLink) => {
                     contact_link_requested = true;
@@ -2593,6 +2645,17 @@ async fn run_node(
                                             )?;
                                         }
                                     }
+                                    // Un reinvio dopo un timeout può far arrivare due volte
+                                    // lo stesso messaggio: confermalo senza mostrarlo di nuovo.
+                                    if already_received(&history, &envelope.event) {
+                                        #[cfg(test)]
+                                        let _ = events.send(ClientEvent::ContactStatus {
+                                            peer_id: contact.to_string(),
+                                            status: "duplicate-ignored".into(),
+                                        });
+                                        swarm.behaviour_mut().secure_chat.send_response(channel, ProtocolResponse::Ack).ok();
+                                        return Ok(LoopFlow::Continue);
+                                    }
                                     let response = receive_event(contact, &envelope.event, &mut Incoming {
                                         pending_emoticons: &mut pending_emoticons,
                                         events: &events,
@@ -2616,6 +2679,11 @@ async fn run_node(
                             },
                             Err(error) => ProtocolResponse::Rejected(error.into()),
                         };
+                        #[cfg(test)]
+                        if withhold_acks {
+                            held_responses.push(channel);
+                            return Ok(LoopFlow::Continue);
+                        }
                         swarm.behaviour_mut().secure_chat.send_response(channel, response).ok();
                     }
                     request_response::Message::Response { request_id, response } => {
@@ -2694,7 +2762,7 @@ async fn run_node(
                                     report_file_failed(&events, &transfer.manifest.filename, "risposta non valida durante il trasferimento");
                                 }
                             }
-                        } else if let Some((msg_peer, event, attempts)) = pending_messages.remove(&request_id) {
+                        } else if let Some((msg_peer, event, attempts, _)) = pending_messages.remove(&request_id) {
                             match response {
                                 // Consegnato: smetti di tracciarlo.
                                 ProtocolResponse::Ack => {}
@@ -2767,17 +2835,10 @@ async fn run_node(
                             eprintln!("trasferimento file fallito definitivamente per {peer}: {error}");
                             report_file_failed(&events, &transfer.manifest.filename, &error.to_string());
                         }
-                    } else if let Some((msg_peer, event, retries)) = pending_messages.remove(&request_id) {
+                    } else if let Some((msg_peer, event, retries, _)) = pending_messages.remove(&request_id) {
                         // Retry di un messaggio di testo fallito in transito.
-                        if let Some(next) = next_request_retry(retries) {
-                            match send_event(&mut swarm, &mut sessions, &contact_devices, msg_peer, local_peer_id, &mut sent_numbers, event.clone()) {
-                                Some(new_id) => {
-                                    pending_messages.insert(new_id, (msg_peer, event, next));
-                                }
-                                None => {
-                                    outbox.entry(msg_peer).or_default().push_back((event, next));
-                                }
-                            }
+                        if let Some(next) = next_delivery_attempt(retries) {
+                            resend_pending(&mut swarm, &mut sessions, &contact_devices, &mut sent_numbers, &mut pending_messages, &mut outbox, local_peer_id, msg_peer, event, next);
                         } else {
                             eprintln!("messaggio non consegnato definitivamente a {peer}: {error}");
                             report_undelivered(&events, &mut shared_emoticons, msg_peer, &event, &error.to_string());
@@ -4019,6 +4080,12 @@ fn handshake_peer_authorized(
     known_contact || active_peer
 }
 
+/// Tentativi di un messaggio: rifiuti per sessione scaduta, errori di rete e
+/// timeout di conferma consumano lo stesso budget.
+fn next_delivery_attempt(attempts: u8) -> Option<u8> {
+    (attempts < MAX_DELIVERY_ATTEMPTS).then_some(attempts + 1)
+}
+
 fn next_request_retry(attempts: u8) -> Option<u8> {
     (attempts < MAX_REQUEST_RETRIES).then_some(attempts + 1)
 }
@@ -4230,7 +4297,7 @@ fn flush_outbox(
     sessions: &mut HashMap<PeerId, RatchetSession>,
     devices: &ContactDevices,
     sent_numbers: &mut HashMap<PeerId, u64>,
-    pending_messages: &mut HashMap<request_response::OutboundRequestId, (PeerId, ChatEvent, u8)>,
+    pending_messages: &mut HashMap<request_response::OutboundRequestId, PendingMessage>,
     outbox: &mut HashMap<PeerId, VecDeque<(ChatEvent, u8)>>,
     local_peer_id: PeerId,
     peer: PeerId,
@@ -4249,13 +4316,36 @@ fn flush_outbox(
         for (event, attempts) in queue {
             match send_event(swarm, sessions, devices, target, local_peer_id, sent_numbers, event.clone()) {
                 Some(request_id) => {
-                    pending_messages.insert(request_id, (target, event, attempts));
+                    pending_messages.insert(request_id, (target, event, attempts, now_ms()));
                 }
                 None => {
                     outbox.entry(target).or_default().push_back((event, attempts));
                 }
             }
         }
+    }
+}
+
+/// Reinvia un evento senza conferma: subito se la sessione c'è, altrimenti
+/// torna in coda nella sua posizione.
+#[allow(clippy::too_many_arguments)]
+fn resend_pending(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    sessions: &mut HashMap<PeerId, RatchetSession>,
+    devices: &ContactDevices,
+    sent_numbers: &mut HashMap<PeerId, u64>,
+    pending_messages: &mut HashMap<request_response::OutboundRequestId, PendingMessage>,
+    outbox: &mut HashMap<PeerId, VecDeque<(ChatEvent, u8)>>,
+    local_peer_id: PeerId,
+    peer: PeerId,
+    event: ChatEvent,
+    attempts: u8,
+) {
+    match send_event(swarm, sessions, devices, peer, local_peer_id, sent_numbers, event.clone()) {
+        Some(request_id) => {
+            pending_messages.insert(request_id, (peer, event, attempts, now_ms()));
+        }
+        None => requeue_in_order(outbox.entry(peer).or_default(), event, attempts),
     }
 }
 
@@ -4270,7 +4360,7 @@ fn deliver_event(
     sessions: &mut HashMap<PeerId, RatchetSession>,
     devices: &ContactDevices,
     sent_numbers: &mut HashMap<PeerId, u64>,
-    pending_messages: &mut HashMap<request_response::OutboundRequestId, (PeerId, ChatEvent, u8)>,
+    pending_messages: &mut HashMap<request_response::OutboundRequestId, PendingMessage>,
     outbox: &mut HashMap<PeerId, VecDeque<(ChatEvent, u8)>>,
     pending_handshakes: &mut HashMap<request_response::OutboundRequestId, (PeerId, HybridInitiator)>,
     local_peer_id: PeerId,
@@ -4281,7 +4371,7 @@ fn deliver_event(
     if devices.secure(peer, sessions) && queue_empty {
         match send_event(swarm, sessions, devices, peer, local_peer_id, sent_numbers, event.clone()) {
             Some(request_id) => {
-                pending_messages.insert(request_id, (peer, event, 0));
+                pending_messages.insert(request_id, (peer, event, 0, now_ms()));
             }
             None => outbox.entry(peer).or_default().push_back((event, 0)),
         }
@@ -4566,6 +4656,19 @@ fn conversation_id(first: PeerId, second: PeerId) -> [u8; 32] {
     hasher.update(&peers[0]);
     hasher.update(&peers[1]);
     *hasher.finalize().as_bytes()
+}
+
+/// Un testo con questo id è già in cronologia (arrivato con un invio
+/// precedente).
+fn already_received(history: &History, event: &ChatEvent) -> bool {
+    match event {
+        ChatEvent::Text(message) if message.id != [0u8; 16] => history
+            .event_meta(&hex_group_id(&message.id))
+            .ok()
+            .flatten()
+            .is_some(),
+        _ => false,
+    }
 }
 
 fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) -> ProtocolResponse {
@@ -7073,6 +7176,44 @@ mod tests {
                 alice.send(ClientCommand::RejectAttachment { offer_id });
                 bob.until(|event| matches!(event, ClientEvent::AttachmentFailed { reason, .. } if reason.contains("rifiutato")))
                     .await;
+                alice.shutdown().await;
+                bob.shutdown().await;
+            })
+            .await;
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Audit #10: un messaggio senza conferma veniva ritentato solo dopo il
+    /// timeout di 5 minuti delle offerte di file. Ora si reinvia dopo pochi
+    /// secondi e il destinatario non lo mostra due volte.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(windows, ignore = "il teardown libp2p può bloccare l'harness Windows")]
+    async fn unacknowledged_message_is_resent_quickly_without_duplicates() {
+        let root = test_root("ack-timeout");
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut alice = TestNode::start(loopback_config("Alice", &root.join("alice"), None)).await;
+                let mut bob = TestNode::start(loopback_config("Bob", &root.join("bob"), None)).await;
+                connect_pair(&mut alice, &mut bob).await;
+
+                bob.send(ClientCommand::WithholdAcks { enabled: true });
+                alice.send(ClientCommand::SendText { peer: bob.peer, text: "conferma persa".into() });
+                bob.until_text("conferma persa").await;
+                bob.send(ClientCommand::WithholdAcks { enabled: false });
+                // Il reinvio arriva ben prima dei 5 minuti ed è riconosciuto
+                // come doppione; poi nessun altro messaggio uguale.
+                let event = receive_until_within(&mut bob.events, Duration::from_secs(10), |event| {
+                    matches!(event, ClientEvent::ContactStatus { status, .. } if status == "duplicate-ignored")
+                        || matches!(event, ClientEvent::Message { message } if message.body == "conferma persa")
+                })
+                .await;
+                assert!(
+                    matches!(&event, ClientEvent::ContactStatus { .. }),
+                    "messaggio mostrato due volte: {event:?}"
+                );
+                alice.send(ClientCommand::SendText { peer: bob.peer, text: "dopo".into() });
+                bob.until_text("dopo").await;
                 alice.shutdown().await;
                 bob.shutdown().await;
             })
