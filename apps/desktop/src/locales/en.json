@@ -74,6 +74,7 @@
   "convEmpty.groupWait": "The chat will be available when at least one participant is online.",
   "convEmpty.ready": "They are online. Write the first message or send a nudge.",
   "convEmpty.offline": "You can resume chatting when they come back online.",
+  "msg.loadOlder": "Load earlier messages",
   "msg.sessionStart": "Start of conversation",
   "msg.youNudged": "You sent a nudge!",
   "msg.contactNudged": "{name} sent you a nudge!",

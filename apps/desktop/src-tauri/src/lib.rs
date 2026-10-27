@@ -996,6 +996,36 @@ fn node_clear_conversation(state: State<'_, NodeState>, peer_id: String) -> Resu
 }
 
 #[tauri::command]
+fn node_load_older_messages(
+    state: State<'_, NodeState>,
+    peer_id: String,
+    before_event_id: String,
+) -> Result<(), String> {
+    send_command(
+        &state,
+        ClientCommand::LoadOlderMessages {
+            peer: parse_peer(&peer_id)?,
+            before_event_id,
+        },
+    )
+}
+
+#[tauri::command]
+fn node_load_older_group_messages(
+    state: State<'_, NodeState>,
+    group_id: String,
+    before_event_id: String,
+) -> Result<(), String> {
+    send_command(
+        &state,
+        ClientCommand::LoadOlderGroupMessages {
+            group_id,
+            before_event_id,
+        },
+    )
+}
+
+#[tauri::command]
 fn node_create_chat_group(
     state: State<'_, NodeState>,
     name: String,
@@ -1606,6 +1636,8 @@ pub fn run() {
             node_set_auto_accept_extensions,
             node_set_presence_status,
             node_clear_conversation,
+            node_load_older_messages,
+            node_load_older_group_messages,
             node_create_chat_group,
             node_moderate_group,
             node_send_group_text,

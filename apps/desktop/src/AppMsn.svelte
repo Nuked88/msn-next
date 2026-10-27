@@ -149,6 +149,7 @@
     emoticons: ClientEmoticonSpan[]
     attachmentId?: string
     attachmentMime?: string
+    eventId?: string
   }
 
   type ClientEvent =
@@ -177,6 +178,8 @@
     | { type: 'conversationCleared'; peerId: string }
     | { type: 'groupChatsUpdated'; groups: Omit<GroupChat, 'unread'>[] }
     | { type: 'groupConversationLoaded'; groupId: string; messages: ClientGroupMessage[] }
+    | { type: 'olderMessagesLoaded'; peerId: string; messages: ClientMessage[]; hasMore: boolean }
+    | { type: 'olderGroupMessagesLoaded'; groupId: string; messages: ClientGroupMessage[]; hasMore: boolean }
     | { type: 'groupMessage'; message: ClientGroupMessage }
     | { type: 'groupConversationCleared'; groupId: string }
     | { type: 'attachmentOpened'; id: string; dataUrl: string }
@@ -435,6 +438,11 @@
   $: activeGroup = chatGroups.find((group) => group.id === selectedGroupId)
   $: conversationKey = selectedGroupId ? `group:${selectedGroupId}` : selectedPeerId
   $: messages = conversationKey ? conversations[conversationKey] || [] : []
+  // Il nodo manda gli ultimi HISTORY_PAGE messaggi per chat; i precedenti
+  // arrivano a pagine quando l'utente li chiede.
+  const HISTORY_PAGE = 100
+  let olderAvailable: Record<string, boolean> = {}
+  let loadingOlder = ''
   $: visibleContacts = contacts.filter((contact) =>
     contact.name.toLocaleLowerCase().includes(searchQuery.trim().toLocaleLowerCase())
   )
@@ -825,7 +833,16 @@
         ...conversations,
         [event.peerId]: event.messages.map(toChatMessage),
       }
+      olderAvailable = { ...olderAvailable, [event.peerId]: event.messages.length >= HISTORY_PAGE }
       scrollMessages()
+      return
+    }
+    if (event.type === 'olderMessagesLoaded') {
+      prependOlder(event.peerId, event.messages.map(toChatMessage), event.hasMore)
+      return
+    }
+    if (event.type === 'olderGroupMessagesLoaded') {
+      prependOlder(`group:${event.groupId}`, event.messages.map(toGroupChatMessage), event.hasMore)
       return
     }
     if (event.type === 'message') {
@@ -976,6 +993,7 @@
         ...conversations,
         [`group:${event.groupId}`]: event.messages.map(toGroupChatMessage),
       }
+      olderAvailable = { ...olderAvailable, [`group:${event.groupId}`]: event.messages.length >= HISTORY_PAGE }
       if (pendingGroupCreation) {
         pendingGroupCreation = false
         groupCreateOpen = false
@@ -1107,7 +1125,8 @@
 
   function toGroupChatMessage(message: ClientGroupMessage): ChatMessage {
     return {
-      id: `${message.timestampMs}-${crypto.randomUUID()}`,
+      id: message.eventId || `${message.timestampMs}-${crypto.randomUUID()}`,
+      eventId: message.eventId,
       kind: message.kind === 'file' ? 'file' : message.direction === 'out' ? 'outgoing' : 'incoming',
       body: message.body,
       emoticons: message.emoticons || [],
@@ -1401,6 +1420,44 @@
     const remaining = Math.max(0, 4000 - messageText.length)
     insertAtDraftCaret((event.clipboardData?.getData('text/plain') || '').slice(0, remaining))
     syncDraft()
+  }
+
+  async function loadOlderMessages() {
+    const key = conversationKey
+    const before = messages.find((message) => message.eventId)?.eventId
+    if (!key || !before || loadingOlder) {
+      olderAvailable = { ...olderAvailable, [key]: false }
+      return
+    }
+    loadingOlder = key
+    try {
+      if (key.startsWith('group:')) {
+        await invoke('node_load_older_group_messages', { groupId: key.slice('group:'.length), beforeEventId: before })
+      } else {
+        await invoke('node_load_older_messages', { peerId: key, beforeEventId: before })
+      }
+    } catch (error) {
+      loadingOlder = ''
+      showToast(String(error))
+    }
+  }
+
+  function prependOlder(key: string, older: ChatMessage[], hasMore: boolean) {
+    const current = conversations[key] || []
+    const known = new Set(current.map((message) => message.id))
+    const previousHeight = messageList?.scrollHeight ?? 0
+    conversations = {
+      ...conversations,
+      [key]: [...older.filter((message) => !known.has(message.id)), ...current],
+    }
+    olderAvailable = { ...olderAvailable, [key]: hasMore }
+    if (loadingOlder === key) loadingOlder = ''
+    // Resta sullo stesso messaggio invece di saltare in cima.
+    if (key === conversationKey) {
+      void tick().then(() => {
+        if (messageList) messageList.scrollTop += messageList.scrollHeight - previousHeight
+      })
+    }
   }
 
   function scrollMessages() {
@@ -2269,7 +2326,11 @@
               <p>{activeGroup ? (ready ? $t('convEmpty.groupReady') : $t('convEmpty.groupWait')) : ready ? $t('convEmpty.ready') : $t('convEmpty.offline')}</p>
             </div>
           {:else}
-            <div class="session-start"><span>{$t('msg.sessionStart')}</span></div>
+            {#if olderAvailable[conversationKey]}
+              <button class="load-older" disabled={loadingOlder === conversationKey} onclick={loadOlderMessages}>{$t('msg.loadOlder')}</button>
+            {:else}
+              <div class="session-start"><span>{$t('msg.sessionStart')}</span></div>
+            {/if}
             {#each messages as message, index (message.id)}
               {#if message.kind === 'nudge'}
                 <div class="nudge-message">

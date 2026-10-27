@@ -311,11 +311,26 @@ impl History {
     }
 
     pub fn conversation(&self, peer: &str, limit: usize) -> Result<Vec<Entry>, Box<dyn Error>> {
+        self.conversation_before(peer, None, limit)
+    }
+
+    /// I messaggi di una conversazione dal più recente, fino a `limit`. Con
+    /// `before` (id di un evento) solo quelli più vecchi di quell'evento: è il
+    /// cursore della paginazione.
+    pub fn conversation_before(
+        &self,
+        peer: &str,
+        before: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Entry>, Box<dyn Error>> {
         let mut statement = self.connection.prepare(
             "SELECT event_id, peer, direction, kind, body, timestamp_ms
-             FROM events WHERE peer = ?1 ORDER BY id DESC LIMIT ?2",
+             FROM events
+             WHERE peer = ?1
+               AND (?2 IS NULL OR id < (SELECT id FROM events WHERE event_id = ?2))
+             ORDER BY id DESC LIMIT ?3",
         )?;
-        let rows = statement.query_map(params![peer, limit as u64], |row| {
+        let rows = statement.query_map(params![peer, before, limit as u64], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1122,6 +1137,36 @@ mod tests {
         assert_eq!(entries[0].peer, "alice");
         assert_eq!(entries[0].body, "uno");
         drop(history);
+        fs::remove_file(path).ok();
+    }
+
+    /// Audit #11: oltre gli ultimi 100 messaggi la cronologia non era
+    /// raggiungibile. Il cursore `before` scorre le pagine fino all'inizio.
+    #[test]
+    fn conversation_pages_reach_the_oldest_message() {
+        let path = std::env::temp_dir().join(format!("msnnext-pages-{}.db", std::process::id()));
+        fs::remove_file(&path).ok();
+        let history = History::open(&path, [5; 32]).unwrap();
+        for index in 0..250u64 {
+            history
+                .record_with_id(&format!("id-{index:03}"), "alice", "in", "text", &format!("m{index}"), index)
+                .unwrap();
+            history.record("bob", "in", "text", "altro", index).unwrap();
+        }
+        let mut before: Option<String> = None;
+        let mut seen = Vec::new();
+        loop {
+            let page = history.conversation_before("alice", before.as_deref(), 100).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            assert!(page.iter().all(|entry| entry.peer == "alice"));
+            before = Some(page.last().unwrap().event_id.clone());
+            seen.extend(page.into_iter().map(|entry| entry.body));
+        }
+        assert_eq!(seen.len(), 250);
+        assert_eq!(seen.first().map(String::as_str), Some("m249"));
+        assert_eq!(seen.last().map(String::as_str), Some("m0"));
         fs::remove_file(path).ok();
     }
 

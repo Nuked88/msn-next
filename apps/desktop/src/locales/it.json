@@ -74,6 +74,7 @@
   "convEmpty.groupWait": "La chat sarà disponibile quando almeno un partecipante è online.",
   "convEmpty.ready": "È online. Scrivi il primo messaggio o invia un trillo.",
   "convEmpty.offline": "Potrai riprendere a chattare quando torna online.",
+  "msg.loadOlder": "Carica i messaggi precedenti",
   "msg.sessionStart": "Inizio della conversazione",
   "msg.youNudged": "Hai inviato un trillo!",
   "msg.contactNudged": "{name} ti ha inviato un trillo!",

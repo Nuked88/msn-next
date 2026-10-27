@@ -70,6 +70,9 @@ const ATTACHMENT_DECISION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Entro quanto un messaggio deve essere confermato prima del reinvio. Il
 /// timeout di libp2p è unico per il protocollo cifrato e vale 5 minuti per
 /// via delle offerte di file: per i messaggi lo accorciamo noi.
+/// Messaggi caricati per volta in una conversazione; i precedenti arrivano
+/// a pagine su richiesta della UI.
+const HISTORY_PAGE: usize = 100;
 const MESSAGE_ACK_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 20 });
 const DELIVERY_CHECK_INTERVAL: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 5 });
 
@@ -142,6 +145,15 @@ pub enum ClientCommand {
     },
     ClearGroupConversation {
         group_id: String,
+    },
+    /// Pagina di messaggi precedenti a `before_event_id` in una chat.
+    LoadOlderMessages {
+        peer: PeerId,
+        before_event_id: String,
+    },
+    LoadOlderGroupMessages {
+        group_id: String,
+        before_event_id: String,
     },
     DeleteChatGroup {
         group_id: String,
@@ -226,6 +238,7 @@ impl ClientCommand {
             | Self::AcceptContactRequest { peer }
             | Self::RejectContactRequest { peer }
             | Self::DeleteMessageForEveryone { peer, .. }
+            | Self::LoadOlderMessages { peer, .. }
             | Self::ClearConversation { peer } => Some(*peer),
             #[cfg(test)]
             Self::ForgetSession { peer } | Self::ScrambleSession { peer } => Some(*peer),
@@ -243,6 +256,7 @@ impl ClientCommand {
             | Self::SendGroupText { .. }
             | Self::SendGroupFile { .. }
             | Self::ClearGroupConversation { .. }
+            | Self::LoadOlderGroupMessages { .. }
             | Self::DeleteChatGroup { .. }
             | Self::ReadAttachment { .. }
             | Self::ExportAttachment { .. }
@@ -382,6 +396,8 @@ pub struct ClientGroupMessage {
     pub emoticons: Vec<ClientEmoticonSpan>,
     pub attachment_id: Option<String>,
     pub attachment_mime: Option<String>,
+    /// Id in cronologia: serve alla UI per chiedere i messaggi precedenti.
+    pub event_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -500,6 +516,18 @@ pub enum ClientEvent {
     GroupConversationLoaded {
         group_id: String,
         messages: Vec<ClientGroupMessage>,
+    },
+    /// Messaggi più vecchi di quelli già mostrati; `has_more` dice se ce ne
+    /// sono altri ancora.
+    OlderMessagesLoaded {
+        peer_id: String,
+        messages: Vec<ClientMessage>,
+        has_more: bool,
+    },
+    OlderGroupMessagesLoaded {
+        group_id: String,
+        messages: Vec<ClientGroupMessage>,
+        has_more: bool,
     },
     GroupMessage {
         message: ClientGroupMessage,
@@ -970,45 +998,7 @@ async fn run_node(
     let group_chats = history.group_chats()?;
     send_group_chats(&group_chats, &events);
     for group in &group_chats {
-        let messages = history
-            .conversation(&group_history_key(&group.id), 100)?
-            .into_iter()
-            .rev()
-            .filter_map(|entry| {
-                let (kind, sender_peer_id) = entry
-                    .kind
-                    .strip_prefix("group-text:")
-                    .map(|sender| ("text", sender.to_owned()))
-                    .or_else(|| {
-                        entry
-                            .kind
-                            .strip_prefix("group-file:")
-                            .map(|sender| ("file", sender.to_owned()))
-                    })?;
-                let attachment = (kind == "file")
-                    .then(|| decode_attachment(&entry.body))
-                    .flatten();
-                let text = (kind == "text").then(|| decode_text_history(&entry.body));
-                Some(ClientGroupMessage {
-                    group_id: group.id.clone(),
-                    sender_peer_id,
-                    direction: entry.direction,
-                    kind: kind.into(),
-                    body: text.as_ref().map_or_else(
-                        || {
-                            attachment
-                                .as_ref()
-                                .map_or(entry.body, |item| item.2.clone())
-                        },
-                        |message| message.text.clone(),
-                    ),
-                    timestamp_ms: entry.timestamp_ms,
-                    emoticons: text.as_ref().map(client_emoticon_spans).unwrap_or_default(),
-                    attachment_id: attachment.as_ref().map(|item| item.0.clone()),
-                    attachment_mime: attachment.map(|item| item.1),
-                })
-            })
-            .collect();
+        let messages = group_conversation_messages(&history, &group.id, None)?;
         let _ = events.send(ClientEvent::GroupConversationLoaded {
             group_id: group.id.clone(),
             messages,
@@ -1125,6 +1115,7 @@ async fn run_node(
                             emoticons: Vec::new(),
                             attachment_id: Some(attachment_hex),
                             attachment_mime: Some(manifest.mime),
+                            event_id: None,
                         }});
                     }
                     FileTarget::AllPeers => {
@@ -2039,6 +2030,7 @@ async fn run_node(
                         emoticons: emoticons.iter().map(|span| ClientEmoticonSpan { start: span.start, end: span.end, asset_id: hex_asset_id(&span.asset_id) }).collect(),
                         attachment_id: None,
                         attachment_mime: None,
+                        event_id: None,
                     }});
                 }
                 Some(ClientCommand::SendGroupFile { group_id, path }) => {
@@ -2055,6 +2047,22 @@ async fn run_node(
                         return Ok(LoopFlow::Continue);
                     }
                     prepare_file(&prepared_files_tx, FileTarget::Group { group_id, parsed_id }, path);
+                }
+                Some(ClientCommand::LoadOlderMessages { peer, before_event_id }) => {
+                    let messages = conversation_page(&history, &peer.to_string(), Some(&before_event_id))?;
+                    let _ = events.send(ClientEvent::OlderMessagesLoaded {
+                        peer_id: peer.to_string(),
+                        has_more: messages.len() == HISTORY_PAGE,
+                        messages,
+                    });
+                }
+                Some(ClientCommand::LoadOlderGroupMessages { group_id, before_event_id }) => {
+                    let messages = group_conversation_messages(&history, &group_id, Some(&before_event_id))?;
+                    let _ = events.send(ClientEvent::OlderGroupMessagesLoaded {
+                        group_id,
+                        has_more: messages.len() == HISTORY_PAGE,
+                        messages,
+                    });
                 }
                 Some(ClientCommand::ClearGroupConversation { group_id }) => {
                     match parse_group_id(&group_id).and_then(|_| history.clear_conversation(&group_history_key(&group_id)).map_err(|error| error.to_string())) {
@@ -3641,10 +3649,65 @@ fn report_loop_error(events: &mpsc::UnboundedSender<ClientEvent>, error: &dyn Er
     });
 }
 
-/// Ultimi messaggi di una conversazione nel formato atteso dalla UI.
-fn conversation_messages(history: &History, peer: &str) -> Result<Vec<ClientMessage>, Box<dyn Error>> {
+/// Una pagina di messaggi di un gruppo, dal più vecchio, fino a
+/// `HISTORY_PAGE` e prima di `before` (id evento) se indicato.
+fn group_conversation_messages(
+    history: &History,
+    group_id: &str,
+    before: Option<&str>,
+) -> Result<Vec<ClientGroupMessage>, Box<dyn Error>> {
     Ok(history
-        .conversation(peer, 100)?
+        .conversation_before(&group_history_key(group_id), before, HISTORY_PAGE)?
+            .into_iter()
+            .rev()
+            .filter_map(|entry| {
+                let (kind, sender_peer_id) = entry
+                    .kind
+                    .strip_prefix("group-text:")
+                    .map(|sender| ("text", sender.to_owned()))
+                    .or_else(|| {
+                        entry
+                            .kind
+                            .strip_prefix("group-file:")
+                            .map(|sender| ("file", sender.to_owned()))
+                    })?;
+                let attachment = (kind == "file")
+                    .then(|| decode_attachment(&entry.body))
+                    .flatten();
+                let text = (kind == "text").then(|| decode_text_history(&entry.body));
+                Some(ClientGroupMessage {
+                    group_id: group_id.to_owned(),
+                    sender_peer_id,
+                    direction: entry.direction,
+                    kind: kind.into(),
+                    body: text.as_ref().map_or_else(
+                        || {
+                            attachment
+                                .as_ref()
+                                .map_or(entry.body, |item| item.2.clone())
+                        },
+                        |message| message.text.clone(),
+                    ),
+                    timestamp_ms: entry.timestamp_ms,
+                    emoticons: text.as_ref().map(client_emoticon_spans).unwrap_or_default(),
+                    attachment_id: attachment.as_ref().map(|item| item.0.clone()),
+                    attachment_mime: attachment.map(|item| item.1),
+                    event_id: Some(entry.event_id),
+                })
+            })
+            .collect())
+}
+
+/// Messaggi più recenti di una conversazione nel formato atteso dalla UI.
+fn conversation_messages(history: &History, peer: &str) -> Result<Vec<ClientMessage>, Box<dyn Error>> {
+    conversation_page(history, peer, None)
+}
+
+/// Una pagina di messaggi di una conversazione, dal più vecchio, fino a
+/// `HISTORY_PAGE` e prima di `before` (id evento) se indicato.
+fn conversation_page(history: &History, peer: &str, before: Option<&str>) -> Result<Vec<ClientMessage>, Box<dyn Error>> {
+    Ok(history
+        .conversation_before(peer, before, HISTORY_PAGE)?
             .into_iter()
             .rev()
             .map(|entry| {
@@ -4831,6 +4894,7 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                         .collect(),
                     attachment_id: None,
                     attachment_mime: None,
+                    event_id: None,
                 },
             });
             notify(
@@ -4875,6 +4939,7 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
                             emoticons: Vec::new(),
                             attachment_id: Some(hex_asset_id(&offer.manifest.attachment_id)),
                             attachment_mime: Some(offer.manifest.mime.clone()),
+                            event_id: None,
                         },
                     });
                     match completed {
@@ -5587,45 +5652,7 @@ fn refresh_synced_state(
         });
     }
     for group in history.group_chats()? {
-        let messages = history
-            .conversation(&group_history_key(&group.id), 100)?
-            .into_iter()
-            .rev()
-            .filter_map(|entry| {
-                let (kind, sender_peer_id) = entry
-                    .kind
-                    .strip_prefix("group-text:")
-                    .map(|sender| ("text", sender.to_owned()))
-                    .or_else(|| {
-                        entry
-                            .kind
-                            .strip_prefix("group-file:")
-                            .map(|sender| ("file", sender.to_owned()))
-                    })?;
-                let attachment = (kind == "file")
-                    .then(|| decode_attachment(&entry.body))
-                    .flatten();
-                let text = (kind == "text").then(|| decode_text_history(&entry.body));
-                Some(ClientGroupMessage {
-                    group_id: group.id.clone(),
-                    sender_peer_id,
-                    direction: entry.direction,
-                    kind: kind.into(),
-                    body: text.as_ref().map_or_else(
-                        || {
-                            attachment
-                                .as_ref()
-                                .map_or(entry.body, |item| item.2.clone())
-                        },
-                        |message| message.text.clone(),
-                    ),
-                    timestamp_ms: entry.timestamp_ms,
-                    emoticons: text.as_ref().map(client_emoticon_spans).unwrap_or_default(),
-                    attachment_id: attachment.as_ref().map(|item| item.0.clone()),
-                    attachment_mime: attachment.map(|item| item.1),
-                })
-            })
-            .collect();
+        let messages = group_conversation_messages(history, &group.id, None)?;
         let _ = events.send(ClientEvent::GroupConversationLoaded {
             group_id: group.id,
             messages,
