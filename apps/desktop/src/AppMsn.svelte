@@ -1996,7 +1996,11 @@
   function openMessageMenu(event: MouseEvent, message: ChatMessage) {
     if (message.deleted || message.kind === 'nudge') return
     event.preventDefault()
-    messageMenu = { message, x: event.clientX, y: event.clientY }
+    messageMenu = {
+      message,
+      x: Math.min(event.clientX, window.innerWidth - 230),
+      y: Math.min(event.clientY, window.innerHeight - (canDeleteForEveryone(message) ? 90 : 55)),
+    }
   }
 
   function closeMessageMenu() {
@@ -2127,12 +2131,12 @@
         </button>
         {#if statusMenuOpen}
           <button class="context-scrim" aria-label={$t('ctx.close')} onclick={() => statusMenuOpen = false}></button>
-          <div class="status-menu" role="menu">
+          <div class="popup-menu status-menu" role="menu">
             {#if running}
               <button role="menuitem" onclick={() => setPresenceStatus('online')}><i class="status-dot" data-status="online"></i>{$t('status.online')}</button>
               <button role="menuitem" onclick={() => setPresenceStatus('busy')}><i class="status-dot" data-status="busy"></i>{$t('status.busy')}</button>
               <button role="menuitem" onclick={() => setPresenceStatus('away')}><i class="status-dot" data-status="away"></i>{$t('status.away')}</button>
-              <div class="status-sep"></div>
+              <div class="menu-separator" role="separator"></div>
               <button role="menuitem" class="danger-item" onclick={() => { statusMenuOpen = false; void stopNode() }}>{$t('action.disconnect')}</button>
             {:else}
               <button role="menuitem" onclick={() => { statusMenuOpen = false; void startNode(false) }}>{$t('action.connect')}</button>
@@ -2496,21 +2500,21 @@
 {#if contextPeerId || contextGroupId}
   {@const contextConversation = contextGroupId ? groupConversationKey(contextGroupId) : peerConversationKey(contextPeerId)}
   <button class="context-scrim" aria-label={$t('ctx.close')} onclick={closeContextMenu}></button>
-  <div class="contact-context-menu" style={`left:${contextX}px;top:${contextY}px`} role="menu">
-    <button onclick={() => { contextGroupId ? selectGroup(contextGroupId) : selectContact(contextPeerId); closeContextMenu() }}>{$t('ctx.open')}</button>
-    {#if contextPeerId}<button onclick={() => manageContact(contextPeerId)}>{$t('ctx.rename')}</button>{/if}
-    <div class="context-separator"></div>
-    <small>{$t('ctx.notifications')}</small>
+  <div class="popup-menu contact-context-menu" style={`left:${contextX}px;top:${contextY}px`} role="menu">
+    <button role="menuitem" onclick={() => { contextGroupId ? selectGroup(contextGroupId) : selectContact(contextPeerId); closeContextMenu() }}>{$t('ctx.open')}</button>
+    {#if contextPeerId}<button role="menuitem" onclick={() => manageContact(contextPeerId)}>{$t('ctx.rename')}</button>{/if}
+    <div class="menu-separator" role="separator"></div>
+    <small class="menu-label">{$t('ctx.notifications')}</small>
     {#if isConversationMuted(contextConversation)}
-      <button onclick={() => unmuteConversation(contextConversation)}>{$t('ctx.unmute')}</button>
+      <button role="menuitem" onclick={() => unmuteConversation(contextConversation)}>{$t('ctx.unmute')}</button>
     {:else}
-      <button onclick={() => muteConversation(contextConversation, 60 * 60 * 1000)}>{$t('ctx.mute1h')}</button>
-      <button onclick={() => muteConversation(contextConversation, 8 * 60 * 60 * 1000)}>{$t('ctx.mute8h')}</button>
-      <button onclick={() => muteConversation(contextConversation, null)}>{$t('ctx.muteAlways')}</button>
+      <button role="menuitem" onclick={() => muteConversation(contextConversation, 60 * 60 * 1000)}>{$t('ctx.mute1h')}</button>
+      <button role="menuitem" onclick={() => muteConversation(contextConversation, 8 * 60 * 60 * 1000)}>{$t('ctx.mute8h')}</button>
+      <button role="menuitem" onclick={() => muteConversation(contextConversation, null)}>{$t('ctx.muteAlways')}</button>
     {/if}
     {#if contextPeerId}
-    <div class="context-separator"></div>
-    <button class="danger-item" onclick={() => { selectContact(contextPeerId); closeContextMenu(); void deleteContact() }}>{$t('ctx.deleteContact')}</button>
+    <div class="menu-separator" role="separator"></div>
+    <button role="menuitem" class="danger-item" onclick={() => { selectContact(contextPeerId); closeContextMenu(); void deleteContact() }}>{$t('ctx.deleteContact')}</button>
     {/if}
   </div>
 {/if}
@@ -2913,10 +2917,10 @@
 {#if messageMenu}
   {@const menu = messageMenu}
   <button class="context-scrim" aria-label={$t('ctx.close')} onclick={closeMessageMenu}></button>
-  <div class="contact-context-menu" style={`left:${menu.x}px;top:${menu.y}px`} role="menu">
-    <button onclick={() => deleteMessageForMe(menu.message)}>{$t('msg.deleteForMe')}</button>
+  <div class="popup-menu contact-context-menu" style={`left:${menu.x}px;top:${menu.y}px`} role="menu">
+    <button role="menuitem" onclick={() => deleteMessageForMe(menu.message)}>{$t('msg.deleteForMe')}</button>
     {#if canDeleteForEveryone(menu.message)}
-      <button class="danger-item" onclick={() => deleteMessageForEveryone(menu.message)}>{$t('msg.deleteForEveryone')}</button>
+      <button role="menuitem" class="danger-item" onclick={() => deleteMessageForEveryone(menu.message)}>{$t('msg.deleteForEveryone')}</button>
     {/if}
   </div>
 {/if}
