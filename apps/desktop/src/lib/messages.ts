@@ -62,7 +62,7 @@ export function builtinMessageParts<Custom>(text: string): MessagePart<Custom>[]
 }
 
 /** Divide il testo in parti: testo, emoticon predefinite e personalizzate. */
-export function messageParts<Custom extends { assetId: string }>(
+export function messageParts<Custom extends { assetId: string; aliases?: string[] }>(
   body: string,
   spans: EmoticonSpan[],
   available: Custom[],
@@ -76,6 +76,7 @@ export function messageParts<Custom extends { assetId: string }>(
     if (start < cursor || end <= start) continue
     parts.push(...builtinMessageParts<Custom>(body.slice(cursor, start)))
     const custom = available.find((item) => item.assetId === span.assetId)
+      ?? available.find((item) => item.aliases?.includes(span.assetId))
     parts.push(custom
       ? { text: body.slice(start, end), custom }
       : { text: body.slice(start, end) })

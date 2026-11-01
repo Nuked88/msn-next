@@ -114,6 +114,8 @@
     dataUrl: string
     animated: boolean
     saved: boolean
+    /** Id originale di un'emoticon ricevuta e poi salvata (usato nei messaggi di chi l'ha mandata). */
+    aliases?: string[]
   }
 
   type ChatMessage = {
@@ -179,6 +181,7 @@
     | { type: 'emoticonCatalog'; emoticons: ClientEmoticon[] }
     | { type: 'emoticonOffered'; peerId: string; emoticon: ClientEmoticon }
     | { type: 'emoticonRemoved'; assetId: string }
+    | { type: 'contactAvatar'; peerId: string; dataUrl: string | null }
     | { type: 'contactLink'; link: string; qrLink: string }
     | { type: 'invite'; code: string; expiresAtMs: number }
     | { type: 'inviteCompleted'; peerId: string; name: string; inviter: boolean }
@@ -478,6 +481,8 @@
   const deleteEveryoneWindowMs = 15 * 60 * 1000
   let messageMenu: { message: ChatMessage; x: number; y: number } | null = null
   let contactStatuses: Record<string, string> = {}
+  /** Avatar dei contatti, già ricodificati dal nodo locale. */
+  let contactAvatars: Record<string, string> = {}
   let presenceStatus = 'online'
   let statusMenuOpen = false
   // Composizione IME/tastiera mobile: alcune riportano isComposing male, così
@@ -904,6 +909,7 @@
     linkedDevices = []
     contactRequests = []
     contactStatuses = {}
+    contactAvatars = {}
     customEmoticons = []
     offeredEmoticons = []
     incomingAttachmentOffers = []
@@ -979,6 +985,13 @@
     if (event.type === 'messageFailed') {
       markMessageFailed(event.eventId)
       showToast($t('toast.messageNotDelivered', { reason: event.reason }))
+      return
+    }
+    if (event.type === 'contactAvatar') {
+      const next = { ...contactAvatars }
+      if (event.dataUrl) next[event.peerId] = event.dataUrl
+      else delete next[event.peerId]
+      contactAvatars = next
       return
     }
     if (event.type === 'contactStatus') {
@@ -1337,7 +1350,8 @@
       ...customEmoticons.filter((item) => item.assetId !== emoticon.assetId),
       emoticon,
     ].sort((a, b) => a.trigger.localeCompare(b.trigger))
-    offeredEmoticons = offeredEmoticons.filter((item) => item.assetId !== emoticon.assetId)
+    const replaced = new Set([emoticon.assetId, ...(emoticon.aliases || [])])
+    offeredEmoticons = offeredEmoticons.filter((item) => !replaced.has(item.assetId))
   }
 
   function addMessage(message: ClientMessage) {
@@ -2561,7 +2575,7 @@
               onclick={() => selectContact(contact.peerId)}
             >
               <span class:offline={!contact.online} class="avatar-shell contact-avatar">
-                <span>{contact.name.slice(0, 1).toUpperCase()}</span>
+                {#if contactAvatars[contact.peerId]}<img src={contactAvatars[contact.peerId]} alt="" />{:else}<span>{contact.name.slice(0, 1).toUpperCase()}</span>{/if}
                 <i class:online={contact.online} data-status={contact.online ? (contactStatuses[contact.peerId] || 'online') : 'offline'}></i>
               </span>
               <span class="contact-copy"><strong>{contact.name}</strong><small>{contactSubtitle(contact)}</small></span>
@@ -2599,7 +2613,7 @@
             <Menu size={19} />
           </button>
           <div class="avatar-shell large">
-            {#if activeGroup}<UsersRound size={20} />{:else}<span>{activeContact?.name.slice(0, 1).toUpperCase() || '?'}</span>{/if}
+            {#if activeGroup}<UsersRound size={20} />{:else if activeContact && contactAvatars[activeContact.peerId]}<img src={contactAvatars[activeContact.peerId]} alt="" />{:else}<span>{activeContact?.name.slice(0, 1).toUpperCase() || '?'}</span>{/if}
             {#if activeContact}<i class:online={activeContact.online}></i>{/if}
           </div>
           <span>
@@ -2645,7 +2659,7 @@
           {:else if messages.length === 0}
             <div class="conversation-empty">
               <div class="avatar-shell hero-avatar">
-                {#if activeGroup}<UsersRound size={30} />{:else}<span>{activeContact?.name.slice(0, 1).toUpperCase()}</span><i class:online={activeContact?.online}></i>{/if}
+                {#if activeGroup}<UsersRound size={30} />{:else}{#if activeContact && contactAvatars[activeContact.peerId]}<img src={contactAvatars[activeContact.peerId]} alt="" />{:else}<span>{activeContact?.name.slice(0, 1).toUpperCase()}</span>{/if}<i class:online={activeContact?.online}></i>{/if}
               </div>
               <h2>{activeGroup?.name || activeContact?.name}</h2>
               <p>{activeGroup ? (ready ? $t('convEmpty.groupReady') : $t('convEmpty.groupWait')) : ready ? $t('convEmpty.ready') : $t('convEmpty.offline')}</p>
@@ -2706,7 +2720,7 @@
             <header><strong>{$t('details.title')}</strong><button aria-label={$t('details.close')} onclick={() => detailsOpen = false}><X size={17} /></button></header>
             <div class="detail-profile">
               <div class="avatar-shell profile-avatar">
-                {#if activeGroup}<UsersRound size={25} />{:else}<span>{activeContact?.name.slice(0, 1).toUpperCase() || displayName.slice(0, 1).toUpperCase()}</span><i class:online={activeContact?.online || running}></i>{/if}
+                {#if activeGroup}<UsersRound size={25} />{:else}{#if activeContact && contactAvatars[activeContact.peerId]}<img src={contactAvatars[activeContact.peerId]} alt="" />{:else if !activeContact && avatarDataUrl}<img src={avatarDataUrl} alt="" />{:else}<span>{activeContact?.name.slice(0, 1).toUpperCase() || displayName.slice(0, 1).toUpperCase()}</span>{/if}<i class:online={activeContact?.online || running}></i>{/if}
               </div>
               <strong>{activeGroup?.name || activeContact?.name || displayName}</strong>
               <small>{activeGroup ? $t('roster.participants', { count: activeGroup.members.length }) : activeContact ? (activeContact.online ? $t('profile.available') : $t('profile.offline')) : (running ? $t('details.online') : $t('profile.offline'))}</small>

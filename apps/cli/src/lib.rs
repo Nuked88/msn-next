@@ -4,6 +4,7 @@ mod contacts;
 mod crypto;
 mod devices;
 mod history;
+mod images;
 mod invite;
 
 use attachments::{
@@ -43,9 +44,10 @@ use libp2p::{
 pub use msnnext_protocol::MAX_TEXT_BYTES;
 use msnnext_protocol::{
     resolve_emoticons, validate_text_message, validate_triggers, AccountProof, AttachmentCancel,
-    AttachmentManifest, ChatEvent, DeleteRequest, Emoticon, EmoticonOffer, EmoticonSpan, Envelope,
-    GroupAttachmentOffer, GroupBan, GroupDefinition, GroupTextMessage, Mime, Nudge, NudgeRateLimit,
-    PresenceUpdate, ProtocolResponse, TextMessage, Trigger, PROTOCOL_VERSION,
+    AttachmentManifest, AvatarRequest, AvatarUpdate, ChatEvent, DeleteRequest, Emoticon,
+    EmoticonOffer, EmoticonSpan, Envelope, GroupAttachmentOffer, GroupBan, GroupDefinition,
+    GroupTextMessage, Mime, Nudge, NudgeRateLimit, PresenceUpdate, ProtocolResponse, TextMessage,
+    Trigger, PROTOCOL_VERSION,
 };
 use serde::Serialize;
 use std::{
@@ -75,6 +77,8 @@ const MAX_PENDING_CONTACT_REQUESTS: usize = 20;
 const MAX_PENDING_INBOUND_OFFERS: usize = 8;
 /// Emoticon ricevute in attesa di salvataggio (fino a ~350 KB l'una).
 const MAX_PENDING_EMOTICONS: usize = 64;
+/// Avatar annunciati in attesa di essere richiesti.
+const MAX_WANTED_AVATARS: usize = 256;
 const ATTACHMENT_DECISION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Messaggi caricati per volta in una conversazione; i precedenti arrivano
 /// a pagine su richiesta della UI.
@@ -233,6 +237,9 @@ pub enum ClientCommand {
     UpdateDisplayName {
         name: String,
     },
+    /// L'immagine del profilo è cambiata (o è stata tolta): la rilegge e lo
+    /// annuncia ai contatti, che chiedono la nuova versione.
+    RefreshAvatar,
     /// Esclude un dispositivo collegato (perso, venduto) e cambia la chiave di
     /// account, così quel dispositivo non può più sincronizzarsi né firmare
     /// a nome dell'account.
@@ -312,6 +319,7 @@ impl ClientCommand {
             | Self::RequestDeviceLink
             | Self::ImportDeviceLink { .. }
             | Self::UpdateDisplayName { .. }
+            | Self::RefreshAvatar
             | Self::RevokeDevice { .. }
             | Self::AnswerAccountRotation { .. }
             | Self::Shutdown => None,
@@ -431,6 +439,10 @@ pub struct ClientEmoticon {
     pub data_url: String,
     pub animated: bool,
     pub saved: bool,
+    /// Id con cui i contatti si riferiscono a questa emoticon: una ricevuta e
+    /// poi salvata ha un id nuovo (quello dei byte ricodificati), ma i
+    /// messaggi di chi l'ha mandata usano ancora quello originale.
+    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -523,6 +535,11 @@ pub enum ClientEvent {
     },
     EmoticonRemoved {
         asset_id: String,
+    },
+    /// Avatar di un contatto, già ricodificato in locale; `None` se l'ha tolto.
+    ContactAvatar {
+        peer_id: String,
+        data_url: Option<String>,
     },
     ContactLink {
         link: String,
@@ -746,7 +763,14 @@ struct PendingPairing {
 }
 
 struct Incoming<'a> {
-    pending_emoticons: &'a mut HashMap<[u8; 32], EmoticonOffer>,
+    pending_emoticons: &'a mut HashMap<[u8; 32], Emoticon>,
+    emotes: &'a Path,
+    avatars: &'a images::AvatarCache,
+    image_jobs: &'a images::ImageJobs,
+    /// Contatti di cui serve chiedere l'avatar annunciato nella presence.
+    wanted_avatars: &'a mut HashMap<PeerId, [u8; 32]>,
+    /// Contatti che ci hanno chiesto il nostro avatar.
+    avatar_requests: &'a mut HashSet<PeerId>,
     events: &'a mpsc::UnboundedSender<ClientEvent>,
     nudge_limits: &'a mut HashMap<PeerId, NudgeRateLimit>,
     attachments: &'a mut Receiver,
@@ -1069,7 +1093,14 @@ async fn run_node(
     // Offerte di file pronte per un contatto connesso ma ancora senza
     // sessione cifrata: partono quando l'handshake si completa.
     let waiting_offers = HashMap::<PeerId, Vec<PendingOffer>>::new();
-    let pending_emoticons = HashMap::<[u8; 32], EmoticonOffer>::new();
+    let pending_emoticons = HashMap::<[u8; 32], Emoticon>::new();
+    let avatar_cache = images::AvatarCache::new(args.avatars.clone());
+    let image_jobs = images::ImageJobs::default();
+    let wanted_avatars = HashMap::<PeerId, [u8; 32]>::new();
+    let avatar_requests = HashSet::<PeerId>::new();
+    let own_avatar = load_own_avatar(args.avatar.as_deref());
+    let own_avatar_id = own_avatar.as_ref().map(|avatar| avatar.avatar_id);
+    images::prune_received_emoticons(&args.emotes);
     let attachment_receiver = Receiver::new(args.downloads.clone(), attachment_key);
     // Lavoro pesante sui file (hash in invio, verifica finale in ricezione)
     // fuori dal loop: i risultati tornano su questi canali.
@@ -1196,10 +1227,18 @@ async fn run_node(
         .filter_map(|trigger| {
             load_emoticon_offer(&args.emotes, trigger)
                 .ok()
-                .map(|offer| client_emoticon(&offer, &trigger.text, true))
+                .map(|offer| client_emoticon(&args.emotes, &offer, &trigger.text))
         })
         .collect();
     let _ = events.send(ClientEvent::EmoticonCatalog { emoticons });
+    for contact in history.contacts()? {
+        if let Some(data_url) = avatar_cache.data_url(&contact.peer) {
+            let _ = events.send(ClientEvent::ContactAvatar {
+                peer_id: contact.peer,
+                data_url: Some(data_url),
+            });
+        }
+    }
     let _ = events.send(ClientEvent::Ready);
 
     let revoked_devices = history
@@ -1262,6 +1301,12 @@ async fn run_node(
         shared_emoticons,
         waiting_offers,
         pending_emoticons,
+        avatar_cache,
+        image_jobs,
+        wanted_avatars,
+        avatar_requests,
+        own_avatar,
+        own_avatar_id,
         attachment_receiver,
         prepared_files_tx,
         prepared_files,
@@ -1378,7 +1423,13 @@ struct Node {
     decrypt_failures: HashMap<PeerId, u8>,
     shared_emoticons: HashSet<(PeerId, [u8; 32])>,
     waiting_offers: HashMap<PeerId, Vec<PendingOffer>>,
-    pending_emoticons: HashMap<[u8; 32], EmoticonOffer>,
+    pending_emoticons: HashMap<[u8; 32], Emoticon>,
+    avatar_cache: images::AvatarCache,
+    image_jobs: images::ImageJobs,
+    wanted_avatars: HashMap<PeerId, [u8; 32]>,
+    avatar_requests: HashSet<PeerId>,
+    own_avatar: Option<AvatarUpdate>,
+    own_avatar_id: Option<[u8; 32]>,
     attachment_receiver: attachments::Receiver,
     prepared_files_tx: mpsc::UnboundedSender<PreparedFile>,
     prepared_files: mpsc::UnboundedReceiver<PreparedFile>,
@@ -1749,6 +1800,7 @@ impl Node {
         let Node {
             local_peer_id,
             account_proof,
+            own_avatar_id,
             swarm,
             display_name,
             peers,
@@ -1757,6 +1809,9 @@ impl Node {
             pending_handshakes,
             presence_status,
             sessions,
+            wanted_avatars,
+            avatar_requests,
+            own_avatar,
             ..
         } = self;
         let local_peer_id = *local_peer_id;
@@ -1790,10 +1845,21 @@ impl Node {
                         presence_status,
                         true,
                         account_proof,
+                        own_avatar_id,
                     )),
                 );
             }
         }
+        exchange_avatars(
+            swarm,
+            sessions,
+            contact_devices,
+            local_peer_id,
+            sent_numbers,
+            wanted_avatars,
+            avatar_requests,
+            own_avatar,
+        );
         pending_handshakes.rekey_due_sessions(swarm, sessions, local_peer_id);
         Ok(LoopFlow::Continue)
     }
@@ -2064,6 +2130,9 @@ impl Node {
         let Node {
             local_peer_id,
             account_proof,
+            own_avatar_id,
+            own_avatar,
+            args,
             swarm,
             display_name,
             peers,
@@ -2180,9 +2249,29 @@ impl Node {
                             presence_status,
                             true,
                             account_proof,
+                            own_avatar_id,
                         )),
                     );
                 }
+            }
+            Some(ClientCommand::RefreshAvatar) => {
+                *own_avatar = load_own_avatar(args.avatar.as_deref());
+                *own_avatar_id = own_avatar.as_ref().map(|avatar| avatar.avatar_id);
+                broadcast(
+                    swarm,
+                    sessions,
+                    contact_devices,
+                    peers,
+                    local_peer_id,
+                    sent_numbers,
+                    ChatEvent::Presence(presence_update(
+                        display_name,
+                        presence_status,
+                        true,
+                        account_proof,
+                        own_avatar_id,
+                    )),
+                );
             }
             Some(ClientCommand::SetNotificationMute {
                 conversation,
@@ -2207,7 +2296,13 @@ impl Node {
                     "busy" | "away" => status,
                     _ => "online".to_string(),
                 };
-                let update = presence_update(display_name, presence_status, true, account_proof);
+                let update = presence_update(
+                    display_name,
+                    presence_status,
+                    true,
+                    account_proof,
+                    own_avatar_id,
+                );
                 for &peer in peers.iter() {
                     send_event(
                         swarm,
@@ -2857,6 +2952,7 @@ impl Node {
             history,
             local_peer_id,
             account_proof,
+            own_avatar_id,
             swarm,
             relay_addresses,
             display_name,
@@ -2995,6 +3091,7 @@ impl Node {
                     presence_status,
                     true,
                     account_proof,
+                    own_avatar_id,
                 )),
             );
             // Avvia subito l'handshake appena la connessione è su, senza
@@ -3021,6 +3118,7 @@ impl Node {
             ignored_contacts,
             local_peer_id,
             account_proof,
+            own_avatar_id,
             swarm,
             display_name,
             peers,
@@ -3036,6 +3134,10 @@ impl Node {
             presence_status,
             sessions,
             pending_emoticons,
+            avatar_cache,
+            image_jobs,
+            wanted_avatars,
+            avatar_requests,
             attachment_receiver,
             vault_jobs_tx,
             incoming_attachments,
@@ -3094,6 +3196,11 @@ impl Node {
                             &request.event,
                             &mut Incoming {
                                 pending_emoticons,
+                                emotes: &args.emotes,
+                                avatars: avatar_cache,
+                                image_jobs,
+                                wanted_avatars,
+                                avatar_requests,
                                 events,
                                 nudge_limits: incoming_nudge_limits,
                                 attachments: attachment_receiver,
@@ -3195,6 +3302,7 @@ impl Node {
                                     presence_status,
                                     true,
                                     account_proof,
+                                    own_avatar_id,
                                 )),
                             );
                         }
@@ -3238,6 +3346,7 @@ impl Node {
             ignored_contacts,
             local_peer_id,
             account_proof,
+            own_avatar_id,
             swarm,
             display_name,
             pending_contact_requests,
@@ -3262,6 +3371,10 @@ impl Node {
             shared_emoticons,
             waiting_offers,
             pending_emoticons,
+            avatar_cache,
+            image_jobs,
+            wanted_avatars,
+            avatar_requests,
             attachment_receiver,
             vault_jobs_tx,
             incoming_attachments,
@@ -3324,6 +3437,7 @@ impl Node {
                                         presence_status,
                                         true,
                                         account_proof,
+                                        own_avatar_id,
                                     )),
                                 );
                             }
@@ -3355,6 +3469,11 @@ impl Node {
                                             &envelope.event,
                                             &mut Incoming {
                                                 pending_emoticons,
+                                                emotes: &args.emotes,
+                                                avatars: avatar_cache,
+                                                image_jobs,
+                                                wanted_avatars,
+                                                avatar_requests,
                                                 events,
                                                 nudge_limits: incoming_nudge_limits,
                                                 attachments: attachment_receiver,
@@ -3524,6 +3643,11 @@ impl Node {
                                 &envelope.event,
                                 &mut Incoming {
                                     pending_emoticons,
+                                    emotes: &args.emotes,
+                                    avatars: avatar_cache,
+                                    image_jobs,
+                                    wanted_avatars,
+                                    avatar_requests,
                                     events,
                                     nudge_limits: incoming_nudge_limits,
                                     attachments: attachment_receiver,
@@ -3736,6 +3860,7 @@ impl Node {
             display_name,
             presence_status,
             account_proof,
+            own_avatar_id,
             ignored_contacts,
             local_peer_id,
             swarm,
@@ -3863,6 +3988,7 @@ impl Node {
                                             presence_status,
                                             true,
                                             account_proof,
+                                            own_avatar_id,
                                         )),
                                     );
                                 }
@@ -3941,6 +4067,7 @@ impl Node {
             local_peer_id,
             account_identity,
             account_proof,
+            own_avatar_id,
             swarm,
             display_name,
             peers,
@@ -4141,6 +4268,7 @@ impl Node {
                                         presence_status,
                                         true,
                                         account_proof,
+                                        own_avatar_id,
                                     )),
                                 );
                             }
@@ -4515,6 +4643,7 @@ impl Node {
                                     presence_status,
                                     true,
                                     account_proof,
+                                    own_avatar_id,
                                 )),
                             );
                         }
@@ -5479,7 +5608,7 @@ impl Node {
                             .cloned()
                             .unwrap_or_default();
                         let _ = events.send(ClientEvent::EmoticonCatalog {
-                            emoticons: vec![client_emoticon(&offer, &trigger, true)],
+                            emoticons: vec![client_emoticon(&args.emotes, &offer, &trigger)],
                         });
                     }
                     Err(error) => {
@@ -5498,15 +5627,24 @@ impl Node {
                         .get(&asset_id)
                         .cloned()
                         .ok_or_else(|| "emoticon ricevuta non disponibile".to_owned())
-                        .map(|offer| (asset_id, offer))
+                        .map(|metadata| (asset_id, metadata))
                 }) {
-                    Ok((asset_id, mut offer)) => {
-                        offer.metadata.suggested_triggers = vec![trigger.trim().to_owned()];
-                        match save_offer(&args.emotes, &offer, triggers) {
-                            Ok(_) => {
+                    Ok((asset_id, metadata)) => {
+                        match save_received_emoticon(
+                            &args.emotes,
+                            asset_id,
+                            &metadata,
+                            &trigger,
+                            triggers,
+                        ) {
+                            Ok(offer) => {
                                 pending_emoticons.remove(&asset_id);
                                 let _ = events.send(ClientEvent::EmoticonCatalog {
-                                    emoticons: vec![client_emoticon(&offer, trigger.trim(), true)],
+                                    emoticons: vec![client_emoticon(
+                                        &args.emotes,
+                                        &offer,
+                                        trigger.trim(),
+                                    )],
                                 });
                             }
                             Err(error) => {
@@ -5537,7 +5675,7 @@ impl Node {
                 }) {
                     Ok((offer, trigger)) => {
                         let _ = events.send(ClientEvent::EmoticonCatalog {
-                            emoticons: vec![client_emoticon(&offer, &trigger, true)],
+                            emoticons: vec![client_emoticon(&args.emotes, &offer, &trigger)],
                         });
                     }
                     Err(message) => {
@@ -5569,6 +5707,7 @@ impl Node {
             ignored_contacts,
             local_peer_id,
             account_proof,
+            own_avatar_id,
             swarm,
             display_name,
             peers,
@@ -5703,6 +5842,7 @@ impl Node {
                             presence_status,
                             true,
                             account_proof,
+                            own_avatar_id,
                         )),
                     );
                     maybe_start_hybrid_handshake(
@@ -6094,6 +6234,10 @@ impl Node {
             sessions,
             waiting_offers,
             pending_emoticons,
+            avatar_cache,
+            image_jobs,
+            wanted_avatars,
+            avatar_requests,
             attachment_receiver,
             vault_jobs_tx,
             incoming_attachments,
@@ -6205,6 +6349,11 @@ impl Node {
                     &pending.event,
                     &mut Incoming {
                         pending_emoticons,
+                        emotes: &args.emotes,
+                        avatars: avatar_cache,
+                        image_jobs,
+                        wanted_avatars,
+                        avatar_requests,
                         events,
                         nudge_limits: incoming_nudge_limits,
                         attachments: attachment_receiver,
@@ -6431,6 +6580,7 @@ impl Node {
                     &self.presence_status,
                     true,
                     &self.account_proof,
+                    &self.own_avatar_id,
                 )),
             );
         }
@@ -7125,17 +7275,71 @@ fn merge_target(contacts: &[ContactEntry], first: PeerId, second: PeerId) -> (Pe
     }
 }
 
+/// Chiede gli avatar annunciati che non abbiamo e risponde a chi ha chiesto
+/// il nostro, appena con quel contatto c'è un canale cifrato.
+#[allow(clippy::too_many_arguments)]
+fn exchange_avatars(
+    swarm: &mut Swarm<Behaviour>,
+    sessions: &mut HashMap<PeerId, RatchetSession>,
+    contact_devices: &ContactDevices,
+    local_peer_id: PeerId,
+    sent_numbers: &mut HashMap<PeerId, u64>,
+    wanted_avatars: &mut HashMap<PeerId, [u8; 32]>,
+    avatar_requests: &mut HashSet<PeerId>,
+    own_avatar: &Option<AvatarUpdate>,
+) {
+    let ready = wanted_avatars
+        .iter()
+        .filter(|(contact, _)| contact_devices.secure(**contact, sessions))
+        .map(|(contact, avatar_id)| (*contact, *avatar_id))
+        .collect::<Vec<_>>();
+    for (contact, avatar_id) in ready {
+        // Se la risposta si perde, la prossima presence lo richiede.
+        wanted_avatars.remove(&contact);
+        send_event(
+            swarm,
+            sessions,
+            contact_devices,
+            contact,
+            local_peer_id,
+            sent_numbers,
+            ChatEvent::AvatarRequest(AvatarRequest { avatar_id }),
+        );
+    }
+    let asked = avatar_requests
+        .iter()
+        .copied()
+        .filter(|contact| contact_devices.secure(*contact, sessions))
+        .collect::<Vec<_>>();
+    for contact in asked {
+        avatar_requests.remove(&contact);
+        if let Some(avatar) = own_avatar {
+            send_event(
+                swarm,
+                sessions,
+                contact_devices,
+                contact,
+                local_peer_id,
+                sent_numbers,
+                ChatEvent::Avatar(avatar.clone()),
+            );
+        }
+    }
+}
+
 fn presence_update(
     display_name: &str,
     status: &str,
     online: bool,
     account: &Option<AccountProof>,
+    avatar: &Option<[u8; 32]>,
 ) -> PresenceUpdate {
     PresenceUpdate {
         display_name: display_name.to_owned(),
         online,
         status: status.to_owned(),
         account: account.clone(),
+        avatar: *avatar,
     }
 }
 
@@ -7223,6 +7427,7 @@ fn client_event_from_chat(
             },
         }),
         ChatEvent::EmoticonOffer(_) => None,
+        ChatEvent::AvatarRequest(_) | ChatEvent::Avatar(_) => None,
         ChatEvent::AttachmentChunk(_) => None,
         ChatEvent::DeleteMessage(_) | ChatEvent::AttachmentCancelled(_) => None,
         ChatEvent::GroupDefinition(_)
@@ -8403,29 +8608,7 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
         {
             ProtocolResponse::Rejected("troppe emoticon in attesa".into())
         }
-        ChatEvent::EmoticonOffer(offer) => match validate_offer(offer) {
-            Ok(()) => {
-                let trigger = offer
-                    .metadata
-                    .suggested_triggers
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        format!(":e{}:", &hex_asset_id(&offer.metadata.asset_id)[..6])
-                    });
-                context
-                    .pending_emoticons
-                    .insert(offer.metadata.asset_id, offer.clone());
-                let _ = context.events.send(ClientEvent::EmoticonOffered {
-                    peer_id: peer.to_string(),
-                    emoticon: client_emoticon(offer, &trigger, false),
-                });
-                log::info!("{peer}: emoticon ricevuta, in attesa di salvataggio");
-                record(context.history, &peer, "in", "emote", &offer.metadata.name);
-                ProtocolResponse::Ack
-            }
-            Err(error) => ProtocolResponse::Rejected(error.to_string()),
-        },
+        ChatEvent::EmoticonOffer(offer) => receive_emoticon_offer(peer, offer, context),
         ChatEvent::AttachmentOffer(manifest) => {
             match context.attachments.accept_offer(manifest.clone()) {
                 Ok((missing, completed)) => {
@@ -8472,17 +8655,218 @@ fn receive_event(peer: PeerId, event: &ChatEvent, context: &mut Incoming<'_>) ->
             Ok(None) => ProtocolResponse::Ack,
             Err(error) => ProtocolResponse::Rejected(error.to_string()),
         },
+        ChatEvent::AvatarRequest(_) => {
+            // Risposta al prossimo giro del loop, che ha accesso alla rete.
+            context.avatar_requests.insert(peer);
+            ProtocolResponse::Ack
+        }
+        ChatEvent::Avatar(update) => receive_avatar(peer, update, context),
         ChatEvent::Presence(presence) => {
             context
                 .peer_names
                 .entry(peer)
                 .or_insert_with(|| presence.display_name.clone());
+            note_announced_avatar(peer, presence.avatar, context);
             log::info!(
                 "{} è {}",
                 presence.display_name,
                 if presence.online { "online" } else { "offline" }
             );
             ProtocolResponse::Ack
+        }
+    }
+}
+
+/// Confronta l'avatar annunciato da un contatto con quello in cache: se è
+/// diverso lo si chiede, se il contatto l'ha tolto lo si toglie.
+fn note_announced_avatar(peer: PeerId, announced: Option<[u8; 32]>, context: &mut Incoming<'_>) {
+    let key = peer.to_string();
+    match announced {
+        Some(avatar_id) if context.avatars.cached_id(&key) != Some(avatar_id) => {
+            if context.wanted_avatars.len() < MAX_WANTED_AVATARS
+                || context.wanted_avatars.contains_key(&peer)
+            {
+                context.wanted_avatars.insert(peer, avatar_id);
+            }
+        }
+        Some(_) => {
+            context.wanted_avatars.remove(&peer);
+        }
+        None => {
+            context.wanted_avatars.remove(&peer);
+            if context.avatars.remove(&key) {
+                let _ = context.events.send(ClientEvent::ContactAvatar {
+                    peer_id: key,
+                    data_url: None,
+                });
+            }
+        }
+    }
+}
+
+/// Avatar ricevuto: i byte del mittente non si usano mai direttamente. Si
+/// decodificano e ricodificano fuori dal loop, e in cache (e alla UI) va
+/// solo il PNG rifatto in locale.
+fn receive_avatar(
+    peer: PeerId,
+    update: &AvatarUpdate,
+    context: &mut Incoming<'_>,
+) -> ProtocolResponse {
+    let key = peer.to_string();
+    if update.bytes.is_empty() || update.bytes.len() > images::MAX_AVATAR_BYTES {
+        return ProtocolResponse::Rejected("avatar di dimensione non valida".into());
+    }
+    if *blake3::hash(&update.bytes).as_bytes() != update.avatar_id {
+        return ProtocolResponse::Rejected("hash avatar non valido".into());
+    }
+    if context.avatars.cached_id(&key) == Some(update.avatar_id) {
+        // Già ricodificato alla prima ricezione.
+        context.wanted_avatars.remove(&peer);
+        return ProtocolResponse::Ack;
+    }
+    let Some(job) = context.image_jobs.try_start() else {
+        // Lo si richiede al prossimo giro.
+        context.wanted_avatars.insert(peer, update.avatar_id);
+        return ProtocolResponse::Rejected("immagini in elaborazione, riprova".into());
+    };
+    context.wanted_avatars.remove(&peer);
+    let cache = context.avatars.clone();
+    let events = context.events.clone();
+    let update = update.clone();
+    spawn_image_job(move || {
+        let _job = job;
+        match images::reencode_avatar(&update.bytes)
+            .and_then(|png| cache.store(&key, &update.avatar_id, &png).map(|_| png))
+        {
+            Ok(png) => {
+                log::info!("{key}: avatar aggiornato");
+                let _ = events.send(ClientEvent::ContactAvatar {
+                    peer_id: key,
+                    data_url: Some(images::data_url("image/png", &png)),
+                });
+            }
+            Err(error) => log::warn!("{key}: avatar scartato: {error}"),
+        }
+    });
+    ProtocolResponse::Ack
+}
+
+/// Emoticon ricevuta: dopo i controlli sull'originale (hash, MIME,
+/// dimensioni) viene ricodificata una volta sola; la UI e il salvataggio
+/// usano soltanto la versione ricodificata in cache.
+fn receive_emoticon_offer(
+    peer: PeerId,
+    offer: &EmoticonOffer,
+    context: &mut Incoming<'_>,
+) -> ProtocolResponse {
+    let asset_id = offer.metadata.asset_id;
+    if saved_emoticon_for_origin(context.emotes, &asset_id).is_some() {
+        // Già nella propria raccolta (ricodificata quando è stata salvata).
+        return ProtocolResponse::Ack;
+    }
+    if !context.pending_emoticons.contains_key(&asset_id)
+        && context.pending_emoticons.len() >= MAX_PENDING_EMOTICONS
+    {
+        return ProtocolResponse::Rejected("troppe emoticon in attesa".into());
+    }
+    if let Err(error) = validate_offer(offer) {
+        return ProtocolResponse::Rejected(error.to_string());
+    }
+    let trigger = offer
+        .metadata
+        .suggested_triggers
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!(":e{}:", &hex_asset_id(&asset_id)[..6]));
+    let peer_id = peer.to_string();
+    if let Some(reencoded) = images::load_received_emoticon(context.emotes, &asset_id) {
+        let _ = context.events.send(ClientEvent::EmoticonOffered {
+            peer_id,
+            emoticon: received_client_emoticon(&offer.metadata, &reencoded, &trigger),
+        });
+    } else {
+        let Some(job) = context.image_jobs.try_start() else {
+            // Il mittente la considera non consegnata e la riprova col
+            // prossimo messaggio.
+            return ProtocolResponse::Rejected("immagini in elaborazione, riprova".into());
+        };
+        let store = context.emotes.to_path_buf();
+        let events = context.events.clone();
+        let offer = offer.clone();
+        spawn_image_job(move || {
+            let _job = job;
+            let metadata = &offer.metadata;
+            match images::reencode_emoticon(
+                &offer.bytes,
+                metadata.mime,
+                metadata.animated,
+                MAX_EMOTICON_SIDE as u32,
+            )
+            .and_then(|reencoded| {
+                images::store_received_emoticon(&store, &metadata.asset_id, &reencoded)
+                    .map(|_| reencoded)
+            }) {
+                Ok(reencoded) => {
+                    let _ = events.send(ClientEvent::EmoticonOffered {
+                        peer_id,
+                        emoticon: received_client_emoticon(metadata, &reencoded, &trigger),
+                    });
+                }
+                Err(error) => log::warn!("{peer_id}: emoticon scartata: {error}"),
+            }
+        });
+    }
+    context
+        .pending_emoticons
+        .insert(asset_id, offer.metadata.clone());
+    log::info!("{peer}: emoticon ricevuta, in attesa di salvataggio");
+    record(context.history, &peer, "in", "emote", &offer.metadata.name);
+    ProtocolResponse::Ack
+}
+
+/// Le ricodifiche girano su un thread bloccante di tokio, se c'è un runtime
+/// (sempre, nel client); altrimenti su un thread a parte.
+fn spawn_image_job(job: impl FnOnce() + Send + 'static) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(job);
+        }
+        Err(_) => {
+            std::thread::spawn(job);
+        }
+    }
+}
+
+fn received_client_emoticon(
+    metadata: &Emoticon,
+    reencoded: &images::Reencoded,
+    trigger: &str,
+) -> ClientEmoticon {
+    ClientEmoticon {
+        // L'id resta quello dell'originale: è quello usato nei messaggi.
+        asset_id: hex_asset_id(&metadata.asset_id),
+        name: metadata.name.clone(),
+        trigger: trigger.to_owned(),
+        mime: mime_name(reencoded.mime).into(),
+        data_url: images::data_url(mime_name(reencoded.mime), &reencoded.bytes),
+        animated: reencoded.animated,
+        saved: false,
+        aliases: Vec::new(),
+    }
+}
+
+/// L'avatar da offrire ai contatti, ricompresso dall'immagine del profilo.
+fn load_own_avatar(path: Option<&Path>) -> Option<AvatarUpdate> {
+    let path = path?;
+    let source = fs::read(path).ok()?;
+    match images::outgoing_avatar(&source) {
+        Ok(bytes) => Some(AvatarUpdate {
+            avatar_id: *blake3::hash(&bytes).as_bytes(),
+            bytes,
+        }),
+        Err(error) => {
+            log::warn!("avatar del profilo non utilizzabile: {error}");
+            None
         }
     }
 }
@@ -9389,7 +9773,7 @@ fn delete_emoticon(
         return Err("emoticon non trovata".into());
     }
     let hash = hex_asset_id(&asset_id);
-    for extension in ["png", "jpg", "gif", "webp", "trigger", "name"] {
+    for extension in ["png", "jpg", "gif", "webp", "trigger", "name", "origin"] {
         let path = store.join(format!("{hash}.{extension}"));
         if path.exists() {
             fs::remove_file(path)?;
@@ -9399,7 +9783,14 @@ fn delete_emoticon(
     Ok(())
 }
 
-fn client_emoticon(offer: &EmoticonOffer, trigger: &str, saved: bool) -> ClientEmoticon {
+/// Un'emoticon della propria raccolta.
+fn client_emoticon(store: &Path, offer: &EmoticonOffer, trigger: &str) -> ClientEmoticon {
+    let hash = hex_asset_id(&offer.metadata.asset_id);
+    let aliases = fs::read_to_string(store.join(format!("{hash}.origin")))
+        .ok()
+        .and_then(|origin| parse_asset_id(origin.trim()).ok())
+        .map(|origin| vec![hex_asset_id(&origin)])
+        .unwrap_or_default();
     ClientEmoticon {
         asset_id: hex_asset_id(&offer.metadata.asset_id),
         name: offer.metadata.name.clone(),
@@ -9411,8 +9802,55 @@ fn client_emoticon(offer: &EmoticonOffer, trigger: &str, saved: bool) -> ClientE
             BASE64.encode(&offer.bytes)
         ),
         animated: offer.metadata.animated,
-        saved,
+        saved: true,
+        aliases,
     }
+}
+
+/// L'emoticon della raccolta salvata a partire da quella ricevuta con questo
+/// id originale, se c'è.
+fn saved_emoticon_for_origin(store: &Path, origin: &[u8; 32]) -> Option<[u8; 32]> {
+    let wanted = hex_asset_id(origin);
+    fs::read_dir(store).ok()?.flatten().find_map(|entry| {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("origin") {
+            return None;
+        }
+        let saved = parse_asset_id(path.file_stem()?.to_str()?).ok()?;
+        (fs::read_to_string(&path).ok()?.trim() == wanted).then_some(saved)
+    })
+}
+
+/// Trasforma un'emoticon ricevuta (già ricodificata) in una della propria
+/// raccolta. L'id nuovo è l'hash dei byte ricodificati: così chi la riceve
+/// da noi può verificarla; quello originale resta come alias.
+fn save_received_emoticon(
+    store: &Path,
+    origin: [u8; 32],
+    metadata: &Emoticon,
+    trigger: &str,
+    triggers: &mut Vec<Trigger>,
+) -> Result<EmoticonOffer, Box<dyn Error>> {
+    let reencoded = images::load_received_emoticon(store, &origin)
+        .ok_or("emoticon ricevuta ancora in elaborazione")?;
+    let offer = EmoticonOffer {
+        metadata: Emoticon {
+            asset_id: *blake3::hash(&reencoded.bytes).as_bytes(),
+            mime: reencoded.mime,
+            width: reencoded.width,
+            height: reencoded.height,
+            animated: reencoded.animated,
+            suggested_triggers: vec![trigger.trim().to_owned()],
+            name: metadata.name.clone(),
+        },
+        bytes: reencoded.bytes,
+    };
+    save_offer(store, &offer, triggers)?;
+    fs::write(
+        store.join(format!("{}.origin", hex_asset_id(&offer.metadata.asset_id))),
+        hex_asset_id(&origin),
+    )?;
+    Ok(offer)
 }
 
 fn load_emoticon_offer(store: &Path, trigger: &Trigger) -> Result<EmoticonOffer, Box<dyn Error>> {
@@ -9521,6 +9959,11 @@ pub struct ClientConfig {
     account_key: Option<[u8; 32]>,
     account_key_store: Option<AccountKeyStore>,
     emotes: PathBuf,
+    /// Cache degli avatar (ricodificati) dei contatti.
+    avatars: PathBuf,
+    /// Immagine del proprio profilo, se esiste: viene ricompressa e offerta
+    /// ai contatti che la chiedono.
+    avatar: Option<PathBuf>,
     downloads: PathBuf,
     history: PathBuf,
     notifications: bool,
@@ -9599,6 +10042,9 @@ impl ClientConfig {
             account_key: None,
             account_key_store: None,
             emotes: data_dir.join("emoticons"),
+            avatars: data_dir.join("avatars"),
+            // Scritta dall'app desktop quando si sceglie l'immagine del profilo.
+            avatar: Some(data_dir.join("profile-avatar.png")),
             downloads: data_dir.join("downloads"),
             history: data_dir.join("history.db"),
             notifications: true,
@@ -9625,6 +10071,8 @@ impl ClientConfig {
         let mut relay_server = false;
         let mut identity = PathBuf::from(".msnnext/identity.key");
         let mut emotes = PathBuf::from(".msnnext/emoticons");
+        let mut avatars = None;
+        let mut avatar = None;
         let mut downloads = PathBuf::from(".msnnext/downloads");
         let mut history = PathBuf::from(".msnnext/history.db");
         let mut notifications = false;
@@ -9646,6 +10094,8 @@ impl ClientConfig {
                 "--relay" => relays.push(value.parse()?),
                 "--identity" => identity = value.into(),
                 "--emotes" => emotes = value.into(),
+                "--avatars" => avatars = Some(value.into()),
+                "--avatar" => avatar = Some(value.into()),
                 "--downloads" => downloads = value.into(),
                 "--history" => history = value.into(),
                 "--notify" => notifications = value.parse()?,
@@ -9668,7 +10118,9 @@ impl ClientConfig {
             ml_dsa_seed: None,
             account_key: None,
             account_key_store: None,
+            avatars: avatars.unwrap_or_else(|| emotes.with_file_name("avatars")),
             emotes,
+            avatar,
             downloads,
             history,
             notifications,
@@ -9817,6 +10269,44 @@ mod tests {
 
         assert_eq!(reloaded.metadata.asset_id, offer.metadata.asset_id);
         assert_eq!(reloaded.bytes, offer.bytes);
+        fs::remove_dir_all(store).ok();
+    }
+
+    /// Un'emoticon ricevuta viene salvata con i byte ricodificati e un id
+    /// nuovo (così si può ricondividere e verificare), mentre l'id originale
+    /// resta come alias per i messaggi di chi l'ha mandata.
+    #[test]
+    fn saved_received_emoticon_uses_reencoded_bytes() {
+        let store = std::env::temp_dir().join(format!("msnnext-saved-emote-{}", now_ms()));
+        let mut original = test_png(8, 8, [0, 160, 0, 255]);
+        original.extend_from_slice(b"dati accodati");
+        let origin = *blake3::hash(&original).as_bytes();
+        let metadata = Emoticon {
+            asset_id: origin,
+            mime: Mime::Png,
+            width: 8,
+            height: 8,
+            animated: false,
+            suggested_triggers: vec![":v:".into()],
+            name: "verde".into(),
+        };
+        let reencoded = images::reencode_emoticon(&original, Mime::Png, false, 512).unwrap();
+        images::store_received_emoticon(&store, &origin, &reencoded).unwrap();
+        let mut triggers = Vec::new();
+        let saved =
+            save_received_emoticon(&store, origin, &metadata, ":v:", &mut triggers).unwrap();
+        assert_ne!(saved.metadata.asset_id, origin);
+        assert_ne!(saved.bytes, original);
+        assert_eq!(
+            saved_emoticon_for_origin(&store, &origin),
+            Some(saved.metadata.asset_id)
+        );
+        let reloaded = load_emoticon_offer(&store, &triggers[0]).unwrap();
+        validate_offer(&reloaded).unwrap();
+        let client = client_emoticon(&store, &reloaded, ":v:");
+        assert_eq!(client.aliases, vec![hex_asset_id(&origin)]);
+        delete_emoticon(&store, saved.metadata.asset_id, &mut triggers).unwrap();
+        assert_eq!(saved_emoticon_for_origin(&store, &origin), None);
         fs::remove_dir_all(store).ok();
     }
 
@@ -10018,7 +10508,13 @@ mod tests {
     }
 
     fn signed_presence(account: &AccountIdentity, device: PeerId) -> PresenceUpdate {
-        presence_update("Phillip", "online", true, &account.proof(device).ok())
+        presence_update(
+            "Phillip",
+            "online",
+            true,
+            &account.proof(device).ok(),
+            &None,
+        )
     }
 
     fn card(peer: PeerId, link: &str) -> ContactEntry {
@@ -10061,7 +10557,7 @@ mod tests {
         // La nostra presence firmata resta leggibile da un client vecchio.
         let account = AccountIdentity::from_account_key(&[13; 32]).unwrap();
         let device = test_peer();
-        let current = presence_update("Alice", "online", true, &account.proof(device).ok());
+        let current = presence_update("Alice", "online", true, &account.proof(device).ok(), &None);
         assert!(current.account.is_some());
         let bytes = cbor4ii::serde::to_vec(Vec::new(), &current).unwrap();
         let view: LegacyView = cbor4ii::serde::from_slice(&bytes).unwrap();
@@ -10120,7 +10616,7 @@ mod tests {
             &known,
             &contacts,
             stranger,
-            &presence_update("Mallory", "online", true, &None),
+            &presence_update("Mallory", "online", true, &None, &None),
         );
         assert_eq!(source.contact, None);
         assert!(source.account.is_none());
@@ -11284,6 +11780,68 @@ mod tests {
         fs::remove_dir_all(root).ok();
     }
 
+    fn test_png(width: u32, height: u32, color: [u8; 4]) -> Vec<u8> {
+        let image = image::RgbaImage::from_pixel(width, height, image::Rgba(color));
+        let mut out = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    async fn until_avatar(node: &mut TestNode, peer: PeerId) -> Option<String> {
+        let peer = peer.to_string();
+        let ClientEvent::ContactAvatar { data_url, .. } = node
+            .until(|event| matches!(event, ClientEvent::ContactAvatar { peer_id, .. } if *peer_id == peer))
+            .await
+        else {
+            unreachable!()
+        };
+        data_url
+    }
+
+    /// L'avatar non arrivava mai ai contatti. Ora è annunciato nella
+    /// presence, richiesto solo se non è già in cache, ricodificato da chi lo
+    /// riceve e aggiornato quando cambia o viene tolto.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(windows, ignore = "il teardown libp2p può bloccare l'harness Windows")]
+    async fn avatar_reaches_contacts_and_follows_changes() {
+        let root = test_root("avatar-sync");
+        let alice_dir = root.join("alice");
+        fs::create_dir_all(&alice_dir).unwrap();
+        let avatar_path = alice_dir.join("profile-avatar.png");
+        fs::write(&avatar_path, test_png(300, 300, [200, 20, 20, 255])).unwrap();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut alice = TestNode::start(loopback_config("Alice", &alice_dir, None)).await;
+                let mut bob =
+                    TestNode::start(loopback_config("Bob", &root.join("bob"), None)).await;
+                connect_pair(&mut alice, &mut bob).await;
+
+                let first = until_avatar(&mut bob, alice.peer)
+                    .await
+                    .expect("avatar ricevuto");
+                let cached =
+                    fs::read(root.join("bob/avatars").join(format!("{}.png", alice.peer))).unwrap();
+                let size = imagesize::blob_size(&cached).unwrap();
+                assert_eq!((size.width, size.height), (192, 192));
+
+                fs::write(&avatar_path, test_png(64, 64, [20, 20, 200, 255])).unwrap();
+                alice.send(ClientCommand::RefreshAvatar);
+                let second = until_avatar(&mut bob, alice.peer)
+                    .await
+                    .expect("avatar aggiornato");
+                assert_ne!(first, second);
+
+                fs::remove_file(&avatar_path).unwrap();
+                alice.send(ClientCommand::RefreshAvatar);
+                assert_eq!(until_avatar(&mut bob, alice.peer).await, None);
+                alice.shutdown().await;
+                bob.shutdown().await;
+            })
+            .await;
+        fs::remove_dir_all(root).ok();
+    }
+
     /// Ordina i due nodi per ruolo nell'handshake: il primo è quello che lo
     /// avvia quando manca la sessione.
     fn by_handshake_role<'a>(
@@ -11312,11 +11870,8 @@ mod tests {
         let root = test_root("queued-events");
         fs::create_dir_all(&root).unwrap();
         let emoticon = root.join("gatto.png");
-        fs::write(
-            &emoticon,
-            b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01",
-        )
-        .unwrap();
+        // Un PNG vero: chi riceve lo decodifica e lo ricodifica.
+        fs::write(&emoticon, test_png(1, 1, [255, 200, 0, 255])).unwrap();
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -11744,7 +12299,7 @@ mod tests {
 
     #[test]
     fn secure_handshake_starts_only_after_presence() {
-        let presence = ChatEvent::Presence(presence_update("Alice", "", true, &None));
+        let presence = ChatEvent::Presence(presence_update("Alice", "", true, &None, &None));
         let text = ChatEvent::Text(TextMessage {
             text: "ciao".into(),
             emoticons: vec![],

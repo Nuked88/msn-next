@@ -35,6 +35,24 @@ pub enum ChatEvent {
     /// l'offerta o libera le parti già ricevute. Un client precedente non la
     /// riconosce e la rifiuta, senza altri effetti.
     AttachmentCancelled(AttachmentCancel),
+    /// Chiede l'immagine del profilo annunciata nella presence. Parte solo
+    /// verso chi ha annunciato un avatar, quindi mai verso client vecchi.
+    AvatarRequest(AvatarRequest),
+    /// Immagine del profilo, inviata solo a chi l'ha chiesta. Chi la riceve
+    /// non usa mai questi byte così come sono: li decodifica e li ricodifica.
+    Avatar(AvatarUpdate),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AvatarRequest {
+    pub avatar_id: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AvatarUpdate {
+    /// BLAKE3 dei byte inviati: lo stesso valore annunciato nella presence.
+    pub avatar_id: [u8; 32],
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +117,10 @@ pub struct PresenceUpdate {
     /// più vecchi.
     #[serde(default)]
     pub account: Option<AccountProof>,
+    /// BLAKE3 dell'avatar corrente (`None` = nessun avatar). Chi ha già in
+    /// cache quella versione non la richiede. `default` per i client vecchi.
+    #[serde(default)]
+    pub avatar: Option<[u8; 32]>,
 }
 
 /// Firma ibrida (classica + post-quantum) con cui l'identità di account

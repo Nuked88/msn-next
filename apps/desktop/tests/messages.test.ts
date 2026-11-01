@@ -47,6 +47,12 @@ test('uno span sconosciuto resta testo e quelli sovrapposti vengono ignorati', (
   assert.equal(parts[1].custom, undefined)
 })
 
+test("un'emoticon ricevuta e salvata si trova anche col suo id originale", () => {
+  const saved = { assetId: 'nuovo', aliases: ['originale'] }
+  const parts = messageParts('ciao :g:', [{ start: 5, end: 8, assetId: 'originale' }], [saved])
+  assert.equal(parts[1].custom, saved)
+})
+
 test('la paginazione non duplica i messaggi già caricati', () => {
   const current = [{ id: '3' }, { id: '4' }]
   const older = [{ id: '1' }, { id: '2' }, { id: '3' }]

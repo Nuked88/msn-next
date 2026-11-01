@@ -1347,7 +1347,10 @@ fn erase_account_data(data_dir: &Path) -> Result<(), String> {
             || name.starts_with("account-data-before-restore-")
             || name.starts_with(".history-restore-")
             || name == "profile-avatar.png"
-            || matches!(name.as_str(), "profile.json" | "downloads" | "emoticons");
+            || matches!(
+                name.as_str(),
+                "profile.json" | "downloads" | "emoticons" | "avatars"
+            );
         if !account_file {
             continue;
         }
@@ -1504,6 +1507,7 @@ fn profile_save(
     {
         return Err("invalid relay address".into());
     }
+    let avatar_changed = clear_avatar || avatar_path.is_some();
     let avatar_file = if clear_avatar {
         if let Some(file) = previous
             .as_ref()
@@ -1546,6 +1550,10 @@ fn profile_save(
                 name: name.to_owned(),
             },
         )?;
+        if avatar_changed {
+            // Il nodo rilegge l'immagine e annuncia la nuova versione.
+            send_command(&state, ClientCommand::RefreshAvatar)?;
+        }
     }
     profile_view(&data_dir, profile)
 }
@@ -2025,7 +2033,12 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        for dir in ["downloads", "emoticons", "account-data-before-restore-1-2"] {
+        for dir in [
+            "downloads",
+            "emoticons",
+            "avatars",
+            "account-data-before-restore-1-2",
+        ] {
             std::fs::create_dir_all(data_dir.join(dir)).unwrap();
             std::fs::write(data_dir.join(dir).join("file"), b"x").unwrap();
         }
