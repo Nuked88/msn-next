@@ -1,6 +1,5 @@
 use std::{
     collections::HashSet,
-    io::Write,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -25,7 +24,8 @@ use tauri::{
     WindowEvent,
 };
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
-use tauri_plugin_fs::{FilePath, FsExt, OpenOptions as FsOpenOptions};
+
+mod picked_files;
 use tokio::sync::mpsc;
 
 type CommandSender = mpsc::UnboundedSender<ClientCommand>;
@@ -93,12 +93,16 @@ async fn dialog_open(
             let _ = sender.send(path.into_iter().collect());
         });
     }
-    let paths: Vec<String> = receiver
-        .await
-        .map_err(|_| "dialog closed".to_owned())?
-        .into_iter()
-        .map(|path| path.to_string())
-        .collect();
+    let picked = receiver.await.map_err(|_| "dialog closed".to_owned())?;
+    let copy_app = app.clone();
+    let paths = tauri::async_runtime::spawn_blocking(move || {
+        picked
+            .into_iter()
+            .map(|path| picked_files::local_copy(&copy_app, path))
+            .collect::<Result<Vec<String>, String>>()
+    })
+    .await
+    .map_err(|error| error.to_string())??;
     let approved = app.state::<ApprovedPaths>();
     for path in &paths {
         approved.approve(path.clone());
@@ -114,7 +118,7 @@ async fn dialog_save(
 ) -> Result<Option<String>, String> {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let mut dialog = file_dialog(&app, filters.unwrap_or_default());
-    if let Some(name) = default_path {
+    if let Some(name) = &default_path {
         dialog = dialog.set_file_name(name);
     }
     dialog.save_file(move |path| {
@@ -123,7 +127,8 @@ async fn dialog_save(
     let path = receiver
         .await
         .map_err(|_| "dialog closed".to_owned())?
-        .map(|path| path.to_string());
+        .map(|path| picked_files::save_target(&app, path, default_path.as_deref()))
+        .transpose()?;
     if let Some(path) = &path {
         app.state::<ApprovedPaths>().approve(path.clone());
     }
@@ -811,6 +816,15 @@ async fn node_start(
                 .ok()
                 .and_then(|slot| slot.as_ref().map(|(generation, _)| *generation));
             if worker_is_current(current_generation, generation) {
+                let event = match event {
+                    ClientEvent::AttachmentExported { path } => {
+                        match picked_files::finish_save(&event_app, &path) {
+                            Ok(()) => ClientEvent::AttachmentExported { path },
+                            Err(message) => ClientEvent::Error { message },
+                        }
+                    }
+                    event => event,
+                };
                 let _ = event_app.emit("client-event", event);
             }
         }
@@ -1368,19 +1382,9 @@ fn node_import_device_link(state: State<'_, NodeState>, link: String) -> Result<
     send_command(&state, ClientCommand::ImportDeviceLink { link })
 }
 
-// Su Android il dialog restituisce URI content:// e non percorsi: std::fs
-// fallisce con "No such file or directory", il plugin fs invece li apre.
 #[tauri::command]
-fn scan_contact_qr(
-    app: AppHandle,
-    approved: State<'_, ApprovedPaths>,
-    path: String,
-) -> Result<String, String> {
-    approved.check(&path)?;
-    let file: FilePath = path.parse().map_err(|_| "invalid path".to_owned())?;
-    let bytes = app
-        .fs()
-        .read(file)
+fn scan_contact_qr(approved: State<'_, ApprovedPaths>, path: String) -> Result<String, String> {
+    let bytes = std::fs::read(approved.check(&path)?)
         .map_err(|error| format!("image could not be read: {error}"))?;
     decode_qr_image(&bytes)
 }
@@ -1392,15 +1396,10 @@ fn save_contact_qr(
     path: String,
     data_url: String,
 ) -> Result<(), String> {
-    approved.check(&path)?;
     let bytes = contact_qr_png(&data_url)?;
-    let file: FilePath = path.parse().map_err(|_| "invalid path".to_owned())?;
-    let mut options = FsOpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    app.fs()
-        .open(file, options)
-        .and_then(|mut out| out.write_all(&bytes))
-        .map_err(|error| format!("QR code could not be saved: {error}"))
+    std::fs::write(approved.check(&path)?, bytes)
+        .map_err(|error| format!("QR code could not be saved: {error}"))?;
+    picked_files::finish_save(&app, &path)
 }
 
 fn contact_qr_png(data_url: &str) -> Result<Vec<u8>, String> {
@@ -1559,7 +1558,7 @@ fn account_backup_export(
     password: String,
     path: String,
 ) -> Result<(), String> {
-    let path = approved.check(&path)?;
+    let target = approved.check(&path)?;
     if node_status(state)? {
         return Err("go offline before creating an account backup".into());
     }
@@ -1573,7 +1572,9 @@ fn account_backup_export(
         history: read_backup_history(&data_dir)?,
     };
     let backup = encrypt_account_backup(&payload, &password)?;
-    std::fs::write(path, backup).map_err(|error| format!("backup could not be saved: {error}"))
+    std::fs::write(target, backup)
+        .map_err(|error| format!("backup could not be saved: {error}"))?;
+    picked_files::finish_save(&app, &path)
 }
 
 #[tauri::command]
@@ -1755,6 +1756,7 @@ pub fn run() {
     let builder = tauri::Builder::default()
         .manage(NodeState::default())
         .manage(ApprovedPaths::default())
+        .manage(picked_files::PendingSaves::default())
         .on_webview_event(|webview, event| {
             // I file trascinati nella finestra contano come scelti dall'utente.
             if let tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
@@ -1770,6 +1772,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            picked_files::cleanup(app.handle());
             // Log su file anche in release (necessario su Windows: l'app GUI non
             // scrive su terminale). File in <log-dir>/msnnext.log.
             app.handle().plugin(
@@ -2103,6 +2106,7 @@ mod tests {
 
     #[test]
     fn android_content_uris_stay_uris() {
+        use tauri_plugin_fs::FilePath;
         let uri: FilePath = "content://com.android.providers.media.documents/document/image%3A42"
             .parse()
             .unwrap();
