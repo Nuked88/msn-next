@@ -1,6 +1,6 @@
 [package]
 name = "msnnext-desktop"
-version = "0.8.13"
+version = "0.8.14"
 description = "Desktop client for msnnext"
 authors = ["msnnext contributors"]
 license = "AGPL-3.0-or-later"
