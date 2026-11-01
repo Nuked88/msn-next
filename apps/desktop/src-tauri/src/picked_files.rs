@@ -63,7 +63,9 @@ pub fn local_copy<R: Runtime>(app: &AppHandle<R>, picked: FilePath) -> Result<St
         }
         FilePath::Url(url) => url,
     };
-    let name = name_from_uri(uri.as_str());
+    let name = display_name(app, uri.as_str())
+        .map(|name| sanitize_name(&name))
+        .unwrap_or_else(|| name_from_uri(uri.as_str()));
     let dir = unique_dir(app, PICKED_DIR)?;
     let copy = dir.join(&name);
     let read_error = |error: io::Error| format!("file could not be read: {error}");
@@ -143,6 +145,97 @@ pub fn finish_save<R: Runtime>(app: &AppHandle<R>, path: &str) -> Result<(), Str
         let _ = fs::remove_dir_all(dir);
     }
     Ok(())
+}
+
+/// Nome mostrato dal selettore Android (OpenableColumns.DISPLAY_NAME): l'URI
+/// da solo spesso contiene solo un numero ("document/116456").
+#[cfg(target_os = "android")]
+fn display_name<R: Runtime>(app: &AppHandle<R>, uri: &str) -> Option<String> {
+    let window = app.webview_windows().into_values().next()?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let uri = uri.to_owned();
+    window
+        .with_webview(move |webview| {
+            webview.jni_handle().exec(move |env, activity, _webview| {
+                let _ = sender.send(android::query_display_name(env, activity, &uri));
+            });
+        })
+        .ok()?;
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .ok()
+        .flatten()
+        .filter(|name| !name.trim().is_empty())
+}
+
+#[cfg(not(target_os = "android"))]
+fn display_name<R: Runtime>(_app: &AppHandle<R>, _uri: &str) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "android")]
+mod android {
+    use jni::{
+        objects::{JObject, JString},
+        JNIEnv,
+    };
+
+    pub fn query_display_name(env: &mut JNIEnv, activity: &JObject, uri: &str) -> Option<String> {
+        let name = query(env, activity, uri);
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
+        name.ok().flatten()
+    }
+
+    fn query(
+        env: &mut JNIEnv,
+        activity: &JObject,
+        uri: &str,
+    ) -> jni::errors::Result<Option<String>> {
+        let uri = env.new_string(uri)?;
+        let uri = env
+            .call_static_method(
+                "android/net/Uri",
+                "parse",
+                "(Ljava/lang/String;)Landroid/net/Uri;",
+                &[(&uri).into()],
+            )?
+            .l()?;
+        let resolver = env
+            .call_method(
+                activity,
+                "getContentResolver",
+                "()Landroid/content/ContentResolver;",
+                &[],
+            )?
+            .l()?;
+        let column = env.new_string("_display_name")?;
+        let projection = env.new_object_array(1, "java/lang/String", &column)?;
+        let null = JObject::null();
+        let cursor = env
+            .call_method(
+                &resolver,
+                "query",
+                "(Landroid/net/Uri;[Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;)Landroid/database/Cursor;",
+                &[(&uri).into(), (&projection).into(), (&null).into(), (&null).into(), (&null).into()],
+            )?
+            .l()?;
+        if cursor.is_null() {
+            return Ok(None);
+        }
+        let mut name = None;
+        if env.call_method(&cursor, "moveToFirst", "()Z", &[])?.z()? {
+            let value = env
+                .call_method(&cursor, "getString", "(I)Ljava/lang/String;", &[0.into()])?
+                .l()?;
+            if !value.is_null() {
+                name = Some(env.get_string(&JString::from(value))?.into());
+            }
+        }
+        env.call_method(&cursor, "close", "()V", &[])?;
+        Ok(name)
+    }
 }
 
 fn percent_decode(value: &str) -> String {

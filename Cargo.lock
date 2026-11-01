@@ -3740,6 +3740,7 @@ dependencies = [
  "chacha20poly1305",
  "image",
  "infer",
+ "jni 0.21.1",
  "keyring",
  "libp2p-identity",
  "log",

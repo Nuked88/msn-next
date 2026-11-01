@@ -442,6 +442,18 @@
   let transferFilename = ''
   let transferProgress = 0
   let incomingAttachmentOffers: IncomingAttachmentOffer[] = []
+  let offersMinimized = false
+  // Stato dei file in arrivo in questa sessione: il messaggio compare appena
+  // inizia il trasferimento, "ricevuto" solo quando il core lo conferma.
+  let attachmentStates: Record<string, 'receiving' | 'failed' | 'done'> = {}
+
+  function markAttachment(id: string | undefined, state: 'receiving' | 'failed' | 'done') {
+    if (!id) return
+    const current = attachmentStates[id]
+    if (state === 'receiving' && current) return
+    if (state === 'failed' && current !== 'receiving') return
+    attachmentStates = { ...attachmentStates, [id]: state }
+  }
   let contactName = ''
   let contactNamePeer = ''
   let chatGroups: GroupChat[] = []
@@ -1087,6 +1099,7 @@
       return
     }
     if (event.type === 'attachmentReceived') {
+      markAttachment(event.id, 'done')
       const conversation = [...(conversations[event.peerId] || [])]
       const index = receivedFileIndex(conversation, event.id, event.filename)
       if (index >= 0) conversation[index] = {
@@ -1129,6 +1142,7 @@
       return
     }
     if (event.type === 'incomingAttachmentCancelled') {
+      markAttachment(event.attachmentId, 'failed')
       if (event.offerId != null) {
         incomingAttachmentOffers = incomingAttachmentOffers.filter((offer) => offer.offerId !== event.offerId)
       }
@@ -1138,6 +1152,7 @@
     }
     if (event.type === 'incomingAttachmentOffered') {
       incomingAttachmentOffers = [...incomingAttachmentOffers, event]
+      offersMinimized = false
       return
     }
     if (event.type === 'emoticonRemoved') {
@@ -1194,6 +1209,7 @@
     if (event.type === 'groupMessage') {
       const key = `group:${event.message.groupId}`
       const next = toGroupChatMessage(event.message)
+      if (event.message.direction === 'in' && event.message.kind === 'file') markAttachment(event.message.attachmentId, 'receiving')
       if (event.message.direction === 'out' && event.message.kind === 'file' && previewSentImages && event.message.attachmentId) {
         requestInlinePreview(event.message.attachmentId, event.message.attachmentMime)
       }
@@ -1214,6 +1230,7 @@
       return
     }
     if (event.type === 'groupAttachmentReceived') {
+      markAttachment(event.id, 'done')
       const key = `group:${event.groupId}`
       const conversation = [...(conversations[key] || [])]
       const index = receivedFileIndex(conversation, event.id, event.filename)
@@ -1326,6 +1343,7 @@
   function addMessage(message: ClientMessage) {
     const conversation = conversations[message.peerId] || []
     const next = toChatMessage(message)
+    if (message.direction === 'in' && message.kind === 'file') markAttachment(message.attachmentId, 'receiving')
     if (message.direction === 'out' && message.kind === 'file' && previewSentImages && message.attachmentId) {
       requestInlinePreview(message.attachmentId, message.attachmentMime)
     }
@@ -2658,12 +2676,13 @@
                   {#if message.deleted}
                     <p class="deleted-message"><Trash2 size={13} /> {message.mine ? $t('msg.deletedByYou') : $t('msg.deletedMessage')}</p>
                   {:else if message.kind === 'file'}
-                    <button class="file-line" disabled={!message.attachmentId} onclick={() => openAttachment(message)}>
+                    {@const transfer = message.mine || !message.attachmentId ? undefined : attachmentStates[message.attachmentId]}
+                    <button class="file-line" class:receiving={transfer === 'receiving'} disabled={!message.attachmentId || transfer === 'receiving' || transfer === 'failed'} onclick={() => openAttachment(message)}>
                       {#if message.attachmentId && attachmentPreviews[message.attachmentId]}
                         <img src={attachmentPreviews[message.attachmentId]} alt={message.body} />
                       {:else}<Paperclip size={17} />{/if}
-                      <span><b>{message.attachmentMime?.startsWith('image/') ? (message.mine ? $t('msg.imageSent') : $t('msg.imageReceived')) : (message.mine ? $t('msg.fileSent') : $t('msg.fileReceived'))}</b><small>{message.body}</small></span>
-                      {#if message.attachmentId}<ExternalLink size={14} />{/if}
+                      <span><b>{transfer === 'receiving' ? $t('msg.fileReceiving') : transfer === 'failed' ? $t('msg.fileNotReceived') : message.attachmentMime?.startsWith('image/') ? (message.mine ? $t('msg.imageSent') : $t('msg.imageReceived')) : (message.mine ? $t('msg.fileSent') : $t('msg.fileReceived'))}</b><small>{message.body}</small></span>
+                      {#if message.attachmentId && transfer !== 'receiving' && transfer !== 'failed'}<ExternalLink size={14} />{/if}
                     </button>
                   {:else}
                     <p>
@@ -2898,19 +2917,30 @@
   </div>
 {/if}
 
-{#if incomingAttachmentOffers[0]}
-  {@const offer = incomingAttachmentOffers[0]}
-  <div class="modal-backdrop">
-    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="attachment-offer-title">
-      <p class="step-label">{$t('offer.incoming')}</p>
-      <h2 id="attachment-offer-title">{$t('offer.question', { filename: offer.filename })}</h2>
-      <p>{$t('offer.body', { name: contacts.find((contact) => contact.peerId === offer.peerId)?.name || $t('offer.aContact'), size: formatBytes(offer.size) })}</p>
-      <div class="modal-actions">
-        <button class="secondary-button" onclick={() => answerAttachmentOffer(offer, false)}>{$t('offer.decline')}</button>
-        <button class="primary-button" onclick={() => answerAttachmentOffer(offer, true)}>{$t('offer.accept')}</button>
-      </div>
+{#if incomingAttachmentOffers.length}
+  <!-- Non modale: l'utente può continuare a usare l'app e decidere dopo. -->
+  {#if offersMinimized}
+    <button class="file-offers-pill" onclick={() => offersMinimized = false}>
+      <Paperclip size={14} /> {$t('offer.waiting', { count: incomingAttachmentOffers.length })}
+    </button>
+  {:else}
+    <div class="file-offers" role="region" aria-label={$t('offer.incoming')}>
+      {#each incomingAttachmentOffers as offer (offer.offerId)}
+        <div class="contact-request-card file-offer-card">
+          <span class="file-offer-icon"><Paperclip size={17} /></span>
+          <div class="contact-request-copy">
+            <strong>{$t('offer.question', { filename: offer.filename })}</strong>
+            <small>{$t('offer.body', { name: contacts.find((contact) => contact.peerId === offer.peerId)?.name || $t('offer.aContact'), size: formatBytes(offer.size) })}</small>
+          </div>
+          <div class="contact-request-actions">
+            <button class="secondary-button" onclick={() => answerAttachmentOffer(offer, false)}>{$t('offer.decline')}</button>
+            <button class="primary-button" onclick={() => answerAttachmentOffer(offer, true)}>{$t('offer.accept')}</button>
+          </div>
+        </div>
+      {/each}
+      <button class="file-offers-later" onclick={() => offersMinimized = true}>{$t('offer.later')}</button>
     </div>
-  </div>
+  {/if}
 {/if}
 
 {#if setupOpen}

@@ -4075,3 +4075,67 @@ span.draft-emoticon { width: auto; font-size: 1.2em; }
 }
 .confirm-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 .confirm-actions > button { height: var(--control-h); min-height: 0; margin: 0; padding: 0 16px; font-size: 0.75rem; }
+
+/* Offerte file in arrivo: pannello non modale in basso, sopra la barra di
+   scrittura; "Decidi dopo" lo riduce a una pillola. */
+.file-offers {
+  position: fixed;
+  z-index: 94;
+  right: 17px;
+  bottom: calc(128px + env(safe-area-inset-bottom, 0px));
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  width: min(440px, calc(100vw - 34px));
+}
+
+.file-offer-icon {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  border-radius: 9px;
+  color: var(--blue);
+  background: var(--selected);
+}
+
+.file-offers-later {
+  order: -1;
+  align-self: flex-end;
+  margin: 0;
+  padding: 4px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow);
+  font-size: 0.625rem;
+}
+
+.file-offers-pill {
+  position: fixed;
+  z-index: 94;
+  right: 17px;
+  bottom: calc(128px + env(safe-area-inset-bottom, 0px));
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  padding: 6px 12px;
+  border: 1px solid var(--selected-border);
+  border-radius: 999px;
+  color: var(--text-strong);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow);
+  font-size: 0.6875rem;
+}
+
+@media (max-width: 720px) {
+  .file-offers { left: 12px; right: 12px; width: auto; }
+  .file-offer-card { flex-wrap: wrap; }
+  .file-offer-card .contact-request-actions { width: 100%; justify-content: flex-end; }
+  .file-offers-pill { right: 12px; }
+}
+.file-line.receiving b { color: var(--muted); }
