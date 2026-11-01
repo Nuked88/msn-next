@@ -25,6 +25,7 @@ use tauri::{
 };
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 
+mod android_update;
 mod picked_files;
 use tokio::sync::mpsc;
 
@@ -1765,6 +1766,7 @@ pub fn run() {
         .manage(NodeState::default())
         .manage(ApprovedPaths::default())
         .manage(picked_files::PendingSaves::default())
+        .manage(android_update::PendingUpdate::default())
         .on_webview_event(|webview, event| {
             // I file trascinati nella finestra contano come scelti dall'utente.
             if let tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
@@ -1781,6 +1783,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             picked_files::cleanup(app.handle());
+            android_update::cleanup(app.handle());
             // Log su file anche in release (necessario su Windows: l'app GUI non
             // scrive su terminale). File in <log-dir>/msnnext.log.
             app.handle().plugin(
@@ -1884,6 +1887,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             dialog_open,
             dialog_save,
+            android_update::android_update_check,
+            android_update::android_update_install,
             node_start,
             node_send_text,
             node_send_nudge,

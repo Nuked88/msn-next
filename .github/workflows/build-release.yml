@@ -160,6 +160,7 @@ jobs:
       ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
       ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
       ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
 
     steps:
       - name: Checkout
@@ -200,6 +201,8 @@ jobs:
         run: |
           echo "NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
           NDK_HOME="$ANDROID_NDK_LATEST_HOME" npm run tauri -- android init --ci
+          # Permesso di installazione e FileProvider per gli aggiornamenti in-app.
+          ../../scripts/patch-android-project.sh src-tauri/gen/android
 
       # Firma con il keystore nei secret; senza secret ripiega sulla chiave
       # debug del runner (installabile, ma cambia a ogni build: per
@@ -246,11 +249,23 @@ jobs:
           cp "$APK" "out/msnnext_${VERSION}_android-arm64.apk"
           ls -l out
 
+      # Firma minisign (stessa chiave dei bundle desktop): l'app Android la
+      # verifica prima di aprire l'installer (voce android-aarch64 di latest.json).
+      - name: Sign APK for in-app updates
+        if: env.TAURI_SIGNING_PRIVATE_KEY != ''
+        working-directory: apps/desktop
+        env:
+          # Vuota se la chiave non ha password (senza variabile la CLI la chiede).
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          npm run tauri -- signer sign "$GITHUB_WORKSPACE/out/msnnext_${VERSION}_android-arm64.apk"
+          test -s "$GITHUB_WORKSPACE/out/msnnext_${VERSION}_android-arm64.apk.sig"
+
       - name: Upload bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: msnnext-${{ env.VERSION }}-android-arm64
-          path: out/*.apk
+          path: out/*
           if-no-files-found: error
 
       - name: Attach APK to release
@@ -265,9 +280,14 @@ jobs:
             gh api --method POST -H "Content-Type: application/vnd.android.package-archive" \
               --input "out/$NAME" \
               "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$NAME" > /dev/null
+            if [ -f "out/$NAME.sig" ]; then
+              gh api --method POST -H "Content-Type: application/octet-stream" \
+                --input "out/$NAME.sig" \
+                "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$NAME.sig" > /dev/null
+            fi
           elif [ "$ANDROID_ONLY" = "true" ]; then
             # Solo Android: aggiunge l'APK alla release già pubblicata.
-            gh release upload "v$VERSION" "out/$NAME" --clobber --repo "$GITHUB_REPOSITORY"
+            gh release upload "v$VERSION" out/msnnext_*_android-arm64.apk* --clobber --repo "$GITHUB_REPOSITORY"
           fi
 
   publish:
@@ -314,6 +334,12 @@ jobs:
               "darwin-aarch64-app": mac,
               "darwin-x86_64-app": mac,
           }
+          # APK Android: l'app lo trova con il target android-aarch64.
+          apk = f"msnnext_{version}_android-arm64.apk"
+          if apk in assets and apk + ".sig" in assets:
+              platforms["android-aarch64"] = entry(apk)
+          else:
+              print(f"::warning::{apk}.sig mancante: niente aggiornamento in-app per Android")
           pub_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
           with open("latest.json", "w") as f:
               json.dump({"version": version, "notes": "", "pub_date": pub_date, "platforms": platforms}, f, indent=2)

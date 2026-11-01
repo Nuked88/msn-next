@@ -208,6 +208,8 @@ Windows, Linux, and macOS releases must be built on their respective operating s
 
 The `Build release bundles` workflow compiles NSIS on Windows, DEB/AppImage on Linux, and a universal Intel/Apple Silicon DMG on macOS. On pull requests it retains packages as artifacts without signing keys; when manually started from the **Actions** tab, it publishes a complete GitHub release with installers, signatures, and `latest.json` for the integrated updater.
 
+On Android the Tauri updater cannot install packages, so the workflow also signs the APK with the same key and adds an `android-aarch64` entry to `latest.json`. The Android app checks that entry, downloads the APK, verifies its signature and opens the system installer (Android also requires the APK to be signed with the same keystore as the installed app). The generated Gradle project is patched by `scripts/patch-android-project.sh` (install permission and FileProvider cache path); run it after `tauri android init` for local builds too.
+
 Updates are verified by the client with the public key included in the app. The private key must not enter the repository: GitHub Actions reads it from the `TAURI_SIGNING_PRIVATE_KEY` secret. A recovery copy of the current key is stored locally in `~/.tauri/msnnext-updater.key` with user-only permissions. For a signed local build, set `TAURI_SIGNING_PRIVATE_KEY` to that file’s path; without the key, use the development override shown above.
 
 The app version follows SemVer and is defined only once in `apps/desktop/package.json`; Tauri reads it from that file. While the project is alpha, use `0.x.0` for new features or incompatible changes and `0.x.y` for compatible fixes. Future releases will use `v0.x.y` Git tags.

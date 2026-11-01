@@ -390,6 +390,7 @@
   "update.checkFailedToast": "Impossibile controllare gli aggiornamenti",
   "update.downloading": "Download di msnnext {version}…",
   "update.installComplete": "Installazione completata. Riavvio di msnnext…",
+  "update.androidConfirm": "Conferma l'installazione nella finestra di Android.",
   "update.failed": "Aggiornamento non riuscito: {error}",
   "update.failedToast": "Aggiornamento non riuscito",
   "update.notChecked": "Non ancora controllato",

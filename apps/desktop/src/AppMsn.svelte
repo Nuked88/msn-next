@@ -217,6 +217,10 @@
   type Theme = 'light' | 'dark' | 'system'
   type SettingsSection = 'profile' | 'appearance' | 'devices' | 'data' | 'updates' | 'network'
   type UpdateStatus = 'idle' | 'checking' | 'available' | 'downloading' | 'installing' | 'current' | 'error'
+  // desktop: aggiornamento del plugin updater; null = APK Android (lato Rust).
+  type UpdateCandidate = { version: string; desktop: Update | null }
+  type AndroidUpdate = { version: string; currentVersion: string; notes?: string | null }
+  type AndroidUpdateProgress = { downloaded: number; total?: number | null }
   type MessagePart = MessagePartOf<ClientEmoticon>
   type Profile = {
     name: string
@@ -236,6 +240,9 @@
 
   const appWindow = isTauri() ? getCurrentWindow() : null
   const isMobile = typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+  // Su Android l'updater Tauri non installa: l'APK passa dai comandi android_update_*.
+  const isAndroid = typeof navigator !== 'undefined' && /Android/i.test(navigator.userAgent)
+  const updatesSupported = !isMobile || isAndroid
 
   // Angoli finestra arrotondati solo su desktop (su mobile è fullscreen). Va
   // impostato subito (non in onMount) così il contenuto è già ritagliato al
@@ -496,7 +503,7 @@
   let overlayIcon: Image | undefined
   let taskbarUpdate = 0
   let appVersion = packageVersion
-  let updateCandidate: Update | null = null
+  let updateCandidate: UpdateCandidate | null = null
   let updateStatus: UpdateStatus = 'idle'
   let updateMessage = ''
   let updateProgress = 0
@@ -585,7 +592,7 @@
           scheduleUpdateCheck()
         }, delay)
       }
-      scheduleUpdateCheck()
+      if (updatesSupported) scheduleUpdateCheck()
     }
     if (appWindow) {
       const syncMaximized = async () => {
@@ -691,7 +698,7 @@
   }
 
   async function checkForUpdates(force: boolean) {
-    if (!isTauri() || updateStatus === 'checking' || updateStatus === 'downloading' || updateStatus === 'installing') return
+    if (!isTauri() || !updatesSupported || updateStatus === 'checking' || updateStatus === 'downloading' || updateStatus === 'installing') return
     if (!force && Date.now() - lastUpdateCheck < updateCheckIntervalMs) return
 
     lastUpdateCheck = Date.now()
@@ -699,9 +706,11 @@
     updateStatus = 'checking'
     updateMessage = $t('update.checking')
     try {
-      const update = await check({ timeout: 30_000 })
+      const update: UpdateCandidate | null = isAndroid
+        ? await invoke<AndroidUpdate | null>('android_update_check').then((found) => found && { version: found.version, desktop: null })
+        : await check({ timeout: 30_000 }).then((found) => found && { version: found.version, desktop: found })
+      await updateCandidate?.desktop?.close()
       if (!update) {
-        await updateCandidate?.close()
         updateCandidate = null
         updateStatus = 'current'
         updateMessage = $t('update.upToDate')
@@ -709,11 +718,11 @@
         return
       }
 
-      await updateCandidate?.close()
       updateCandidate = update
       updateStatus = 'available'
       updateMessage = $t('update.ready', { version: update.version })
-      if (force) showToast($t('update.availableToast', { version: update.version }))
+      // Su mobile il pulsante in alto è solo un'icona: avvisa anche col toast.
+      if (force || isMobile) showToast($t('update.availableToast', { version: update.version }))
     } catch (error) {
       updateStatus = 'error'
       updateMessage = $t('update.checkFailed', { error: String(error) })
@@ -729,8 +738,13 @@
     updateDownloaded = 0
     updateDownloadTotal = 0
     updateMessage = $t('update.downloading', { version: updateCandidate.version })
+    const desktopUpdate = updateCandidate.desktop
+    if (!desktopUpdate) {
+      await installAndroidUpdate()
+      return
+    }
     try {
-      await updateCandidate.downloadAndInstall((event) => {
+      await desktopUpdate.downloadAndInstall((event) => {
         if (event.event === 'Started') {
           updateDownloadTotal = event.data.contentLength || 0
           return
@@ -751,6 +765,31 @@
       updateStatus = 'error'
       updateMessage = $t('update.failed', { error: String(error) })
       showToast($t('update.failedToast'))
+    }
+  }
+
+  async function installAndroidUpdate() {
+    let stopProgress: UnlistenFn | undefined
+    try {
+      stopProgress = await listen<AndroidUpdateProgress>('android-update-progress', ({ payload }) => {
+        updateDownloaded = payload.downloaded
+        updateDownloadTotal = payload.total || 0
+        updateProgress = updateDownloadTotal
+          ? Math.min(99, Math.round(updateDownloaded * 100 / updateDownloadTotal))
+          : 0
+      })
+      // Scarica, verifica la firma e apre l'installer di sistema.
+      await invoke('android_update_install')
+      updateProgress = 100
+      // Se l'utente annulla l'installer, il pulsante resta per riprovare.
+      updateStatus = 'available'
+      updateMessage = $t('update.androidConfirm')
+    } catch (error) {
+      updateStatus = 'error'
+      updateMessage = $t('update.failed', { error: String(error) })
+      showToast($t('update.failedToast'))
+    } finally {
+      stopProgress?.()
     }
   }
 
